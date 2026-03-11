@@ -1,0 +1,28 @@
+name = "my-gtfs-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-03-20"
+
+# Cron trigger: Runs every 4 hours (MYT is UTC+8, so 20:00 UTC)
+[triggers]
+crons = ["0 */4 * * *"]
+
+# Bind to Cloudflare D1
+[[d1_databases]]
+binding = "DB"
+database_name = "my-gtfs-db"
+database_id = "9e313928-98ce-4d8d-89f1-ab1ad203065f"
+
+[vars]
+GTFS_STATIC_URL = "https://api.data.gov.my/gtfs-static/"
+# Enum option refer: https://developer.data.gov.my/realtime-api/gtfs-static
+GTFS_STATIC_ENUM = """ktmb,
+prasarana?category=rapid-bus-penang,
+prasarana?category=rapid-bus-mrtfeeder,
+prasarana?category=rapid-rail-kl,
+prasarana?category=rapid-bus-kl,
+mybas-johor,
+mybas-ipoh"""
+
+
+[build]
+command = "cargo install worker-build && worker-build --release"
