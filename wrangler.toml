@@ -10,7 +10,7 @@ crons = ["0 */4 * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "my-gtfs-db"
-database_id = "9e313928-98ce-4d8d-89f1-ab1ad203065f"
+database_id = "6002f22a-c926-424a-9a97-bc68924f17ea"
 
 [vars]
 GTFS_STATIC_URL = "https://api.data.gov.my/gtfs-static/"

@@ -11,10 +11,8 @@ crate-type = ["cdylib", "rlib"]
 worker = { version = "0.7.5", features = ["d1"] }
 console_error_panic_hook = "0.1"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 zip = { version = "8.2.0", default-features = false, features = ["deflate"] }
 csv = "1.4.0"
-bytes = "1.11.1"
 
 [profile.release]
 lto = true

@@ -1,3 +1,4 @@
+//! Dual logging: writes to both the Cloudflare Worker console and a persistent D1 `logs` table.
 use worker::{D1Database, Result};
 use worker::wasm_bindgen::JsValue;
 use std::rc::Rc;
@@ -9,11 +10,13 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    fn as_str(&self) -> &'static str {
+    /// Returns `(console_label, db_level)` for this log level.
+    /// DB levels match schema.sql: 0=Trace, 1=Debug, 2=Info, 3=Warning, 4=Error, 5=Critical
+    fn metadata(&self) -> (&'static str, u8) {
         match self {
-            LogLevel::Info => "INFO",
-            LogLevel::Warn => "WARN",
-            LogLevel::Error => "ERROR",
+            LogLevel::Info => ("INFO", 2),
+            LogLevel::Warn => ("WARN", 3),
+            LogLevel::Error => ("ERROR", 4),
         }
     }
 }
@@ -31,9 +34,9 @@ impl Logger {
 
     /// Primary log function that handles both console and D1 logging asynchronously without blocking
     pub fn log(&self, level: LogLevel, message: &str) {
-        let prefix = level.as_str();
-        let console_msg = format!("[{}] {}", prefix, message);
-        
+        let (prefix, db_level) = level.metadata();
+        let console_msg = format!("[{prefix}] {message}");
+
         // 1. Log to Cloudflare Worker Console natively
         match level {
             LogLevel::Info => worker::console_log!("{}", console_msg),
@@ -41,15 +44,14 @@ impl Logger {
             LogLevel::Error => worker::console_error!("{}", console_msg),
         }
 
-        // 2. Fire and Forget to D1 ExecutionLogs Table persistently (if DB initialized)
+        // 2. Fire and forget to D1 `logs` table (if DB initialized)
         if let Some(db) = &self.db {
             let db_clone = Rc::clone(db);
-            let prefix_owned = prefix.to_string();
             let msg_owned = message.to_string();
-            
+
             worker::wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) = Self::log_to_db(&db_clone, &prefix_owned, &msg_owned).await {
-                    worker::console_error!("[ERROR] Failed to write log to D1 ExecutionLogs: {:?}", e);
+                if let Err(e) = Self::log_to_db(&db_clone, db_level, &msg_owned).await {
+                    worker::console_error!("[ERROR] Failed to write log to D1: {:?}", e);
                 }
             });
         }
@@ -67,11 +69,11 @@ impl Logger {
         self.log(LogLevel::Error, message);
     }
 
-    /// Internal function handling parameter bounds to write safely to SQLite
-    async fn log_to_db(db: &D1Database, level: &str, message: &str) -> Result<()> {
-        let stmt = db.prepare("INSERT INTO ExecutionLogs (Level, Message) VALUES (?1, ?2)");
-        let params = vec![JsValue::from_str(level), JsValue::from_str(message)];
-        
+    /// Inserts a log row into the `logs` table with an integer level.
+    async fn log_to_db(db: &D1Database, level: u8, message: &str) -> Result<()> {
+        let stmt = db.prepare("INSERT INTO logs (Level, Message) VALUES (?1, ?2)");
+        let params = vec![JsValue::from(level), JsValue::from_str(message)];
+
         stmt.bind(&params)?.run().await?;
         Ok(())
     }
