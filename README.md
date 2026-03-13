@@ -94,7 +94,7 @@ Ensure your local environment is correctly configured with:
 
 ```bash
 npm install
-cargo update
+npm run build
 ```
 
 ### 2. Create the D1 Database

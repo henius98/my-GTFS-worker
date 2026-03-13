@@ -4,7 +4,7 @@
   "description": "Cloudflare Worker GTFS importer",
   "main": "build/worker/shim.mjs",
   "scripts": {
-    "build": "cargo install -q worker-build && worker-build --release",
+    "build": "bash ./build.sh",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
