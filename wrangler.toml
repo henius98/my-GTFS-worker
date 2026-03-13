@@ -25,4 +25,4 @@ mybas-ipoh"""
 
 
 [build]
-command = "cargo install worker-build && worker-build --release"
+command = "bash ./build.sh"
