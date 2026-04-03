@@ -351,7 +351,6 @@ CREATE TABLE IF NOT EXISTS rapid_bus_kl_stop_times (
     stop_id TEXT,
     stop_sequence INTEGER,
     stop_headsign TEXT,
-    shape_dist_traveled REAL,
     PRIMARY KEY (trip_id, stop_sequence)
     -- FOREIGN KEY (trip_id) REFERENCES trips(trip_id),
     -- FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
@@ -364,7 +363,9 @@ CREATE TABLE IF NOT EXISTS mybas_johor_trips (
     trip_id VARCHAR(20) PRIMARY KEY,
     trip_headsign TEXT,
     direction_id INTEGER, -- 0 = from Jetty or 1 = end Jetty
-    shape_id TEXT
+    shape_id TEXT,
+    block_id TEXT,
+    wheelchair_accessible INTEGER
     -- FOREIGN KEY (route_id) REFERENCES trips(routes),
     -- FOREIGN KEY (service_id) REFERENCES trips(calendar),
     -- FOREIGN KEY (shape_id) REFERENCES trips(shapes),
@@ -387,7 +388,11 @@ CREATE TABLE IF NOT EXISTS mybas_johor_routes (
     agency_id TEXT,
     route_short_name TEXT,
     route_long_name TEXT,
-    route_type INTEGER
+    route_type INTEGER,
+    route_desc TEXT,
+    route_url TEXT,
+    route_color TEXT,
+    route_text_color TEXT
     -- FOREIGN KEY (agency_id) REFERENCES trips(agency),
 );
 CREATE TABLE IF NOT EXISTS mybas_johor_shapes (
@@ -403,7 +408,12 @@ CREATE TABLE IF NOT EXISTS mybas_johor_stops (
     stop_code TEXT,
     stop_name TEXT,
     stop_lat REAL,
-    stop_lon REAL
+    stop_lon REAL,
+    stop_desc TEXT,
+    zone_id TEXT,
+    stop_url TEXT,
+    location_type INTEGER,
+    parent_station TEXT
 );
 CREATE TABLE IF NOT EXISTS mybas_johor_stop_times (
     trip_id TEXT,
@@ -413,6 +423,8 @@ CREATE TABLE IF NOT EXISTS mybas_johor_stop_times (
     stop_sequence INTEGER,
     stop_headsign TEXT,
     shape_dist_traveled REAL,
+    pickup_type INTEGER,
+    drop_off_type INTEGER,
     PRIMARY KEY (trip_id, stop_sequence)
     -- FOREIGN KEY (trip_id) REFERENCES trips(trip_id),
     -- FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
@@ -423,7 +435,6 @@ CREATE TABLE IF NOT EXISTS mybas_ipoh_trips (
     route_id TEXT,
     service_id TEXT,
     trip_id VARCHAR(20) PRIMARY KEY,
-    trip_headsign TEXT,
     direction_id INTEGER, -- 0 = from Jetty or 1 = end Jetty
     shape_id TEXT
     -- FOREIGN KEY (route_id) REFERENCES trips(routes),
@@ -456,7 +467,6 @@ CREATE TABLE IF NOT EXISTS mybas_ipoh_shapes (
     shape_pt_lat REAL,
     shape_pt_lon REAL,
     shape_pt_sequence INTEGER,
-    shape_dist_traveled REAL,
     PRIMARY KEY (shape_id, shape_pt_sequence)
 );
 CREATE TABLE IF NOT EXISTS mybas_ipoh_stops (
@@ -464,7 +474,8 @@ CREATE TABLE IF NOT EXISTS mybas_ipoh_stops (
     stop_code TEXT,
     stop_name TEXT,
     stop_lat REAL,
-    stop_lon REAL
+    stop_lon REAL,
+    parent_station TEXT
 );
 CREATE TABLE IF NOT EXISTS mybas_ipoh_stop_times (
     trip_id TEXT,
@@ -472,8 +483,8 @@ CREATE TABLE IF NOT EXISTS mybas_ipoh_stop_times (
     departure_time TEXT,
     stop_id TEXT,
     stop_sequence INTEGER,
-    stop_headsign TEXT,
-    shape_dist_traveled REAL,
+    pickup_type INTEGER,
+    drop_off_type INTEGER,
     PRIMARY KEY (trip_id, stop_sequence)
     -- FOREIGN KEY (trip_id) REFERENCES trips(trip_id),
     -- FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
