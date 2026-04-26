@@ -9,19 +9,18 @@ crons = ["0 */4 * * *"]
 # Bind to Cloudflare D1
 [[d1_databases]]
 binding = "DB"
-database_name = "my-gtfs-db"
-database_id = "6002f22a-c926-424a-9a97-bc68924f17ea"
+database_name = "my-gtfs-db-prod"
+database_id = "22a5c5fc-adb6-4b49-aef9-36990ca85189"
 
 [vars]
 GTFS_STATIC_URL = "https://api.data.gov.my/gtfs-static/"
 # Enum option refer: https://developer.data.gov.my/realtime-api/gtfs-static
-GTFS_STATIC_ENUM = """ktmb,
-prasarana?category=rapid-bus-penang,
+GTFS_STATIC_ENUM = """mybas-johor,
+ktmb,
 prasarana?category=rapid-bus-mrtfeeder,
 prasarana?category=rapid-rail-kl,
 prasarana?category=rapid-bus-kl,
-mybas-johor,
-mybas-ipoh"""
+prasarana?category=rapid-bus-penang"""
 
 
 [build]

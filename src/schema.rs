@@ -32,7 +32,7 @@ pub async fn prefetch_table_schemas(
         let db_columns = get_table_columns(d1, &full_table).await?;
 
         if db_columns.is_empty() {
-            logger.warn(&format!("Table `{full_table}` has no columns or does not exist, skipping."));
+            logger.warn(&format!("Table `{full_table}` has no columns or does not exist, skipping.")).await;
             continue;
         }
 
@@ -44,7 +44,7 @@ pub async fn prefetch_table_schemas(
             "Schema loaded for `{base_name}` ({col_count} columns): \
              {rows_per_insert} rows/query, up to {} rows/batch",
             rows_per_insert * D1_MAX_BATCH_STATEMENTS
-        ));
+        )).await;
 
         schemas.push(TableSchema {
             csv_file,

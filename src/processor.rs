@@ -1,7 +1,7 @@
 //! CSV → D1 processing: reads CSV files from ZIP archives, maps columns to the DB schema,
 //! and performs bulk multi-row INSERTs into Cloudflare D1.
 
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use serde::Deserialize;
 use worker::{D1Database, Result};
 use zip::ZipArchive;
@@ -23,22 +23,19 @@ pub async fn process_csv_file(
     let filename = schema.csv_file;
 
     // ── Extract file from archive ──────────────────────────────────────────
-    let mut file = match archive.by_name(filename) {
+    let file = match archive.by_name(filename) {
         Ok(f) => f,
         Err(_) => {
-            logger.warn(&format!("{filename} not found in archive, skipping."));
+            logger.warn(&format!("{filename} not found in archive, skipping.")).await;
             return Ok(());
         }
     };
-    logger.info(&format!("Processing {filename} → `{table_name}`..."));
-
-    let mut content = String::new();
-    file.read_to_string(&mut content).map_err(to_worker_err)?;
+    logger.info(&format!("Processing {filename} → `{table_name}`...")).await;
 
     // ── Parse CSV & resolve column indices against pre-fetched DB schema ───
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
-        .from_reader(content.as_bytes());
+        .from_reader(file);
 
     let headers = rdr.headers().map_err(to_worker_err)?.clone();
 
@@ -46,12 +43,12 @@ pub async fn process_csv_file(
     let (matched_columns, csv_indices) = resolve_matching_columns(&headers, &schema.db_columns);
 
     if matched_columns.is_empty() {
-        logger.warn(&format!("No matching columns between {filename} and `{table_name}`, skipping."));
+        logger.warn(&format!("No matching columns between {filename} and `{table_name}`, skipping.")).await;
         return Ok(());
     }
 
     // Log diagnostics only when there are mismatches (CSV-only or DB-only columns)
-    log_column_diagnostics(logger, filename, &headers, &schema.db_columns, &matched_columns);
+    log_column_diagnostics(logger, filename, &headers, &schema.db_columns, &matched_columns).await;
 
     // ── Compute sizing and build SQL ───────────────────────────────────────
     let col_count = matched_columns.len();
@@ -98,7 +95,7 @@ pub async fn process_csv_file(
         if rows_in_buf >= rows_per_insert {
             let bound = full_stmt.clone().bind(&row_param_buf).map_err(to_worker_err)?;
             batch_stmts.push(bound);
-            row_param_buf = Vec::with_capacity(rows_per_insert * col_count);
+            row_param_buf.clear();
             rows_in_buf = 0;
 
             // When we have enough statements → flush the batch
@@ -129,7 +126,7 @@ pub async fn process_csv_file(
 
     logger.info(&format!(
         "✅ `{table_name}` sync complete: {count_processed} items processed ({count_new} new, {count_updated} updated)."
-    ));
+    )).await;
     Ok(())
 }
 
@@ -183,7 +180,7 @@ fn resolve_matching_columns(
 }
 
 /// Logs diagnostic info about mismatched columns between CSV and DB schema.
-fn log_column_diagnostics(
+async fn log_column_diagnostics(
     logger: &Logger,
     filename: &str,
     headers: &csv::StringRecord,
@@ -212,7 +209,7 @@ fn log_column_diagnostics(
         if !csv_only.is_empty() {
             msg.push_str(&format!(" CSV-only (ignored): {csv_only:?}"));
         }
-        logger.warn(&msg);
+        logger.warn(&msg).await;
     }
 }
 

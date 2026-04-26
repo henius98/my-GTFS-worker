@@ -1,7 +1,6 @@
 //! Dual logging: writes to both the Cloudflare Worker console and a persistent D1 `logs` table.
 use worker::{D1Database, Result};
 use worker::wasm_bindgen::JsValue;
-use std::rc::Rc;
 
 pub enum LogLevel {
     Info,
@@ -22,18 +21,18 @@ impl LogLevel {
 }
 
 pub struct Logger {
-    db: Option<Rc<D1Database>>,
+    db: Option<D1Database>,
 }
 
 impl Logger {
     /// Create a new logger. Pass `Some(d1)` to enable logging to the database table,
     /// or `None` to only log to the worker console.
     pub fn new(db: Option<D1Database>) -> Self {
-        Self { db: db.map(Rc::new) }
+        Self { db }
     }
 
-    /// Primary log function that handles both console and D1 logging asynchronously without blocking
-    pub fn log(&self, level: LogLevel, message: &str) {
+    /// Primary log function that handles both console and D1 logging
+    pub async fn log(&self, level: LogLevel, message: &str) {
         let (prefix, db_level) = level.metadata();
         let console_msg = format!("[{prefix}] {message}");
 
@@ -44,29 +43,24 @@ impl Logger {
             LogLevel::Error => worker::console_error!("{}", console_msg),
         }
 
-        // 2. Fire and forget to D1 `logs` table (if DB initialized)
+        // 2. Await write to D1 `logs` table (if DB initialized)
         if let Some(db) = &self.db {
-            let db_clone = Rc::clone(db);
-            let msg_owned = message.to_string();
-
-            worker::wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) = Self::log_to_db(&db_clone, db_level, &msg_owned).await {
-                    worker::console_error!("[ERROR] Failed to write log to D1: {:?}", e);
-                }
-            });
+            if let Err(e) = Self::log_to_db(db, db_level, message).await {
+                worker::console_error!("[ERROR] Failed to write log to D1: {:?}", e);
+            }
         }
     }
 
-    pub fn info(&self, message: &str) {
-        self.log(LogLevel::Info, message);
+    pub async fn info(&self, message: &str) {
+        self.log(LogLevel::Info, message).await;
     }
 
-    pub fn warn(&self, message: &str) {
-        self.log(LogLevel::Warn, message);
+    pub async fn warn(&self, message: &str) {
+        self.log(LogLevel::Warn, message).await;
     }
 
-    pub fn error(&self, message: &str) {
-        self.log(LogLevel::Error, message);
+    pub async fn error(&self, message: &str) {
+        self.log(LogLevel::Error, message).await;
     }
 
     /// Inserts a log row into the `logs` table with an integer level.

@@ -14,6 +14,15 @@ pub const GTFS_TABLES: &[(&str, &str)] = &[
     ("calendar.txt", "calendar"),
     ("trips.txt", "trips"),
     ("stop_times.txt", "stop_times"),
+    ("agency.txt", "agency"),
+    ("areas.txt", "areas"),
+    ("fare_leg_rules.txt", "fare_leg_rules"),
+    ("fare_media.txt", "fare_media"),
+    ("fare_products.txt", "fare_products"),
+    ("rider_categories.txt", "rider_categories"),
+    ("stop_areas.txt", "stop_areas"),
+    ("frequencies.txt", "frequencies"),
+    ("calendar_dates.txt", "calendar_dates"),
 ];
 
 // ─── D1 Limits ─────────────────────────────────────────────────────────────────
@@ -59,5 +68,11 @@ pub fn to_worker_err(e: impl std::fmt::Display) -> worker::Error {
 /// - `"mybas-johor"` → `"mybas_johor"`
 pub fn enum_to_prefix(item: &str) -> String {
     let base = item.split("category=").nth(1).unwrap_or(item);
-    base.replace('-', "_")
+    // Sanitize: only allow alphanumeric, hyphens, and underscores.
+    // This prevents SQL injection and ensures the prefix is safe for table names.
+    let sanitized: String = base
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    sanitized.replace('-', "_")
 }
