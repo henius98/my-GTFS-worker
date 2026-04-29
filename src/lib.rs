@@ -21,24 +21,32 @@ use import::import_gtfs;
 #[event(scheduled)]
 pub async fn main(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     console_error_panic_hook::set_once();
-    let _ = import_gtfs(&env).await;
+    worker::console_log!("Scheduled GTFS import started.");
+    
+    match import_gtfs(&env).await {
+        Ok(()) => worker::console_log!("Scheduled GTFS import completed successfully."),
+        Err(e) => worker::console_error!("Scheduled GTFS import failed: {e}"),
+    }
 }
 
 #[event(fetch)]
 pub async fn fetch_route(
     req: Request,
     env: Env,
-    _ctx: Context,
+    ctx: Context,
 ) -> Result<Response> {
     console_error_panic_hook::set_once();
     let url = req.url()?;
 
     match url.path() {
         "/import" => {
-            match import_gtfs(&env).await {
-                Ok(()) => Response::ok("GTFS imported successfully via fetch trigger."),
-                Err(e) => Response::error(format!("Error: {e}"), 500),
-            }
+            let env_clone = env.clone();
+            ctx.wait_until(async move {
+                if let Err(e) = import_gtfs(&env_clone).await {
+                    worker::console_error!("Background GTFS import failed: {e}");
+                }
+            });
+            Response::ok("GTFS import started in background. Check Cloudflare logs or D1 `logs` table for progress.")
         }
 
         "/" => {

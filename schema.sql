@@ -1,64 +1,65 @@
 -- Drop existing tables to allow clean recreation with new schema Types
-DROP TABLE IF EXISTS mybas_johor_trips;
-DROP TABLE IF EXISTS mybas_johor_calendar;
-DROP TABLE IF EXISTS mybas_johor_routes;
-DROP TABLE IF EXISTS mybas_johor_shapes;
-DROP TABLE IF EXISTS mybas_johor_stops;
-DROP TABLE IF EXISTS mybas_johor_stop_times;
-DROP TABLE IF EXISTS mybas_johor_agency;
-DROP TABLE IF EXISTS mybas_johor_areas;
-DROP TABLE IF EXISTS mybas_johor_fare_leg_rules;
-DROP TABLE IF EXISTS mybas_johor_fare_media;
-DROP TABLE IF EXISTS mybas_johor_fare_products;
-DROP TABLE IF EXISTS mybas_johor_rider_categories;
-DROP TABLE IF EXISTS mybas_johor_stop_areas;
+-- DROP TABLE IF EXISTS mybas_johor_trips;
+-- DROP TABLE IF EXISTS mybas_johor_calendar;
+-- DROP TABLE IF EXISTS mybas_johor_routes;
+-- DROP TABLE IF EXISTS mybas_johor_shapes;
+-- DROP TABLE IF EXISTS mybas_johor_stops;
+-- DROP TABLE IF EXISTS mybas_johor_stop_times;
+-- DROP TABLE IF EXISTS mybas_johor_agency;
+-- DROP TABLE IF EXISTS mybas_johor_areas;
+-- DROP TABLE IF EXISTS mybas_johor_fare_leg_rules;
+-- DROP TABLE IF EXISTS mybas_johor_fare_media;
+-- DROP TABLE IF EXISTS mybas_johor_fare_products;
+-- DROP TABLE IF EXISTS mybas_johor_rider_categories;
+-- DROP TABLE IF EXISTS mybas_johor_stop_areas;
 
-DROP TABLE IF EXISTS ktmb_trips;
-DROP TABLE IF EXISTS ktmb_calendar;
-DROP TABLE IF EXISTS ktmb_routes;
-DROP TABLE IF EXISTS ktmb_shapes;
-DROP TABLE IF EXISTS ktmb_stops;
-DROP TABLE IF EXISTS ktmb_stop_times;
-DROP TABLE IF EXISTS ktmb_agency;
+-- DROP TABLE IF EXISTS ktmb_trips;
+-- DROP TABLE IF EXISTS ktmb_calendar;
+-- DROP TABLE IF EXISTS ktmb_routes;
+-- DROP TABLE IF EXISTS ktmb_shapes;
+-- DROP TABLE IF EXISTS ktmb_stops;
+-- DROP TABLE IF EXISTS ktmb_stop_times;
+-- DROP TABLE IF EXISTS ktmb_agency;
 
-DROP TABLE IF EXISTS rapid_bus_mrtfeeder_trips;
-DROP TABLE IF EXISTS rapid_bus_mrtfeeder_calendar;
-DROP TABLE IF EXISTS rapid_bus_mrtfeeder_calendar_dates;
-DROP TABLE IF EXISTS rapid_bus_mrtfeeder_routes;
-DROP TABLE IF EXISTS rapid_bus_mrtfeeder_shapes;
-DROP TABLE IF EXISTS rapid_bus_mrtfeeder_stops;
-DROP TABLE IF EXISTS rapid_bus_mrtfeeder_stop_times;
-DROP TABLE IF EXISTS rapid_bus_mrtfeeder_agency;
+-- DROP TABLE IF EXISTS rapid_bus_mrtfeeder_trips;
+-- DROP TABLE IF EXISTS rapid_bus_mrtfeeder_calendar;
+-- DROP TABLE IF EXISTS rapid_bus_mrtfeeder_calendar_dates;
+-- DROP TABLE IF EXISTS rapid_bus_mrtfeeder_routes;
+-- DROP TABLE IF EXISTS rapid_bus_mrtfeeder_shapes;
+-- DROP TABLE IF EXISTS rapid_bus_mrtfeeder_stops;
+-- DROP TABLE IF EXISTS rapid_bus_mrtfeeder_stop_times;
+-- DROP TABLE IF EXISTS rapid_bus_mrtfeeder_agency;
 
-DROP TABLE IF EXISTS rapid_rail_kl_trips;
-DROP TABLE IF EXISTS rapid_rail_kl_calendar;
-DROP TABLE IF EXISTS rapid_rail_kl_routes;
-DROP TABLE IF EXISTS rapid_rail_kl_shapes;
-DROP TABLE IF EXISTS rapid_rail_kl_stops;
-DROP TABLE IF EXISTS rapid_rail_kl_stop_times;
-DROP TABLE IF EXISTS rapid_rail_kl_agency;
-DROP TABLE IF EXISTS rapid_rail_kl_frequencies;
+-- DROP TABLE IF EXISTS rapid_rail_kl_trips;
+-- DROP TABLE IF EXISTS rapid_rail_kl_calendar;
+-- DROP TABLE IF EXISTS rapid_rail_kl_routes;
+-- DROP TABLE IF EXISTS rapid_rail_kl_shapes;
+-- DROP TABLE IF EXISTS rapid_rail_kl_stops;
+-- DROP TABLE IF EXISTS rapid_rail_kl_stop_times;
+-- DROP TABLE IF EXISTS rapid_rail_kl_agency;
+-- DROP TABLE IF EXISTS rapid_rail_kl_frequencies;
 
-DROP TABLE IF EXISTS rapid_bus_kl_trips;
-DROP TABLE IF EXISTS rapid_bus_kl_calendar;
-DROP TABLE IF EXISTS rapid_bus_kl_routes;
-DROP TABLE IF EXISTS rapid_bus_kl_shapes;
-DROP TABLE IF EXISTS rapid_bus_kl_stops;
-DROP TABLE IF EXISTS rapid_bus_kl_stop_times;
-DROP TABLE IF EXISTS rapid_bus_kl_agency;
-DROP TABLE IF EXISTS rapid_bus_kl_frequencies;
+-- DROP TABLE IF EXISTS rapid_bus_kl_trips;
+-- DROP TABLE IF EXISTS rapid_bus_kl_calendar;
+-- DROP TABLE IF EXISTS rapid_bus_kl_routes;
+-- DROP TABLE IF EXISTS rapid_bus_kl_shapes;
+-- DROP TABLE IF EXISTS rapid_bus_kl_stops;
+-- DROP TABLE IF EXISTS rapid_bus_kl_stop_times;
+-- DROP TABLE IF EXISTS rapid_bus_kl_agency;
+-- DROP TABLE IF EXISTS rapid_bus_kl_frequencies;
 
-DROP TABLE IF EXISTS rapid_bus_penang_trips;
-DROP TABLE IF EXISTS rapid_bus_penang_calendar;
-DROP TABLE IF EXISTS rapid_bus_penang_routes;
-DROP TABLE IF EXISTS rapid_bus_penang_shapes;
-DROP TABLE IF EXISTS rapid_bus_penang_stops;
-DROP TABLE IF EXISTS rapid_bus_penang_stop_times;
-DROP TABLE IF EXISTS rapid_bus_penang_agency;
+-- DROP TABLE IF EXISTS rapid_bus_penang_trips;
+-- DROP TABLE IF EXISTS rapid_bus_penang_calendar;
+-- DROP TABLE IF EXISTS rapid_bus_penang_routes;
+-- DROP TABLE IF EXISTS rapid_bus_penang_shapes;
+-- DROP TABLE IF EXISTS rapid_bus_penang_stops;
+-- DROP TABLE IF EXISTS rapid_bus_penang_stop_times;
+-- DROP TABLE IF EXISTS rapid_bus_penang_agency;
 
-DROP TABLE IF EXISTS trip;
-DROP TABLE IF EXISTS vehicle_positions;
-DROP TABLE IF EXISTS logs;
+-- DROP TABLE IF EXISTS trip;
+-- DROP TABLE IF EXISTS vehicle_positions;
+-- DROP TABLE IF EXISTS logs;
+-- DROP TABLE IF EXISTS sync_status;
 
 -- realtime API data --
 CREATE TABLE IF NOT EXISTS trip (
@@ -82,6 +83,25 @@ CREATE TABLE IF NOT EXISTS logs (
     Level TINYINT NOT NULL CHECK(Level IN (0, 1, 2, 3, 4, 5)), -- 0 = Trace, 1 = Debug, 2 = Info, 3 = Warning, 4 = Error, 5 = Critical
     Message TEXT NOT NULL,
     Timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Table to prevent duplicate runs
+CREATE TABLE IF NOT EXISTS sync_status (
+    Id TEXT PRIMARY KEY,
+    IsRunning BOOLEAN DEFAULT 0,
+    LastStarted DATETIME,
+    LastFinished DATETIME
+);
+
+-- Initialize the sync row if it doesn't exist
+INSERT OR IGNORE INTO sync_status (Id, IsRunning) VALUES ('gtfs_import', 0);
+
+-- Table to track dataset versions for conditional downloads
+CREATE TABLE IF NOT EXISTS dataset_versions (
+    Prefix TEXT PRIMARY KEY,
+    ETag TEXT,
+    LastModified TEXT,
+    LastImported DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 ---------------------------------------------------------------------------------

@@ -2,7 +2,6 @@
 //! and performs bulk multi-row INSERTs into Cloudflare D1.
 
 use std::io::Cursor;
-use serde::Deserialize;
 use worker::{D1Database, Result};
 use zip::ZipArchive;
 
@@ -13,12 +12,16 @@ use crate::logger::Logger;
 
 /// Extracts a CSV file from the archive, maps its columns to the pre-fetched DB schema,
 /// and bulk-inserts the rows into the specified operator-prefixed table.
+/// 
+/// Includes filtering logic to skip stale schedules and unreferenced data,
+/// which is critical for staying within Cloudflare D1 free quota limits.
 pub async fn process_csv_file(
     d1: &D1Database,
     logger: &Logger,
     archive: &mut ZipArchive<Cursor<Vec<u8>>>,
     schema: &TableSchema,
     table_name: &str,
+    ctx: &mut ImportContext,
 ) -> Result<()> {
     let filename = schema.csv_file;
 
@@ -67,9 +70,6 @@ pub async fn process_csv_file(
     let full_insert_sql = build_multi_row_sql(table_name, &effective_col_list, col_count, rows_per_insert);
     let full_stmt = d1.prepare(&full_insert_sql);
 
-    // ── Snapshot row count BEFORE inserts (for new vs. updated tracking) ───
-    let count_before = count_rows(d1, table_name).await?;
-
     // ── Stream CSV rows into multi-row bulk inserts ────────────────────────
     let mut batch_stmts = Vec::with_capacity(D1_MAX_BATCH_STATEMENTS);
     let mut row_param_buf: Vec<worker::wasm_bindgen::JsValue> =
@@ -79,6 +79,47 @@ pub async fn process_csv_file(
 
     for result in rdr.records() {
         let record = result.map_err(to_worker_err)?;
+
+        // ── Context Tracking ────────────────────────────────────────────────
+        // We track IDs to ensure we only import relevant stop_times and shapes.
+        
+        match schema.base_name {
+            "calendar" => {
+                if let Some(sid) = get_val(&record, &headers, "service_id") {
+                    ctx.active_service_ids.insert(sid.to_string());
+                }
+            }
+            "calendar_dates" => {
+                if let Some(sid) = get_val(&record, &headers, "service_id") {
+                    ctx.active_service_ids.insert(sid.to_string());
+                }
+            }
+            "trips" => {
+                let sid = get_val(&record, &headers, "service_id").unwrap_or_default();
+                if !ctx.active_service_ids.contains(sid) {
+                    continue;
+                }
+                if let Some(tid) = get_val(&record, &headers, "trip_id") {
+                    ctx.active_trip_ids.insert(tid.to_string());
+                }
+                if let Some(shid) = get_val(&record, &headers, "shape_id") {
+                    ctx.active_shape_ids.insert(shid.to_string());
+                }
+            }
+            "stop_times" => {
+                let tid = get_val(&record, &headers, "trip_id").unwrap_or_default();
+                if !ctx.active_trip_ids.contains(tid) {
+                    continue;
+                }
+            }
+            "shapes" => {
+                let shid = get_val(&record, &headers, "shape_id").unwrap_or_default();
+                if !ctx.active_shape_ids.contains(shid) {
+                    continue;
+                }
+            }
+            _ => {}
+        }
 
         // Append this row's column values to the param buffer
         for &idx in &csv_indices {
@@ -119,15 +160,15 @@ pub async fn process_csv_file(
         d1.batch(batch_stmts).await.map_err(to_worker_err)?;
     }
 
-    // ── Compute new vs. updated from row count difference ──────────────────
-    let count_after = count_rows(d1, table_name).await?;
-    let count_new = count_after.saturating_sub(count_before);
-    let count_updated = count_processed.saturating_sub(count_new);
-
     logger.info(&format!(
-        "✅ `{table_name}` sync complete: {count_processed} items processed ({count_new} new, {count_updated} updated)."
+        "✅ `{table_name}` sync complete: {count_processed} items processed."
     )).await;
     Ok(())
+}
+
+/// Helper to extract a value from a CSV record by column name.
+fn get_val<'a>(record: &'a csv::StringRecord, headers: &csv::StringRecord, key: &str) -> Option<&'a str> {
+    headers.iter().position(|h| h == key).and_then(|i| record.get(i))
 }
 
 // ─── SQL Builder ───────────────────────────────────────────────────────────────
@@ -213,20 +254,3 @@ async fn log_column_diagnostics(
     }
 }
 
-// ─── D1 Query Helpers ──────────────────────────────────────────────────────────
-
-/// Row count result from `SELECT COUNT(*)`.
-#[derive(Deserialize)]
-struct CountResult {
-    count: u32,
-}
-
-/// Returns the current row count for a table. Used before/after inserts to
-/// accurately calculate new vs. updated rows (since SQLite's `changes()` does
-/// not count implicit deletes from REPLACE conflict resolution).
-async fn count_rows(d1: &D1Database, table_name: &str) -> Result<u32> {
-    let query = format!("SELECT COUNT(*) AS count FROM {table_name}");
-    let result = d1.prepare(&query).all().await?;
-    let rows: Vec<CountResult> = result.results()?;
-    Ok(rows.first().map(|r| r.count).unwrap_or(0))
-}

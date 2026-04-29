@@ -8,13 +8,14 @@ use serde::Deserialize;
 // e.g., ("routes.txt", "routes") → "ktmb_routes", "rapid_bus_penang_routes", etc.
 // Columns are discovered automatically from schema.sql via PRAGMA table_info.
 pub const GTFS_TABLES: &[(&str, &str)] = &[
-    ("shapes.txt", "shapes"),
-    ("routes.txt", "routes"),
-    ("stops.txt", "stops"),
+    ("agency.txt", "agency"),
     ("calendar.txt", "calendar"),
+    ("calendar_dates.txt", "calendar_dates"),
+    ("routes.txt", "routes"),
     ("trips.txt", "trips"),
     ("stop_times.txt", "stop_times"),
-    ("agency.txt", "agency"),
+    ("shapes.txt", "shapes"),
+    ("stops.txt", "stops"),
     ("areas.txt", "areas"),
     ("fare_leg_rules.txt", "fare_leg_rules"),
     ("fare_media.txt", "fare_media"),
@@ -22,7 +23,6 @@ pub const GTFS_TABLES: &[(&str, &str)] = &[
     ("rider_categories.txt", "rider_categories"),
     ("stop_areas.txt", "stop_areas"),
     ("frequencies.txt", "frequencies"),
-    ("calendar_dates.txt", "calendar_dates"),
 ];
 
 // ─── D1 Limits ─────────────────────────────────────────────────────────────────
@@ -50,6 +50,21 @@ pub struct TableSchema {
     pub rows_per_insert: usize,
     /// Pre-built comma-separated column list for SQL (e.g. "col_a, col_b, col_c").
     pub col_list: String,
+}
+
+/// Stores IDs of active entities to filter during import (minimizes D1 writes).
+#[derive(Default)]
+pub struct ImportContext {
+    pub active_service_ids: std::collections::HashSet<String>,
+    pub active_trip_ids: std::collections::HashSet<String>,
+    pub active_shape_ids: std::collections::HashSet<String>,
+}
+
+/// Represents the version info for a dataset stored in D1.
+#[derive(Deserialize, Debug, Default)]
+pub struct DatasetVersion {
+    pub ETag: Option<String>,
+    pub LastModified: Option<String>,
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────

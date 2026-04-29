@@ -16,9 +16,28 @@ use crate::schema::prefetch_table_schemas;
 /// variations (e.g., missing tables or optional columns) between datasets.
 pub async fn import_gtfs(env: &Env) -> Result<()> {
     let logger = Logger::new(env.d1("DB").ok());
+    let d1 = env.d1("DB")?;
+
+    // ── Check/Acquire distributed lock ──────────────────────────────────────
+    let lock_query = "
+        UPDATE sync_status 
+        SET IsRunning = 1, LastStarted = CURRENT_TIMESTAMP 
+        WHERE Id = 'gtfs_import' 
+          AND (IsRunning = 0 OR LastStarted < datetime('now', '-1 hour'))
+    ";
+    
+    let lock_result = d1.prepare(lock_query).run().await?;
+    let changes = match lock_result.meta()? {
+        Some(m) => m.changes.unwrap_or(0),
+        None => 0,
+    };
+    
+    if changes == 0 {
+        logger.warn("Import skipped: Another sync is already in progress.").await;
+        return Ok(());
+    }
 
     let result = async {
-        let d1 = env.d1("DB")?;
         let base_url = env.var("GTFS_STATIC_URL")?.to_string();
         let enum_str = env.var("GTFS_STATIC_ENUM")?.to_string();
 
@@ -29,69 +48,110 @@ pub async fn import_gtfs(env: &Env) -> Result<()> {
             .filter(|s| !s.is_empty())
             .collect();
 
-        if items.is_empty() {
-            logger.warn("GTFS_STATIC_ENUM is empty, nothing to import.").await;
-            return Ok(());
-        }
-
         for item in &items {
             let prefix = enum_to_prefix(item);
             let target_url = format!("{base_url}{item}");
+            let start_time = worker::Date::now().as_millis();
 
-            // Wrap each operator's import in an async block to catch errors locally.
-            // This ensures that a failure in one dataset (e.g. network timeout)
-            // does not prevent other datasets from being imported.
             let op_result = async {
-                logger.info(&format!("Downloading GTFS data from: {target_url}")).await;
+                // 1. Check existing version in DB to enable conditional GET
+                let version: DatasetVersion = d1.prepare("SELECT ETag, LastModified FROM dataset_versions WHERE Prefix = ?")
+                    .bind(&[prefix.clone().into()])?
+                    .first()
+                    .await?
+                    .unwrap_or_default();
 
-                // Pre-fetch column schemas specifically for this operator's prefix.
+                logger.info(&format!("Checking for updates: {target_url}")).await;
+
+                let (bytes, new_etag, new_lm) = fetch_gtfs_with_cache(&target_url, &version).await?;
+
+                if bytes.is_empty() {
+                    logger.info(&format!("Dataset {item} is up to date (304 Not Modified). Skipping import.")).await;
+                    return Ok(());
+                }
+
+                logger.info(&format!("Update found. Downloaded ZIP size: {} bytes", bytes.len())).await;
+
+                // Pre-fetch column schemas for this operator
                 let schemas = prefetch_table_schemas(&d1, &logger, &prefix).await?;
-
-                let bytes = fetch_zip_bytes(&target_url).await?;
-                logger.info(&format!("Downloaded ZIP size: {} bytes", bytes.len())).await;
-
                 let cursor = Cursor::new(bytes);
                 let mut archive = ZipArchive::new(cursor).map_err(to_worker_err)?;
 
-                // Process each GTFS table with the operator-prefixed table name
+                // 2. Initialize ImportContext to track active IDs (Save D1 Writes)
+                let mut ctx = ImportContext::default();
+
                 for schema in &schemas {
                     let table_name = format!("{prefix}_{}", schema.base_name);
-                    process_csv_file(&d1, &logger, &mut archive, schema, &table_name).await?;
+                    process_csv_file(&d1, &logger, &mut archive, schema, &table_name, &mut ctx).await?;
                 }
+
+                // 3. Update version info in DB after successful import
+                d1.prepare("INSERT OR REPLACE INTO dataset_versions (Prefix, ETag, LastModified, LastImported) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)")
+                    .bind(&[prefix.into(), new_etag.into(), new_lm.into()])?
+                    .run()
+                    .await?;
+
                 Ok::<(), worker::Error>(())
             }
             .await;
 
+            let duration = worker::Date::now().as_millis() - start_time;
             if let Err(e) = op_result {
-                logger.error(&format!("Skipping dataset {item} due to error: {e}")).await;
+                logger.error(&format!("Skipping dataset {item} due to error: {e} (Took {}ms)", duration)).await;
                 continue;
             }
-
-            logger.info(&format!("Finished dataset import for: {item}")).await;
+            logger.info(&format!("Finished dataset import for: {item} (Took {}ms)", duration)).await;
         }
 
-        logger.info("Successfully imported all GTFS data into D1.").await;
+        logger.info("Successfully processed all GTFS datasets.").await;
         Ok(())
     }
     .await;
 
-    // Catch and log any errors that bubbled up from the `?` operators
     if let Err(ref e) = result {
         logger.error(&format!("GTFS import failed: {e}")).await;
     }
 
+    // ── Release distributed lock ────────────────────────────────────────────
+    let _ = d1.prepare("UPDATE sync_status SET IsRunning = 0, LastFinished = CURRENT_TIMESTAMP WHERE Id = 'gtfs_import'")
+        .run()
+        .await;
+
     result
 }
 
-/// Downloads a ZIP file from the given URL and returns the raw bytes.
-async fn fetch_zip_bytes(url: &str) -> Result<Vec<u8>> {
+/// Downloads a ZIP file with conditional headers (ETag/Last-Modified).
+/// Returns (bytes, new_etag, new_last_modified). If bytes is empty, content is unchanged.
+async fn fetch_gtfs_with_cache(
+    url: &str, 
+    version: &DatasetVersion
+) -> Result<(Vec<u8>, Option<String>, Option<String>)> {
+    let mut headers = worker::Headers::new();
+    if let Some(ref etag) = version.ETag {
+        headers.set("If-None-Match", etag)?;
+    }
+    if let Some(ref lm) = version.LastModified {
+        headers.set("If-Modified-Since", lm)?;
+    }
+
     let req = Request::new_with_init(
         url,
         &RequestInit {
             method: Method::Get,
+            headers,
             ..Default::default()
         },
     )?;
 
-    Fetch::Request(req).send().await?.bytes().await
+    let mut resp = Fetch::Request(req).send().await?;
+    
+    if resp.status_code() == 304 {
+        return Ok((vec![], None, None));
+    }
+
+    let new_etag = resp.headers().get("ETag")?;
+    let new_lm = resp.headers().get("Last-Modified")?;
+    let bytes = resp.bytes().await?;
+
+    Ok((bytes, new_etag, new_lm))
 }
