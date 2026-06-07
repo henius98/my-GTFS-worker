@@ -7,18 +7,25 @@ import os
 import glob
 import csv
 
-providers = [
-    {"name": "mybas-johor", "url": "https://api.data.gov.my/gtfs-static/mybas-johor"},
-    {"name": "ktmb", "url": "https://api.data.gov.my/gtfs-static/ktmb"},
-    {"name": "rapid-bus-mrtfeeder",
-        "url": "https://api.data.gov.my/gtfs-static/prasarana?category=rapid-bus-mrtfeeder"},
-    {"name": "rapid-rail-kl",
-        "url": "https://api.data.gov.my/gtfs-static/prasarana?category=rapid-rail-kl"},
-    {"name": "rapid-bus-kl",
-        "url": "https://api.data.gov.my/gtfs-static/prasarana?category=rapid-bus-kl"},
-    {"name": "rapid-bus-penang",
-        "url": "https://api.data.gov.my/gtfs-static/prasarana?category=rapid-bus-penang"}
-]
+import os
+
+providers_file = os.path.join(os.path.dirname(__file__), '..', 'providers.toml')
+providers = []
+with open(providers_file, 'r') as f:
+    content = f.read()
+
+blocks = content.split('[[providers]]')[1:]
+for block in blocks:
+    name_match = re.search(r'name\s*=\s*"([^"]+)"', block)
+    url_match = re.search(r'static_url\s*=\s*"([^"]+)"', block)
+    provider_match = re.search(r'static_provider\s*=\s*"([^"]+)"', block)
+    if name_match and url_match and provider_match:
+        is_active_match = re.search(r'is_active\s*=\s*(false|False)', block)
+        if not is_active_match:
+            providers.append({
+                "name": name_match.group(1),
+                "url": url_match.group(1) + provider_match.group(1)
+            })
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False

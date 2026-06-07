@@ -68,6 +68,10 @@ with open(OUTPUT_FILE, "w") as out:
         if not name:
             continue
             
+        is_active_match = re.search(r'is_active\s*=\s*(false|False)', block)
+        if is_active_match:
+            continue
+            
         db_id = get_val("database_id") or ""
         db_name = f"gtfs-{name}-db"
         binding_name = f"DB_{name.upper().replace('-', '_')}"
