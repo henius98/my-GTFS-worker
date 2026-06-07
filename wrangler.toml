@@ -1,27 +1,61 @@
+# AUTO-GENERATED from providers.toml — do not edit directly.
+# Regenerate with: ./generate-wrangler.sh
+
 name = "my-gtfs-worker"
-main = "build/worker/shim.mjs"
-compatibility_date = "2024-03-20"
+main = "worker/build/worker/shim.mjs"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
 
-# Cron trigger: Runs every 4 hours (MYT is UTC+8, so 20:00 UTC)
-[triggers]
-crons = ["0 */4 * * *"]
-
-# Bind to Cloudflare D1
-[[d1_databases]]
-binding = "DB"
-database_name = "my-gtfs-db-prod"
-database_id = "22a5c5fc-adb6-4b49-aef9-36990ca85189"
-
-[vars]
-GTFS_STATIC_URL = "https://api.data.gov.my/gtfs-static/"
-# Enum option refer: https://developer.data.gov.my/realtime-api/gtfs-static
-GTFS_STATIC_ENUM = """mybas-johor,
-ktmb,
-prasarana?category=rapid-bus-mrtfeeder,
-prasarana?category=rapid-rail-kl,
-prasarana?category=rapid-bus-kl,
-prasarana?category=rapid-bus-penang"""
-
+[observability]
+enabled = true
 
 [build]
 command = "bash ./build.sh"
+
+# ─── Provider D1 Databases ──────────────────────────────────────────────────
+# All providers share the same worker, but queries route to the specific D1 database.
+#
+# Deploy:     ./deploy.sh
+# Logs:       wrangler tail
+
+# ── mybas-johor ─────────────────────────────────────────────────────────────
+[[d1_databases]]
+binding = "DB_MYBAS_JOHOR"
+database_name = "gtfs-mybas-johor-db"
+database_id = "93576d0b-86fd-42ff-b86a-bdaea2a786a1"
+migrations_dir = "migrations/mybas-johor"
+
+# ── ktmb ─────────────────────────────────────────────────────────────
+[[d1_databases]]
+binding = "DB_KTMB"
+database_name = "gtfs-ktmb-db"
+database_id = "71f2af52-7440-4d82-b3d2-61423a76d397"
+migrations_dir = "migrations/ktmb"
+
+# ── rapid-bus-mrtfeeder ─────────────────────────────────────────────────────────────
+[[d1_databases]]
+binding = "DB_RAPID_BUS_MRTFEEDER"
+database_name = "gtfs-rapid-bus-mrtfeeder-db"
+database_id = "3dff36d4-888d-4634-a318-59e0ae1c77cb"
+migrations_dir = "migrations/rapid-bus-mrtfeeder"
+
+# ── rapid-rail-kl ─────────────────────────────────────────────────────────────
+[[d1_databases]]
+binding = "DB_RAPID_RAIL_KL"
+database_name = "gtfs-rapid-rail-kl-db"
+database_id = "99afff73-6a80-4053-8b13-094703829623"
+migrations_dir = "migrations/rapid-rail-kl"
+
+# ── rapid-bus-kl ─────────────────────────────────────────────────────────────
+[[d1_databases]]
+binding = "DB_RAPID_BUS_KL"
+database_name = "gtfs-rapid-bus-kl-db"
+database_id = "1bc7d877-bd2c-4581-9b78-2ef282487dab"
+migrations_dir = "migrations/rapid-bus-kl"
+
+# ── rapid-bus-penang ─────────────────────────────────────────────────────────────
+[[d1_databases]]
+binding = "DB_RAPID_BUS_PENANG"
+database_name = "gtfs-rapid-bus-penang-db"
+database_id = "9a45613d-0219-4384-9557-afa65d878ddd"
+migrations_dir = "migrations/rapid-bus-penang"

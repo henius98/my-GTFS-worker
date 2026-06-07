@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # 1. Install Rust Toolchain if not present
 if ! command -v cargo &> /dev/null; then
@@ -8,12 +8,16 @@ if ! command -v cargo &> /dev/null; then
     source "$HOME/.cargo/env"
 fi
 
-# 2. Ensure worker-build is installed
+# 2. Ensure wasm32 target is installed
+echo "Ensuring wasm32-unknown-unknown target is installed..."
+rustup target add wasm32-unknown-unknown
+
+# 3. Ensure worker-build is installed (optimized via --locked)
 if ! command -v worker-build &> /dev/null; then
     echo "worker-build not found. Installing..."
-    cargo install -q worker-build
+    cargo install -q worker-build --locked
 fi
 
-# 3. Build the worker
+# 4. Build the worker
 echo "Building worker..."
-worker-build --release
+cd worker && worker-build --release

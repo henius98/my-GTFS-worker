@@ -1,0 +1,15 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Sync bashrc to env",
+            "type": "shell",
+            "command": "sed -n '/# region my-GTFS-wroker/,/# endregion my-GTFS-wroker/p' ~/.bashrc | grep -v 'region my-GTFS-wroker' | sed 's/^export //' > ${workspaceFolder}/.env",
+            "presentation": {
+                "reveal": "silent",
+                "panel": "shared",
+                "clear": true
+            }
+        }
+    ]
+}

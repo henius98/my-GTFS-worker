@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug Importer",
+            "cargo": {
+                "args": ["build", "--bin=importer", "--package=importer"]
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Sync bashrc to env",
+            "envFile": "${workspaceFolder}/.env",
+        }
+    ]
+}
