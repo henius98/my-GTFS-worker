@@ -21,9 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for provider in config.providers.into_iter() {
         if !provider.is_active || provider.database_id.is_empty() {
-            if provider.is_active {
-                println!("Skipping provider {}: database_id is empty", provider.name);
-            }
+            println!("Skipping provider {}: database_id is empty or is_active false", provider.name);
             continue;
         }
 
