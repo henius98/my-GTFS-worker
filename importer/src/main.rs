@@ -20,12 +20,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut handles = vec![];
 
     for provider in config.providers.into_iter() {
-        if !provider.is_active {
-            continue;
-        }
-
-        if provider.database_id.is_empty() {
-            println!("Skipping provider {}: database_id is empty", provider.name);
+        if !provider.is_active || provider.database_id.is_empty() {
+            if provider.is_active {
+                println!("Skipping provider {}: database_id is empty", provider.name);
+            }
             continue;
         }
 
