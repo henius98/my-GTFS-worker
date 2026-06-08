@@ -11,39 +11,39 @@ name = "mybas-johor"
 is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "mybas-johor"
-database_id = "ceab48e4-22b9-41ab-8280-3fdaceb2651e"
+database_id = ""
 
 [[providers]]
 name = "ktmb"
 is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "ktmb"
-database_id = "83d27857-1ed2-49a1-91d8-452a30c3fb3e"
+database_id = ""
 
 [[providers]]
 name = "rapid-bus-mrtfeeder"
 is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "prasarana?category=rapid-bus-mrtfeeder"
-database_id = "bb1f9bf5-f4b3-43be-8e83-b51b2fb54bd9"
+database_id = ""
 
 [[providers]]
 name = "rapid-rail-kl"
 is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "prasarana?category=rapid-rail-kl"
-database_id = "b8323ceb-d188-439c-a2dd-3c4b89f817b6"
+database_id = ""
 
 [[providers]]
 name = "rapid-bus-kl"
 is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "prasarana?category=rapid-bus-kl"
-database_id = "102d2871-a2c8-4930-999e-9a1b1262d4f6"
+database_id = ""
 
 [[providers]]
 name = "rapid-bus-penang"
 is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "prasarana?category=rapid-bus-penang"
-database_id = "3b092c45-d136-4c12-bd8e-ee4734d2affb"
+database_id = ""

@@ -31,15 +31,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Processing provider: {}", provider.name);
             if let Err(e) = processor::process_provider(&client, &provider, csv_sem).await {
                 println!("Error processing provider {}: {}", provider.name, e);
+                return Err(format!("Provider {} failed: {}", provider.name, e));
             }
+            Ok(())
         });
         handles.push(handle);
     }
 
+    let mut has_error = false;
     for handle in handles {
-        if let Err(e) = handle.await {
-            println!("Task failed to join: {}", e);
+        match handle.await {
+            Ok(Err(_e)) => {
+                has_error = true;
+            }
+            Err(e) => {
+                println!("Task failed to join: {}", e);
+                has_error = true;
+            }
+            _ => {}
         }
+    }
+
+    if has_error {
+        return Err("One or more providers failed to process".into());
     }
 
     Ok(())

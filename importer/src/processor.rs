@@ -75,7 +75,7 @@ impl BatchWorker {
         let mut error = false;
         while batch_tasks.len() >= self.limit {
             if let Some(res) = batch_tasks.join_next().await
-                && handle_task_result(res)
+                && handle_task_result(res, &self.provider.name)
             {
                 error = true;
             }
@@ -84,14 +84,14 @@ impl BatchWorker {
     }
 }
 
-fn handle_task_result(res: Result<Result<(), ProcessorError>, tokio::task::JoinError>) -> bool {
+fn handle_task_result(res: Result<Result<(), ProcessorError>, tokio::task::JoinError>, provider_name: &str) -> bool {
     match res {
         Ok(Err(e)) => {
-            println!("Batch insert failed: {}", e);
+            println!("[{}] Batch insert failed: {}", provider_name, e);
             true
         }
         Err(e) => {
-            println!("Task join error: {}", e);
+            println!("[{}] Task join error: {}", provider_name, e);
             true
         }
         _ => false,
@@ -115,19 +115,19 @@ pub async fn check_etag(d1_client: &D1Client, provider: &ProviderConfig) -> Resu
     Ok((target_url, remote_etag, etag_changed))
 }
 
-fn get_resume_state(row: Option<&serde_json::Value>, csv_file: &str, file_crc: &str) -> Option<u64> {
+fn get_resume_state(row: Option<&serde_json::Value>, csv_file: &str, file_crc: &str, provider_name: &str) -> Option<u64> {
     let mut last_processed = 0;
     let mut force_restart_file = false;
 
     if let Some(row) = row {
         let db_crc = row.get("CRC").and_then(|v| v.as_str()).unwrap_or("");
         if db_crc != file_crc {
-            println!("File {} changed (CRC: {} -> {}). Restarting file.", csv_file, db_crc, file_crc);
+            println!("[{}] File {} changed (CRC: {} -> {}). Restarting file.", provider_name, csv_file, db_crc, file_crc);
             force_restart_file = true;
         } else {
             let status = row.get("Status").and_then(|v| v.as_i64()).unwrap_or(-1);
             if status == 0 {
-                println!("Skipping {}, already completed.", csv_file);
+                println!("[{}] Skipping {}, already completed.", provider_name, csv_file);
                 return None;
             }
             last_processed = row.get("LastProcessedLine").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -143,6 +143,7 @@ fn get_resume_state(row: Option<&serde_json::Value>, csv_file: &str, file_crc: &
 
 struct CsvExtractJob {
     bytes: Bytes,
+    provider_name: String,
     csv_file: String,
     table_name: String,
     db_columns: &'static [&'static str],
@@ -167,7 +168,7 @@ fn extract_and_batch_csv(job: CsvExtractJob, rows_processed_this_run: Arc<Atomic
     }
 
     if matched_cols.is_empty() {
-        println!("No matching columns, skip");
+        println!("[{}] No matching columns in {}, skip", job.provider_name, job.csv_file);
         return Ok((true, false, job.last_processed));
     }
 
@@ -275,7 +276,7 @@ impl ProviderProcessor {
         }
 
         while let Some(res) = batch_tasks.join_next().await {
-            if handle_task_result(res) {
+            if handle_task_result(res, &self.provider.name) {
                 file_error = true;
             }
         }
@@ -284,7 +285,7 @@ impl ProviderProcessor {
     }
 
     pub async fn process_csv_file(&self, bytes: Bytes, csv_file: &str, file_crc: &str, table_name: &str, db_columns: &'static [&'static str], last_processed: u64) -> Result<bool, ProcessorError> {
-        println!("Importing {} (resuming from {})", csv_file, last_processed);
+        println!("[{}] Importing {} (resuming from {})", self.provider.name, csv_file, last_processed);
         self.d1_client
             .init_file_progress(&self.provider.database_id, &self.provider.name, csv_file, file_crc, last_processed, 1)
             .await?;
@@ -298,6 +299,7 @@ impl ProviderProcessor {
 
         let job = CsvExtractJob {
             bytes,
+            provider_name: self.provider.name.clone(),
             csv_file: csv_file.to_string(),
             table_name: table_name.to_string(),
             db_columns,
@@ -331,20 +333,20 @@ pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, c
     if !etag_changed {
         let incomplete = d1_client.get_incomplete_files_count(&provider.database_id, &provider.name).await?;
         if incomplete == 0 {
-            println!("Zip unchanged and all files processed. Skipping.");
+            println!("[{}] Zip unchanged and all files processed. Skipping.", provider.name);
             return Ok(());
         } else {
-            println!("Zip unchanged, but {} files are incomplete. Resuming.", incomplete);
+            println!("[{}] Zip unchanged, but {} files are incomplete. Resuming.", provider.name, incomplete);
         }
     } else {
-        println!("Zip ETag changed (new: {}). Starting new import.", remote_etag);
+        println!("[{}] Zip ETag changed (new: {}). Starting new import.", provider.name, remote_etag);
         d1_client.set_dataset_version(&provider.database_id, &provider.name, &remote_etag).await?;
     }
 
-    println!("Downloading GTFS zip from {}", target_url);
+    println!("[{}] Downloading GTFS zip from {}", provider.name, target_url);
     let response = d1_client.client.get(&target_url).send().await?.error_for_status()?;
     let bytes = response.bytes().await?;
-    println!("Downloaded {} bytes", bytes.len());
+    println!("[{}] Downloaded {} bytes", provider.name, bytes.len());
 
     let mut file_names_and_crcs = Vec::new();
     let schemas = parse_provider_schemas(&provider.name).unwrap_or(&[]);
@@ -364,11 +366,11 @@ pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, c
 
                 let db_columns = schemas.iter().find(|(t, _)| *t == table_name).map(|(_, cols)| *cols);
                 let Some(db_columns) = db_columns else {
-                    println!("Skipping unsupported GTFS file: {} (no schema)", table_name);
+                    println!("[{}] Skipping unsupported GTFS file: {} (no schema)", provider.name, table_name);
                     continue;
                 };
                 if db_columns.is_empty() {
-                    println!("Skipping unsupported GTFS file: {} (empty schema)", table_name);
+                    println!("[{}] Skipping unsupported GTFS file: {} (empty schema)", provider.name, table_name);
                     continue;
                 }
 
@@ -384,7 +386,7 @@ pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, c
 
     for (csv_file, crc_str, table_name, db_columns) in file_names_and_crcs {
         let row = all_progress_rows.iter().find(|r| r.get("FileName").and_then(|v| v.as_str()) == Some(csv_file.as_str()));
-        let Some(last_processed) = get_resume_state(row, &csv_file, &crc_str) else {
+        let Some(last_processed) = get_resume_state(row, &csv_file, &crc_str, &provider.name) else {
             continue;
         };
 
@@ -393,7 +395,7 @@ pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, c
 
         let handle = tokio::spawn(async move {
             if let Err(e) = processor_clone.process_csv_file(bytes_clone, &csv_file, &crc_str, &table_name, db_columns, last_processed).await {
-                println!("Error processing {} for {}: {}", csv_file, processor_clone.provider.name, e);
+                println!("[{}] Error processing {}: {}", processor_clone.provider.name, csv_file, e);
             }
         });
         csv_tasks.push(handle);
@@ -403,6 +405,6 @@ pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, c
         let _ = handle.await;
     }
 
-    println!("Completed run for {}. Total rows: {}", provider.name, processor.rows_processed_this_run.load(Ordering::Relaxed));
+    println!("[{}] Completed run. Total rows: {}", provider.name, processor.rows_processed_this_run.load(Ordering::Relaxed));
     Ok(())
 }
