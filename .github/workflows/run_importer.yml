@@ -8,6 +8,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NODE_OPTIONS: "--no-deprecation"
 
 # Ensure only one import runs at a time to prevent D1 database state corruption
 concurrency:
@@ -27,7 +28,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download latest-cron -p importer -O importer_bin
+          gh release download latest-cron -p importer -O importer_bin --clobber
           chmod +x importer_bin
 
       - name: Run Importer

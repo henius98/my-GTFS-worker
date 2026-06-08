@@ -12,6 +12,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NODE_OPTIONS: "--no-deprecation"
 
 jobs:
   build:
@@ -40,8 +41,9 @@ jobs:
           # Using gh cli which is pre-installed on ubuntu runners
 
           # Delete the release and tag if they exist locally and remotely
-          gh release delete latest-cron -y --cleanup-tag || true
-          git push origin :refs/tags/latest-cron || true
+          if gh release view latest-cron >/dev/null 2>&1; then
+            gh release delete latest-cron -y --cleanup-tag
+          fi
 
           # Create the release and upload the binary
           gh release create latest-cron target/release/importer \
