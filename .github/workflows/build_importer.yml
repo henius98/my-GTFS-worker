@@ -6,8 +6,11 @@ on:
       - main
     paths:
       - "importer/**"
+      - "migrations/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain"
+      - ".github/workflows/build_importer.yml"
   workflow_dispatch:
 
 env:
