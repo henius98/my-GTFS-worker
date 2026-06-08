@@ -34,22 +34,21 @@ fn parse_schema_file(path: &Path) -> std::collections::HashMap<String, Vec<Strin
                 current_cols.clear();
 
                 if line.ends_with(");") {
-                    if let (Some(start), Some(end)) = (line.find('('), line.rfind(')')) {
-                        if start < end {
-                            let cols_str = &line[start + 1..end];
-                            for col_def in cols_str.split(',') {
-                                let col_def = col_def.trim();
-                                let col_upper = col_def.to_uppercase();
-                                if !col_upper.starts_with("PRIMARY KEY")
-                                    && !col_upper.starts_with("FOREIGN KEY")
-                                    && !col_upper.starts_with("UNIQUE")
-                                    && !col_upper.starts_with("CHECK")
-                                    && let Some(col_name) = col_def.split_whitespace().next()
-                                {
-                                    if !col_name.is_empty() {
-                                        current_cols.push(col_name.to_string());
-                                    }
-                                }
+                    if let (Some(start), Some(end)) = (line.find('('), line.rfind(')'))
+                        && start < end
+                    {
+                        let cols_str = &line[start + 1..end];
+                        for col_def in cols_str.split(',') {
+                            let col_def = col_def.trim();
+                            let col_upper = col_def.to_uppercase();
+                            if !col_upper.starts_with("PRIMARY KEY")
+                                && !col_upper.starts_with("FOREIGN KEY")
+                                && !col_upper.starts_with("UNIQUE")
+                                && !col_upper.starts_with("CHECK")
+                                && let Some(col_name) = col_def.split_whitespace().next()
+                                && !col_name.is_empty()
+                            {
+                                current_cols.push(col_name.to_string());
                             }
                         }
                     }
