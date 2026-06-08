@@ -37,10 +37,12 @@ struct BatchWorker {
     csv_file: String,
     insert_sql: String,
     limit: usize,
+    d1_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl BatchWorker {
     async fn flush_batch(self, json_batch: Vec<serde_json::Value>, last_processed: u64) -> Result<(), ProcessorError> {
+        let _permit = self.d1_semaphore.acquire().await.map_err(|e| ProcessorError::D1(D1Error::ApiError(format!("Semaphore error: {}", e))))?;
         let batch_size = json_batch.len() as u64;
         let json_str = serde_json::to_string(&json_batch)?;
 
@@ -230,15 +232,17 @@ pub struct ProviderProcessor {
     d1_client: D1Client,
     provider: ProviderConfig,
     csv_semaphore: Arc<tokio::sync::Semaphore>,
+    d1_semaphore: Arc<tokio::sync::Semaphore>,
     rows_processed_this_run: Arc<AtomicU64>,
 }
 
 impl ProviderProcessor {
-    pub fn new(d1_client: D1Client, provider: ProviderConfig, csv_semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+    pub fn new(d1_client: D1Client, provider: ProviderConfig, csv_semaphore: Arc<tokio::sync::Semaphore>, d1_semaphore: Arc<tokio::sync::Semaphore>) -> Self {
         Self {
             d1_client,
             provider,
             csv_semaphore,
+            d1_semaphore,
             rows_processed_this_run: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -258,6 +262,7 @@ impl ProviderProcessor {
                             csv_file: csv_file.clone(),
                             insert_sql: sql,
                             limit: std::env::var("D1_CONCURRENCY_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(5),
+                            d1_semaphore: self.d1_semaphore.clone(),
                         });
                     }
                 }
@@ -327,7 +332,7 @@ impl ProviderProcessor {
     }
 }
 
-pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, csv_semaphore: Arc<tokio::sync::Semaphore>) -> Result<(), ProcessorError> {
+pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, csv_semaphore: Arc<tokio::sync::Semaphore>, d1_semaphore: Arc<tokio::sync::Semaphore>) -> Result<(), ProcessorError> {
     let (target_url, remote_etag, etag_changed) = check_etag(d1_client, provider).await?;
 
     if !etag_changed {
@@ -381,7 +386,7 @@ pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, c
     }
 
     let all_progress_rows = d1_client.get_all_files_progress(&provider.database_id, &provider.name).await?;
-    let processor = Arc::new(ProviderProcessor::new(d1_client.clone(), provider.clone(), csv_semaphore.clone()));
+    let processor = Arc::new(ProviderProcessor::new(d1_client.clone(), provider.clone(), csv_semaphore.clone(), d1_semaphore.clone()));
     let mut csv_tasks = vec![];
 
     for (csv_file, crc_str, table_name, db_columns) in file_names_and_crcs {
@@ -396,13 +401,27 @@ pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, c
         let handle = tokio::spawn(async move {
             if let Err(e) = processor_clone.process_csv_file(bytes_clone, &csv_file, &crc_str, &table_name, db_columns, last_processed).await {
                 println!("[{}] Error processing {}: {}", processor_clone.provider.name, csv_file, e);
+                return Err(e);
             }
+            Ok(())
         });
         csv_tasks.push(handle);
     }
 
+    let mut has_csv_error = false;
     for handle in csv_tasks {
-        let _ = handle.await;
+        match handle.await {
+            Ok(Err(_e)) => has_csv_error = true,
+            Err(e) => {
+                println!("[{}] CSV task join error: {}", provider.name, e);
+                has_csv_error = true;
+            }
+            _ => {}
+        }
+    }
+
+    if has_csv_error {
+        return Err(ProcessorError::D1(D1Error::ApiError("One or more CSV processing tasks failed".into())));
     }
 
     println!("[{}] Completed run. Total rows: {}", provider.name, processor.rows_processed_this_run.load(Ordering::Relaxed));
