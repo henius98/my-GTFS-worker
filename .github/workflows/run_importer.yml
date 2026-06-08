@@ -1,0 +1,37 @@
+name: GTFS Import Pipeline
+
+on:
+  schedule:
+    # Run every 1 hours. Adjust frequency based on chunk sizes and D1 limits.
+    - cron: "0 */1 * * *"
+  workflow_dispatch: # Allow manual triggers
+
+# Ensure only one import runs at a time to prevent D1 database state corruption
+concurrency:
+  group: gtfs-import
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # Fail-safe to prevent runaways from consuming free tier minutes
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Pre-built Importer
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download latest-cron -p importer
+          chmod +x importer
+
+      - name: Run Importer
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT }}
+          MAX_ROWS_PER_RUN: ${{ vars.MAX_ROWS_PER_RUN }}
+          QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE }}
+        run: ./importer

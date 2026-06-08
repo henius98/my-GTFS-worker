@@ -126,11 +126,9 @@ echo ""
 # ── Step 3: Apply D1 migrations ──────────────────────────────────────────────
 for PROVIDER in $PROVIDERS; do
     if [ ! -d "migrations/${PROVIDER}" ]; then
-        echo "→ Migrations folder 'migrations/${PROVIDER}' not found. Auto-scaffolding..."
+        echo "→ Migrations folder 'migrations/${PROVIDER}' not found. Creating empty directory..."
         mkdir -p "migrations/${PROVIDER}"
-        TIMESTAMP=$(date +%Y%m%d%H%M%S)
-        cp schema.sql "migrations/${PROVIDER}/${TIMESTAMP}_gtfs_schema.sql"
-        echo "  Created migrations/${PROVIDER}/${TIMESTAMP}_gtfs_schema.sql"
+        echo "  Please add your specific migrations to this folder before deploying."
     fi
 
     # Convert provider name to uppercase and replace dashes with underscores

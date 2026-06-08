@@ -22,40 +22,40 @@ command = "bash ./build.sh"
 [[d1_databases]]
 binding = "DB_MYBAS_JOHOR"
 database_name = "gtfs-mybas-johor-db"
-database_id = "93576d0b-86fd-42ff-b86a-bdaea2a786a1"
+database_id = "ceab48e4-22b9-41ab-8280-3fdaceb2651e"
 migrations_dir = "migrations/mybas-johor"
 
 # ── ktmb ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_KTMB"
 database_name = "gtfs-ktmb-db"
-database_id = "71f2af52-7440-4d82-b3d2-61423a76d397"
+database_id = "83d27857-1ed2-49a1-91d8-452a30c3fb3e"
 migrations_dir = "migrations/ktmb"
 
 # ── rapid-bus-mrtfeeder ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_BUS_MRTFEEDER"
 database_name = "gtfs-rapid-bus-mrtfeeder-db"
-database_id = "3dff36d4-888d-4634-a318-59e0ae1c77cb"
+database_id = "bb1f9bf5-f4b3-43be-8e83-b51b2fb54bd9"
 migrations_dir = "migrations/rapid-bus-mrtfeeder"
 
 # ── rapid-rail-kl ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_RAIL_KL"
 database_name = "gtfs-rapid-rail-kl-db"
-database_id = "99afff73-6a80-4053-8b13-094703829623"
+database_id = "b8323ceb-d188-439c-a2dd-3c4b89f817b6"
 migrations_dir = "migrations/rapid-rail-kl"
 
 # ── rapid-bus-kl ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_BUS_KL"
 database_name = "gtfs-rapid-bus-kl-db"
-database_id = "1bc7d877-bd2c-4581-9b78-2ef282487dab"
+database_id = "102d2871-a2c8-4930-999e-9a1b1262d4f6"
 migrations_dir = "migrations/rapid-bus-kl"
 
 # ── rapid-bus-penang ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_BUS_PENANG"
 database_name = "gtfs-rapid-bus-penang-db"
-database_id = "9a45613d-0219-4384-9557-afa65d878ddd"
+database_id = "3b092c45-d136-4c12-bd8e-ee4734d2affb"
 migrations_dir = "migrations/rapid-bus-penang"

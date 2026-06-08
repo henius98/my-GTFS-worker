@@ -1,0 +1,47 @@
+name: Build Importer
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "importer/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed for creating a GitHub release
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Importer
+        run: cargo build --release -p importer
+
+      - name: Publish to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create a rolling 'latest-cron' tag and release
+          # Using gh cli which is pre-installed on ubuntu runners
+
+          # Delete the release and tag if they exist locally and remotely
+          gh release delete latest-cron -y --cleanup-tag || true
+          git push origin :refs/tags/latest-cron || true
+
+          # Create the release and upload the binary
+          gh release create latest-cron target/release/importer \
+            --title "Latest Importer Build" \
+            --notes "Automated build from commit ${{ github.sha }} for the cron pipeline." \
+            --latest

@@ -17,10 +17,10 @@ providers.toml          ← Single source of truth for all providers
 generate-wrangler.sh    ← Generates wrangler.toml from providers.toml
     │
     ▼
-wrangler.toml           ← AUTO-GENERATED (one [env.*] block per provider)
+wrangler.toml           ← AUTO-GENERATED (one [[d1_databases]] binding per provider)
     │
     ▼
-deploy.sh <provider>    ← Provisions D1 DB + applies migrations + deploys worker
+deploy.sh               ← Provisions D1 DB + applies migrations + deploys worker
 ```
 
 ## Features
@@ -28,9 +28,10 @@ deploy.sh <provider>    ← Provisions D1 DB + applies migrations + deploys work
 - ⚡ **Lightning Fast & Concurrent** — Written purely in Rust using `tokio` for asynchronous execution. Processes multiple CSV files and dispatches D1 queries in parallel.
 - 📦 **In-Memory ZIP Processing** — Downloads and streams ZIP datasets directly in-memory, extracting CSV files (`routes.txt`, `stops.txt`, etc.) without touching disk.
 - ⏯️ **Smart Resumability & Checkpointing** — Tracks dataset version via `ETag` and individual file changes via `CRC32`. Safely pauses and resumes interrupted imports using `LastProcessedLine`. Caps execution at a safe `MAX_ROWS_PER_RUN` limit to prevent hitting Cloudflare API rate limits.
-- 🚀 **Concurrent Multi-Row Bulk Inserts** — Dynamically builds optimal batch sizing and dispatches them concurrently. Concurrency can be tuned via `D1_CONCURRENCY_LIMIT` (default 5).
+- 🚀 **Concurrent Multi-Row Bulk Inserts** — Dynamically builds optimal batch sizing and dispatches them concurrently. Concurrency can be tuned via `D1_CONCURRENCY_LIMIT`.
 - 🧵 **Decoupled Blocking Executor** — Isolates CPU-heavy Zip decompression and JSON parsing to a `tokio::task::spawn_blocking` pool, streaming JSON back to the async HTTP engine via MPSC channels to avoid executor starvation. Protected by a global `CSV_CONCURRENCY_LIMIT` semaphore to limit memory footprint.
-- 🧠 **Explicit Deploy-Time Schema** — You manually manage the schema per-provider via D1 migrations (`migrations/<provider>/<timestamp>_gtfs_schema.sql`). The importer dynamically introspects your tables at runtime to insert the exact columns you defined.
+- 🧠 **Explicit Deploy-Time Schema** — You manually manage the schema per-provider via explicit D1 migrations in `migrations/<provider>/`. The importer dynamically introspects your tables at runtime to insert the exact columns you defined.
+- 🛡️ **Early Schema Validation** — Validates the entire GTFS ZIP against your explicitly defined schemas upfront. Completely bypasses parsing, database queries, and async task spawning for unsupported files, guaranteeing zero performance overhead for irrelevant GTFS data.
 - 🔄 **Safe UPSERT Sync** — Uses `INSERT OR REPLACE INTO` instead of destructive `DELETE FROM`.
 - ⏱️ **Zero-Maintenance Scheduling** — GitHub Actions cron triggers (`0 */1 * * *`) fire every 1 hours automatically.
 - 🗄️ **Full Provider Isolation** — Each provider gets its own D1 database with bare GTFS table names.
@@ -42,7 +43,9 @@ deploy.sh <provider>    ← Provisions D1 DB + applies migrations + deploys work
 ```text
 my-GTFS-worker/
 ├── Cargo.toml          # Cargo Workspace definition
+├── package.json        # Node dependencies (e.g., Wrangler CLI)
 ├── providers.toml      # Single source of truth for all provider instances
+├── .env.example        # Example environment variables
 ├── generate-wrangler.sh # Generates wrangler.toml from providers.toml
 ├── deploy.sh           # Full lifecycle deployment script
 ├── wrangler.toml       # AUTO-GENERATED — do not edit directly
@@ -60,7 +63,7 @@ my-GTFS-worker/
 │       └── lib.rs      # API entry points (/status)
 ├── migrations/         # D1 migration files for infrastructure tables
 ├── schema.sql          # Reference schema (not applied directly)
-└── .github/workflows/  # GitHub Actions pipelines (e.g., gtfs_import.yml)
+└── .github/workflows/  # GitHub Actions pipelines (e.g., run_importer.yml)
 ```
 
 ### Crate Responsibilities
@@ -68,7 +71,7 @@ my-GTFS-worker/
 | Crate | Purpose |
 |---|---|
 | `worker` | Deploys to Cloudflare Workers. Handles incoming HTTP requests to check database status via `/status`. |
-| `importer` | Runs via GitHub Actions. Handles downloading ZIPs, concurrent CSV parsing, dynamic schema matching, and parallel asynchronous multi-row batch inserts to D1. Tracks row progress to ensure resumability. |
+| `importer` | Runs via GitHub Actions. Handles downloading ZIPs, upfront schema validation, concurrent CSV parsing, and parallel asynchronous multi-row batch inserts to D1. Tracks row progress to ensure resumability. |
 
 ### Data Flow
 
@@ -77,7 +80,7 @@ graph TD
     Start([GitHub Actions Cron]) --> Config[Load providers.toml]
     Config --> D1Init[Initialize D1Client & Global CSV Semaphore]
     
-    D1Init -->|Iterate Providers| ProvSpawn
+    D1Init -->|Iterate Active Providers| ProvSpawn
     
     subgraph "Provider Concurrency (All Providers Run Simultaneously)"
         ProvSpawn{tokio::spawn per Provider} --> ProvTask[process_provider]
@@ -87,13 +90,15 @@ graph TD
         CheckIncomplete -->|No| Skip[Skip Provider]
         CheckIncomplete -->|Yes: Resume| Download
         
-        Download -->|Iterate Zip Files| CSVSpawn
+        Download --> EarlySchemaCheck{Upfront Schema Validation & Filter}
+        EarlySchemaCheck --> GetProgress[Query D1: Get All Files Progress]
+        GetProgress --> FilterFiles{Check Resume State}
+        
+        FilterFiles -->|Spawn needed| CSVSpawn
         
         subgraph "File Concurrency (All CSVs Spawn Simultaneously)"
-            CSVSpawn{tokio::spawn per .txt} --> CSVTask[process_csv_file]
-            CSVTask --> Progress[Query D1: Resume Line & Schema]
-            
-            Progress --> SemAcquire((Acquire Global CSV Semaphore Permit))
+            CSVSpawn{tokio::spawn per File} --> CSVTask[process_csv_file]
+            CSVTask --> SemAcquire((Acquire Global CSV Semaphore Permit))
             
             SemAcquire -->|Isolates CPU Work| ChannelSetup{Setup MPSC Channel}
             
@@ -125,28 +130,46 @@ Ensure your local environment is correctly configured with:
 
 1. **[Rust & Cargo](https://rustup.rs/)** (`rustup default stable`)
 2. **[Node.js / npm](https://nodejs.org/en/)**
-3. **Wrangler CLI**: Install globally using `npm install -g wrangler`, and then authenticate your account by running `wrangler login`.
-4. **Cloudflare Account**
+3. **Wrangler CLI**: Install globally using `npm install -g wrangler`. (You can authenticate via `wrangler login`, or just use the `.env` file with your API token as shown below).
+4. **Cloudflare Account**: Create an API Token with the following permissions:
+   ```text
+   Workers CI Write
+   Workers CI Read
+   D1 Read
+   D1 Write
+   Workers Tail Read
+   Workers Scripts Write
+   Workers Scripts Read
+   Account Settings Read
+   ```
 
 ---
 
 ## Setup
 
-### 1. Add a Provider
+### 1. Environment Variables
+Copy the provided example environment file and add your Cloudflare credentials:
+```bash
+cp .env.example .env
+```
+Then, edit `.env` and fill in `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` (this allows you to skip `wrangler login`).
+
+### 2. Add a Provider
 
 All provider configuration lives in `providers.toml`. To add a new provider, simply add its block and leave `database_id` empty:
 
 ```toml
 [[providers]]
 name = "mybas-johor"
+is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "mybas-johor"
 database_id = ""   # ← Leave empty! deploy.sh will auto-fill this
 ```
 
-*Note: You no longer need to manually run `wrangler d1 create` or set up the `migrations/` folder. `deploy.sh` will automatically provision the database, scaffold the `migrations/` folder using `schema.sql` as a template, and update your `providers.toml`.*
+*Note: You no longer need to manually run `wrangler d1 create` or set up the `migrations/` folder. `deploy.sh` will automatically provision the database, create an empty `migrations/` folder (if missing), and update your `providers.toml`.*
 
-### 2. Deploy the Database and Worker
+### 3. Deploy the Database and Worker
 
 ```bash
 # Deploy all providers automatically (creates missing D1 databases, scaffolds schemas, generates wrangler.toml, and deploys worker)
@@ -154,17 +177,18 @@ database_id = ""   # ← Leave empty! deploy.sh will auto-fill this
 ```
 
 The deploy script handles:
-1. Validates the provider exists in `providers.toml`
-2. Auto-provisions the D1 database if `database_id` is empty
-3. Regenerates `wrangler.toml`
-4. Scaffolds `migrations/` from `schema.sql` (if missing) and applies D1 migrations
-5. Deploys the worker
+1. Iterates over all active providers (`is_active = true`) in `providers.toml`
+2. Auto-provisions the D1 database if `database_id` is empty and updates `providers.toml`
+3. Regenerates `wrangler.toml` dynamically
+4. Creates an empty `migrations/` directory (if missing) and applies D1 migrations
+5. Deploys the unified worker
 
-### 3. Setup GitHub Actions
+### 4. Setup GitHub Actions
 To start the automatic import pipeline:
 1. Push your code to GitHub.
 2. Add `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` as Repository Secrets.
-3. The `.github/workflows/gtfs_import.yml` action will now automatically run every 4 hours.
+3. Add `D1_CONCURRENCY_LIMIT`, `MAX_ROWS_PER_RUN`, and `QUERY_STATEMENT_BATCH_SIZE` as Repository Variables.
+4. The `.github/workflows/run_importer.yml` action will now automatically run every 1 hours.
 
 ---
 
@@ -172,16 +196,14 @@ To start the automatic import pipeline:
 
 ```bash
 # Start local development server for the worker (connects to your remote D1 database)
-npx wrangler dev --env mybas-johor --remote
+npx wrangler dev --remote
 ```
 
-Visit `http://localhost:8787/status` to check the progress of your background imports!
+Visit `http://localhost:8787/<provider>/status` (e.g., `http://localhost:8787/mybas-johor/status`) to check the progress of your background imports!
 
 To run the importer locally for testing:
 ```bash
-export CLOUDFLARE_ACCOUNT_ID="your_account_id"
-export CLOUDFLARE_API_TOKEN="your_api_token"
-export D1_CONCURRENCY_LIMIT=5 # Optional: Set D1 parallel requests limit
+set -a; source .env; set +a
 cargo run --release -p importer
 ```
 
@@ -191,10 +213,12 @@ cargo run --release -p importer
 
 If a provider adds a new column or table, or if you need to add an index:
 
-1. **Update the provider's migration file** in `migrations/<provider>/<timestamp>_gtfs_schema.sql` (or create a new migration).
-2. **Apply the migration**:
+1. **Update `0_gtfs_schema.sql`**: The Rust importer parses `migrations/<provider>/0_gtfs_schema.sql` at **build time** to determine which CSV columns to extract. You *must* add your new column to this file.
+2. **Create a new D1 migration**: Because D1 ignores changes to already-applied migrations, you must also create a new migration to actually alter the database:
    ```bash
-   wrangler d1 migrations apply DB --env <provider> --remote
+   npx wrangler d1 migrations create DB_<PROVIDER_NAME_UPPERCASE> add_new_column
    ```
+3. **Add your SQL** (e.g., `ALTER TABLE ... ADD COLUMN ...`) to the newly generated file in `migrations/<provider>/<timestamp>_add_new_column.sql`.
+4. **Apply the migration** by running `./deploy.sh` (or `npx wrangler d1 migrations apply ...`).
 
-The importer dynamically uses `PRAGMA table_info()` at runtime, so it will automatically discover any new columns you add to your schema and map them from the CSV! No Rust code changes are required for new tables.
+Because the schema is parsed dynamically at compile time, no Rust code changes are required! The next time your GitHub Action runs, it will recompile the importer and automatically start mapping the new column from the CSV.
