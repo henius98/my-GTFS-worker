@@ -6,6 +6,9 @@ on:
     - cron: "0 */1 * * *"
   workflow_dispatch: # Allow manual triggers
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 # Ensure only one import runs at a time to prevent D1 database state corruption
 concurrency:
   group: gtfs-import
@@ -24,8 +27,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download latest-cron -p importer
-          chmod +x importer
+          gh release download latest-cron -p importer -O importer_bin
+          chmod +x importer_bin
 
       - name: Run Importer
         env:
@@ -34,4 +37,4 @@ jobs:
           D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT }}
           MAX_ROWS_PER_RUN: ${{ vars.MAX_ROWS_PER_RUN }}
           QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE }}
-        run: ./importer
+        run: ./importer_bin
