@@ -42,7 +42,8 @@ pub async fn fetch_route(req: Request, env: Env, _ctx: Context) -> Result<Respon
         }
 
         (Some(provider), Some("data"), Some(table_name)) => {
-            let limit: u32 = url.query_pairs().find(|(k, _)| k == "limit").and_then(|(_, v)| v.parse().ok()).unwrap_or(100);
+            let mut limit: u32 = url.query_pairs().find(|(k, _)| k == "limit").and_then(|(_, v)| v.parse().ok()).unwrap_or(100);
+            limit = std::cmp::min(limit, 1000); // Enforce maximum limit of 1000
             let offset: u32 = url.query_pairs().find(|(k, _)| k == "offset").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
 
             let binding_name = format!("DB_{}", provider.to_uppercase().replace("-", "_"));
@@ -69,7 +70,7 @@ pub async fn fetch_route(req: Request, env: Env, _ctx: Context) -> Result<Respon
             }
 
             // Get valid columns for the table
-            let columns_query = format!("PRAGMA table_info({})", table_name);
+            let columns_query = format!("PRAGMA table_info(\"{}\")", table_name);
             let columns_statement = match d1.prepare(&columns_query).bind(&[]) {
                 Ok(stmt) => stmt,
                 Err(e) => return Response::error(format!("Database error: {}", e), 500),
@@ -93,11 +94,11 @@ pub async fn fetch_route(req: Request, env: Env, _ctx: Context) -> Result<Respon
 
             let include_cols: Option<Vec<String>> = url.query_pairs()
                 .find(|(k, _)| k == "include")
-                .map(|(_, v)| v.split(',').map(|s| s.trim().to_string()).collect());
+                .map(|(_, v)| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
 
             let exclude_cols: Option<Vec<String>> = url.query_pairs()
                 .find(|(k, _)| k == "exclude")
-                .map(|(_, v)| v.split(',').map(|s| s.trim().to_string()).collect());
+                .map(|(_, v)| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
 
             if let Some(cols) = include_cols {
                 for col in &cols {
@@ -105,7 +106,7 @@ pub async fn fetch_route(req: Request, env: Env, _ctx: Context) -> Result<Respon
                         return Response::error(format!("Invalid include column: {}", col), 400);
                     }
                 }
-                selected_columns = cols.join(", ");
+                selected_columns = cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
             } else if let Some(cols) = exclude_cols {
                 let mut final_cols = Vec::new();
                 for valid_col in &valid_columns {
@@ -121,7 +122,7 @@ pub async fn fetch_route(req: Request, env: Env, _ctx: Context) -> Result<Respon
                 if final_cols.is_empty() {
                     return Response::error("Cannot exclude all columns", 400);
                 }
-                selected_columns = final_cols.join(", ");
+                selected_columns = final_cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
             }
 
             // Parse filters
@@ -131,10 +132,10 @@ pub async fn fetch_route(req: Request, env: Env, _ctx: Context) -> Result<Respon
             for (k, v) in url.query_pairs() {
                 match k.as_ref() {
                     "filter" | "ifilter" | "contains" | "icontains" => {
-                        let (operator, is_like, is_glob) = match k.as_ref() {
+                        let (operator, is_like, is_instr) = match k.as_ref() {
                             "filter" => ("=", false, false),
                             "ifilter" => ("COLLATE NOCASE =", false, false),
-                            "contains" => ("GLOB", false, true),
+                            "contains" => ("", false, true),
                             "icontains" => ("LIKE", true, false),
                             _ => unreachable!(),
                         };
@@ -150,11 +151,14 @@ pub async fn fetch_route(req: Request, env: Env, _ctx: Context) -> Result<Respon
                                 return Response::error(format!("Invalid filter column: {}", col), 400);
                             }
                             
-                            filter_clauses.push(format!("{} {} ?{}", col, operator, filter_clauses.len() + 1));
+                            if is_instr {
+                                filter_clauses.push(format!("INSTR(\"{}\", ?{}) > 0", col, filter_clauses.len() + 1));
+                            } else {
+                                filter_clauses.push(format!("\"{}\" {} ?{}", col, operator, filter_clauses.len() + 1));
+                            }
+                            
                             if is_like {
                                 filter_values.push(format!("%{}%", val));
-                            } else if is_glob {
-                                filter_values.push(format!("*{}*", val));
                             } else {
                                 filter_values.push(val.to_string());
                             }
@@ -177,11 +181,11 @@ pub async fn fetch_route(req: Request, env: Env, _ctx: Context) -> Result<Respon
                                         let end = range_parts[1];
                                         
                                         if !begin.is_empty() {
-                                            filter_clauses.push(format!("{} >= ?{}", col, filter_clauses.len() + 1));
+                                            filter_clauses.push(format!("\"{}\" >= ?{}", col, filter_clauses.len() + 1));
                                             filter_values.push(begin.to_string());
                                         }
                                         if !end.is_empty() {
-                                            filter_clauses.push(format!("{} <= ?{}", col, filter_clauses.len() + 1));
+                                            filter_clauses.push(format!("\"{}\" <= ?{}", col, filter_clauses.len() + 1));
                                             filter_values.push(end.to_string());
                                         }
                                     } else {
@@ -200,17 +204,20 @@ pub async fn fetch_route(req: Request, env: Env, _ctx: Context) -> Result<Respon
                 let cols: Vec<&str> = v.split(',').collect();
                 for col in cols {
                     let col = col.trim();
+                    if col.is_empty() {
+                        continue;
+                    }
                     if col.starts_with('-') {
                         let col_name = &col[1..];
                         if !valid_columns.contains(&col_name.to_string()) {
                             return Response::error(format!("Invalid sort column: {}", col_name), 400);
                         }
-                        sort_clauses.push(format!("{} DESC", col_name));
+                        sort_clauses.push(format!("\"{}\" DESC", col_name));
                     } else {
                         if !valid_columns.contains(&col.to_string()) {
                             return Response::error(format!("Invalid sort column: {}", col), 400);
                         }
-                        sort_clauses.push(format!("{} ASC", col));
+                        sort_clauses.push(format!("\"{}\" ASC", col));
                     }
                 }
             }
