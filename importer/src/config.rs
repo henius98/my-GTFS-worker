@@ -18,6 +18,10 @@ pub struct ProviderConfig {
     pub static_url: String,
     pub static_provider: String,
     pub database_id: String,
+    /// Optional override for the D1 database name. If not set, defaults to "gtfs-{name}-db".
+    /// Used when a database is recreated with a versioned name (e.g., "gtfs-mybas-johor-db-v1").
+    #[allow(dead_code)] // Deserialized for TOML compatibility; used by shell scripts, not Rust code
+    pub database_name: Option<String>,
 }
 
 fn default() -> bool {

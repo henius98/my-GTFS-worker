@@ -7,6 +7,9 @@ use std::env;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+/// Special exit code that signals GitHub Actions to run recreate-db.sh
+const EXIT_CODE_DB_FULL: i32 = 42;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account_id = env::var("CLOUDFLARE_ACCOUNT_ID").map_err(|_| "CLOUDFLARE_ACCOUNT_ID must be set")?;
@@ -34,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[{}] Processing provider", provider.name);
             if let Err(e) = processor::process_provider(&client, &provider, csv_sem, d1_sem).await {
                 println!("[{}] Error processing provider: {}", provider.name, e);
-                return Err(format!("Provider {} failed: {}", provider.name, e));
+                return Err(e);
             }
             Ok(())
         });
@@ -42,8 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut has_error = false;
+    let mut db_full_providers: Vec<String> = Vec::new();
     for handle in handles {
         match handle.await {
+            Ok(Err(processor::ProcessorError::DatabaseFull(provider_name))) => {
+                println!("[{}] ⚠️  Database full (exceeded 500MB limit). Marking for recreation.", provider_name);
+                db_full_providers.push(provider_name);
+            }
             Ok(Err(_e)) => {
                 has_error = true;
             }
@@ -53,6 +61,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => {}
         }
+    }
+
+    // Write providers that need DB recreation to file for GitHub Actions
+    if !db_full_providers.is_empty() {
+        let content = db_full_providers.join("\n");
+        if let Err(e) = std::fs::write("recreate-providers.txt", &content) {
+            println!("❌ Failed to write recreate-providers.txt: {}", e);
+        } else {
+            println!("📝 Wrote {} provider(s) to recreate-providers.txt: {}", db_full_providers.len(), content.replace('\n', ", "));
+        }
+        std::process::exit(EXIT_CODE_DB_FULL);
     }
 
     if has_error {

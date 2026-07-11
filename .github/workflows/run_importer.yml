@@ -18,7 +18,9 @@ concurrency:
 jobs:
   import:
     runs-on: ubuntu-latest
-    timeout-minutes: 10 # Fail-safe to prevent runaways from consuming free tier minutes
+    timeout-minutes: 30 # Increased to allow for potential DB recreation + re-import
+    permissions:
+      contents: write # Needed for pushing updated providers.toml after DB recreation
 
     steps:
       - name: Checkout Code
@@ -32,6 +34,57 @@ jobs:
           chmod +x importer_bin
 
       - name: Run Importer
+        id: importer
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT }}
+          MAX_ROWS_PER_RUN: ${{ vars.MAX_ROWS_PER_RUN }}
+          QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE }}
+        run: |
+          set +e
+          ./importer_bin
+          EXIT_CODE=$?
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+          if [ "$EXIT_CODE" -eq 42 ]; then
+            echo "🔄 Database full detected (exit code 42). Recreation will follow."
+            exit 0
+          elif [ "$EXIT_CODE" -ne 0 ]; then
+            exit "$EXIT_CODE"
+          fi
+
+      # ── DB Recreation Steps (only when exit code 42) ──────────────────────
+      - name: Setup Node.js
+        if: steps.importer.outputs.exit_code == '42'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Wrangler
+        if: steps.importer.outputs.exit_code == '42'
+        run: npm install -g wrangler
+
+      - name: Setup Rust
+        if: steps.importer.outputs.exit_code == '42'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust Dependencies
+        if: steps.importer.outputs.exit_code == '42'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Recreate Databases
+        if: steps.importer.outputs.exit_code == '42'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          echo "Providers needing recreation:"
+          cat recreate-providers.txt
+          echo ""
+          bash ./recreate-db.sh recreate-providers.txt
+
+      - name: Re-run Importer
+        if: steps.importer.outputs.exit_code == '42'
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -39,3 +92,16 @@ jobs:
           MAX_ROWS_PER_RUN: ${{ vars.MAX_ROWS_PER_RUN }}
           QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE }}
         run: ./importer_bin
+
+      - name: Commit Updated Config
+        if: steps.importer.outputs.exit_code == '42'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add providers.toml wrangler.toml
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: recreate D1 database(s) due to 500MB limit
+
+          Auto-recreated by GTFS Import Pipeline.
+          Providers: $(cat recreate-providers.txt | tr '\n' ', ' | sed 's/,$//')"
+          git push

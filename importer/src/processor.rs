@@ -23,6 +23,8 @@ pub enum ProcessorError {
     Csv(#[from] csv::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("D1 database full (exceeded maximum size) for provider: {0}")]
+    DatabaseFull(String),
 }
 
 pub enum BatchMessage {
@@ -333,6 +335,15 @@ impl ProviderProcessor {
 }
 
 pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, csv_semaphore: Arc<tokio::sync::Semaphore>, d1_semaphore: Arc<tokio::sync::Semaphore>) -> Result<(), ProcessorError> {
+    match process_provider_inner(d1_client, provider, csv_semaphore, d1_semaphore).await {
+        Err(ProcessorError::D1(D1Error::DatabaseFull(_))) => {
+            Err(ProcessorError::DatabaseFull(provider.name.clone()))
+        }
+        other => other,
+    }
+}
+
+async fn process_provider_inner(d1_client: &D1Client, provider: &ProviderConfig, csv_semaphore: Arc<tokio::sync::Semaphore>, d1_semaphore: Arc<tokio::sync::Semaphore>) -> Result<(), ProcessorError> {
     let (target_url, remote_etag, etag_changed) = check_etag(d1_client, provider).await?;
 
     if !etag_changed {
@@ -409,8 +420,12 @@ pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, c
     }
 
     let mut has_csv_error = false;
+    let mut has_db_full = false;
     for handle in csv_tasks {
         match handle.await {
+            Ok(Err(ProcessorError::D1(D1Error::DatabaseFull(_)))) => {
+                has_db_full = true;
+            }
             Ok(Err(_e)) => has_csv_error = true,
             Err(e) => {
                 println!("[{}] CSV task join error: {}", provider.name, e);
@@ -418,6 +433,10 @@ pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, c
             }
             _ => {}
         }
+    }
+
+    if has_db_full {
+        return Err(ProcessorError::DatabaseFull(provider.name.clone()));
     }
 
     if has_csv_error {

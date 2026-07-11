@@ -21,8 +21,8 @@ command = "bash ./build.sh"
 # ── mybas-johor ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_MYBAS_JOHOR"
-database_name = "gtfs-mybas-johor-db"
-database_id = "87df9873-ce5f-42d2-b1b4-96c6064edbd0"
+database_name = "gtfs-mybas-johor-db-2"
+database_id = "c1fb60aa-db7e-43c5-996e-cbdaf6688766"
 migrations_dir = "migrations/mybas-johor"
 
 # ── ktmb ─────────────────────────────────────────────────────────────

@@ -12,6 +12,8 @@ pub enum D1Error {
     ApiError(String),
     #[error("D1 query failed: {0:?}")]
     QueryFailed(Option<Vec<serde_json::Value>>),
+    #[error("D1 database full (exceeded maximum size): {0}")]
+    DatabaseFull(String),
 }
 
 #[derive(Serialize)]
@@ -68,6 +70,11 @@ impl D1Client {
                         let status = resp.status();
                         let err_text = resp.text().await.unwrap_or_default();
 
+                        // Check for error code 7500 (exceeded maximum DB size) in HTTP error response
+                        if Self::contains_error_code_7500(&err_text) {
+                            return Err(D1Error::DatabaseFull(err_text));
+                        }
+
                         if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                             if retries >= max_retries {
                                 return Err(D1Error::ApiError(format!("HTTP {}: {}", status, err_text)));
@@ -80,6 +87,15 @@ impl D1Client {
                         let d1_resp: D1Response = resp.json().await?;
 
                         if !d1_resp.success {
+                            // Check for error code 7500 in D1 response errors
+                            if let Some(ref errors) = d1_resp.errors {
+                                for err in errors {
+                                    if err.get("code").and_then(|c| c.as_u64()) == Some(7500) {
+                                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("Exceeded maximum DB size");
+                                        return Err(D1Error::DatabaseFull(msg.to_string()));
+                                    }
+                                }
+                            }
                             return Err(D1Error::QueryFailed(d1_resp.errors));
                         }
 
@@ -166,5 +182,16 @@ impl D1Client {
         )
         .await?;
         Ok(())
+    }
+
+    /// Check if an error response body contains D1 error code 7500 (exceeded maximum DB size)
+    fn contains_error_code_7500(body: &str) -> bool {
+        // Parse as JSON and look for error code 7500 in the errors array
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(errors) = parsed.get("errors").and_then(|e| e.as_array()) {
+                return errors.iter().any(|err| err.get("code").and_then(|c| c.as_u64()) == Some(7500));
+            }
+        }
+        false
     }
 }

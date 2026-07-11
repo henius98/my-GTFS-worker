@@ -73,7 +73,7 @@ with open(OUTPUT_FILE, "w") as out:
             continue
             
         db_id = get_val("database_id") or ""
-        db_name = f"gtfs-{name}-db"
+        db_name = get_val("database_name") or f"gtfs-{name}-db"
         binding_name = f"DB_{name.upper().replace('-', '_')}"
 
         env_block = f"""

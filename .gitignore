@@ -4,3 +4,7 @@ node_modules/
 .wrangler/
 Cargo.lock
 .env
+
+# Pipeline / script temp files
+recreate-providers.txt
+importer_bin

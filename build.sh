@@ -20,4 +20,5 @@ fi
 
 # 4. Build the worker
 echo "Building worker..."
+export RUSTFLAGS="-C target-feature=+reference-types"
 cd worker && worker-build --release

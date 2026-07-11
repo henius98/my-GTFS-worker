@@ -56,7 +56,21 @@ for block in blocks:
 " || true)
 
     if [ -z "$DB_ID" ]; then
-        DB_NAME="gtfs-${PROVIDER}-db"
+        # Check for explicit database_name in providers.toml
+        DB_NAME=$(python3 -c "
+import sys, re
+with open('$PROVIDERS_FILE', 'r') as f:
+    blocks = f.read().split('[[providers]]')
+for block in blocks:
+    name_match = re.search(r'name\s*=\s*\"([^\"]+)\"', block)
+    if name_match and name_match.group(1) == '$PROVIDER':
+        db_name_match = re.search(r'database_name\s*=\s*\"([^\"]+)\"', block)
+        if db_name_match:
+            print(db_name_match.group(1))
+        else:
+            print('gtfs-${PROVIDER}-db')
+        sys.exit(0)
+" || echo "gtfs-${PROVIDER}-db")
         echo "→ database_id is empty for provider '${PROVIDER}'. Checking if '${DB_NAME}' exists..."
         
         if ! wrangler d1 info "$DB_NAME" > .d1_info.tmp 2>/dev/null; then
