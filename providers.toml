@@ -3,7 +3,7 @@
 # After adding a new provider block with an empty `database_id`:
 #   1. Run: ./deploy.sh
 #
-# The deploy script will automatically provision the D1 database, 
+# The deploy script will automatically provision the D1 database,
 # fill in the `database_id`, generate wrangler.toml, and deploy!
 
 [[providers]]
@@ -11,7 +11,8 @@ name = "mybas-johor"
 is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "mybas-johor"
-database_id = "4381bca8-ecef-4805-abad-fdbfe3da77bf"
+database_name = "gtfs-mybas-johor-db-20260730"
+database_id = "1d10de8c-b95e-4586-b2ee-80329adeda22"
 
 [[providers]]
 name = "ktmb"
