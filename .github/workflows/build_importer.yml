@@ -11,6 +11,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain"
       - ".github/workflows/build_importer.yml"
+      - "providers.toml"
   workflow_dispatch:
 
 env:
