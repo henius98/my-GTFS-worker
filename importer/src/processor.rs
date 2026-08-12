@@ -104,7 +104,7 @@ pub fn parse_provider_schemas(provider_name: &str) -> Option<&'static [(&'static
     include!(concat!(env!("OUT_DIR"), "/schemas.rs"))
 }
 
-pub fn get_provider_schema_sql(provider_name: &str) -> Option<&'static str> {
+pub fn get_provider_schema_sql(provider_name: &str) -> Option<&'static [&'static str]> {
     include!(concat!(env!("OUT_DIR"), "/schema_sql.rs"))
 }
 
@@ -350,32 +350,40 @@ pub async fn process_provider(d1_client: &D1Client, provider: &mut ProviderConfi
         let new_uuid = d1_client.create_database(&new_db_name).await?;
         println!("[{}] Created new database {} with UUID {}", provider.name, new_db_name, new_uuid);
         
-        if let Some(schema_sql) = get_provider_schema_sql(&provider.name) {
-            println!("[{}] Applying schema to new database...", provider.name);
-            d1_client.execute_schema(&new_uuid, schema_sql).await?;
-        } else {
-            println!("[{}] Warning: No schema SQL found for provider", provider.name);
-        }
-        
-        let toml_path = "providers.toml";
-        if let Ok(content) = std::fs::read_to_string(toml_path) {
-            let mut new_content = String::new();
-            let mut in_target_provider = false;
-            for line in content.lines() {
-                if line.trim().starts_with("name =") && line.contains(&format!("\"{}\"", provider.name)) {
-                    in_target_provider = true;
-                } else if line.trim().starts_with("[[providers]]") {
-                    in_target_provider = false;
+        let setup_res: Result<(), ProcessorError> = async {
+            if let Some(schema_sqls) = get_provider_schema_sql(&provider.name) {
+                println!("[{}] Applying schemas to new database...", provider.name);
+                for schema_sql in schema_sqls.iter() {
+                    d1_client.execute_schema(&new_uuid, schema_sql).await?;
                 }
-                
-                if in_target_provider && line.trim().starts_with("database_id =") {
-                    new_content.push_str(&format!("database_id = \"{}\"\n", new_uuid));
-                } else {
-                    new_content.push_str(line);
-                    new_content.push('\n');
+            } else {
+                println!("[{}] Warning: No schema SQL found for provider", provider.name);
+            }
+            
+            let toml_path = "providers.toml";
+            let content = std::fs::read_to_string(toml_path)
+                .map_err(|e| ProcessorError::D1(D1Error::ApiError(format!("Failed to read providers.toml: {}", e))))?;
+            
+            let mut doc = content.parse::<toml_edit::DocumentMut>()
+                .map_err(|e| ProcessorError::D1(D1Error::ApiError(format!("Failed to parse providers.toml: {}", e))))?;
+            
+            if let Some(providers) = doc.get_mut("providers").and_then(|i| i.as_array_of_tables_mut()) {
+                for prov in providers.iter_mut() {
+                    if prov.get("name").and_then(|n| n.as_str()) == Some(provider.name.as_str()) {
+                        prov["database_id"] = toml_edit::value(new_uuid.clone());
+                    }
                 }
             }
-            std::fs::write(toml_path, new_content).map_err(|e| ProcessorError::D1(D1Error::ApiError(format!("Failed to write providers.toml: {}", e))))?;
+            
+            std::fs::write(toml_path, doc.to_string())
+                .map_err(|e| ProcessorError::D1(D1Error::ApiError(format!("Failed to write providers.toml: {}", e))))?;
+            Ok(())
+        }.await;
+        
+        if let Err(e) = setup_res {
+            println!("[{}] Failed to setup new database. Deleting orphaned DB {}: {}", provider.name, new_uuid, e);
+            let _ = d1_client.delete_database(&new_uuid).await;
+            return Err(e);
         }
         
         provider.database_id = new_uuid;

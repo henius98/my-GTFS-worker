@@ -20,8 +20,17 @@ fi
 echo "→ Parsing $PROVIDERS_FILE and generating $OUTPUT_FILE..."
 
 python3 - << 'EOF'
-import sys, re, os
+import sys, os
 from datetime import datetime
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        print("❌ Error: Python 3.11+ or 'tomli' package is required.")
+        sys.exit(1)
 
 PROVIDERS_FILE = "providers.toml"
 OUTPUT_FILE = "wrangler.toml"
@@ -29,20 +38,17 @@ OUTPUT_FILE = "wrangler.toml"
 old_mappings = {}
 if os.path.exists(OUTPUT_FILE):
     try:
-        with open(OUTPUT_FILE, "r") as f:
-            old_content = f.read()
-            blocks = old_content.split("[[d1_databases]]")[1:]
-            for block in blocks:
-                id_match = re.search(r'database_id\s*=\s*"([^"]+)"', block)
-                name_match = re.search(r'database_name\s*=\s*"([^"]+)"', block)
-                if id_match and name_match:
-                    old_mappings[id_match.group(1)] = name_match.group(1)
+        with open(OUTPUT_FILE, "rb") as f:
+            old_data = tomllib.load(f)
+            for db in old_data.get("d1_databases", []):
+                if "database_id" in db and "database_name" in db:
+                    old_mappings[db["database_id"]] = db["database_name"]
     except Exception as e:
         print(f"⚠️ Warning: Could not read existing {OUTPUT_FILE}: {e}")
 
 try:
-    with open(PROVIDERS_FILE, "r") as f:
-        content = f.read()
+    with open(PROVIDERS_FILE, "rb") as f:
+        providers_data = tomllib.load(f)
 except Exception as e:
     print(f"❌ Error reading {PROVIDERS_FILE}: {e}")
     sys.exit(1)
@@ -68,26 +74,17 @@ command = "bash ./scripts/build.sh"
 # Logs:       wrangler tail
 """
 
-blocks = content.split("[[providers]]")[1:]  # Skip everything before the first block
 environments_count = 0
 
 with open(OUTPUT_FILE, "w") as out:
     out.write(header)
     
-    for block in blocks:
-        def get_val(key):
-            match = re.search(fr'{key}\s*=\s*"([^"]+)"', block)
-            return match.group(1) if match else None
-
-        name = get_val("name")
-        if not name:
+    for provider in providers_data.get("providers", []):
+        name = provider.get("name")
+        if not name or provider.get("is_active") is False:
             continue
             
-        is_active_match = re.search(r'is_active\s*=\s*(false|False)', block)
-        if is_active_match:
-            continue
-            
-        db_id = get_val("database_id") or ""
+        db_id = provider.get("database_id", "")
         
         if db_id and db_id in old_mappings:
             db_name = old_mappings[db_id]

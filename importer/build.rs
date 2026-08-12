@@ -131,10 +131,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && let Some(file_name) = path.file_name()
                 && let Some(provider_name) = file_name.to_str()
             {
-                let schema_path = path.join("0_gtfs_schema.sql");
-                if schema_path.exists() {
-                    let sql = fs::read_to_string(&schema_path).unwrap_or_default();
-                    sql_code.push_str(&format!("    \"{}\" => Some(r#\"{}\"#),\n", provider_name, sql));
+                let mut sql_files = Vec::new();
+                for f_entry in fs::read_dir(&path)? {
+                    let f_entry = f_entry?;
+                    let f_path = f_entry.path();
+                    if f_path.is_file() && f_path.extension().map_or(false, |ext| ext == "sql") {
+                        sql_files.push(f_path);
+                    }
+                }
+                
+                sql_files.sort();
+                
+                if !sql_files.is_empty() {
+                    sql_code.push_str(&format!("    \"{}\" => Some(&[\n", provider_name));
+                    for schema_path in sql_files {
+                        let sql = fs::read_to_string(&schema_path).unwrap_or_default();
+                        sql_code.push_str(&format!("        r#\"{}\"#,\n", sql));
+                    }
+                    sql_code.push_str("    ]),\n");
                 }
             }
         }

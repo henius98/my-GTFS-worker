@@ -40,7 +40,7 @@ jobs:
           D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT }}
           MAX_ROWS_PER_RUN: ${{ vars.MAX_ROWS_PER_RUN }}
           QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE }}
-          DB_SIZE_THRESHOLD_MB: ${{ vars.DB_SIZE_THRESHOLD_MB || '450' }}
+          DB_SIZE_THRESHOLD_MB: ${{ vars.DB_SIZE_THRESHOLD_MB }}
         run: ./importer_bin
 
       - name: Auto-Commit and Redeploy on Rotation

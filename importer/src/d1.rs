@@ -208,4 +208,19 @@ impl D1Client {
         }
         Ok(())
     }
+    
+    pub async fn delete_database(&self, db_id: &str) -> Result<(), D1Error> {
+        let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{}", self.account_id, db_id);
+        let resp = self.client.delete(&url).header("Authorization", format!("Bearer {}", self.api_token)).send().await?;
+        if !resp.status().is_success() {
+            return Err(D1Error::ApiError(format!("Failed to delete database {}: {}", db_id, resp.text().await.unwrap_or_default())));
+        }
+        
+        let json: serde_json::Value = resp.json().await?;
+        if !json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(D1Error::ApiError(format!("API success=false: {:?}", json)));
+        }
+        
+        Ok(())
+    }
 }
