@@ -1,5 +1,5 @@
 # AUTO-GENERATED from providers.toml — do not edit directly.
-# Regenerate with: ./generate-wrangler.sh
+# Regenerate with: ./scripts/generate-wrangler.sh
 
 name = "my-gtfs-worker"
 main = "worker/build/worker/shim.mjs"
@@ -10,12 +10,12 @@ compatibility_flags = ["nodejs_compat"]
 enabled = true
 
 [build]
-command = "bash ./build.sh"
+command = "bash ./scripts/build.sh"
 
 # ─── Provider D1 Databases ──────────────────────────────────────────────────
 # All providers share the same worker, but queries route to the specific D1 database.
 #
-# Deploy:     ./deploy.sh
+# Deploy:     ./scripts/deploy.sh
 # Logs:       wrangler tail
 
 # ── mybas-johor ─────────────────────────────────────────────────────────────

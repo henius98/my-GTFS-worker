@@ -14,13 +14,13 @@ It handles multiple Malaysian public transport operator datasets dynamically usi
 providers.toml          ← Single source of truth for all providers
     │
     ▼
-generate-wrangler.sh    ← Generates wrangler.toml from providers.toml
+scripts/generate-wrangler.sh    ← Generates wrangler.toml from providers.toml
     │
     ▼
 wrangler.toml           ← AUTO-GENERATED (one [[d1_databases]] binding per provider)
     │
     ▼
-deploy.sh               ← Provisions D1 DB + applies migrations + deploys worker
+scripts/deploy.sh               ← Provisions D1 DB + applies migrations + deploys worker
 ```
 
 ## Features
@@ -46,10 +46,11 @@ my-GTFS-worker/
 ├── package.json        # Node dependencies (e.g., Wrangler CLI)
 ├── providers.toml      # Single source of truth for all provider instances
 ├── .env.example        # Example environment variables
-├── generate-wrangler.sh # Generates wrangler.toml from providers.toml
-├── deploy.sh           # Full lifecycle deployment script
 ├── wrangler.toml       # AUTO-GENERATED — do not edit directly
-├── build.sh            # Rust compilation (called by wrangler [build].command)
+├── scripts/            # Shell scripts for build & deployment
+│   ├── generate-wrangler.sh # Generates wrangler.toml from providers.toml
+│   ├── deploy.sh       # Full lifecycle deployment script
+│   └── build.sh        # Rust compilation (called by wrangler [build].command)
 ├── importer/           # GitHub Actions Importer crate
 │   ├── Cargo.toml
 │   └── src/
@@ -164,16 +165,16 @@ name = "mybas-johor"
 is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "mybas-johor"
-database_id = ""   # ← Leave empty! deploy.sh will auto-fill this
+database_id = ""   # ← Leave empty! scripts/deploy.sh will auto-fill this
 ```
 
-*Note: You no longer need to manually run `wrangler d1 create` or set up the `migrations/` folder. `deploy.sh` will automatically provision the database, create an empty `migrations/` folder (if missing), and update your `providers.toml`.*
+*Note: You no longer need to manually run `wrangler d1 create` or set up the `migrations/` folder. `scripts/deploy.sh` will automatically provision the database, create an empty `migrations/` folder (if missing), and update your `providers.toml`.*
 
 ### 3. Deploy the Database and Worker
 
 ```bash
 # Deploy all providers automatically (creates missing D1 databases, scaffolds schemas, generates wrangler.toml, and deploys worker)
-./deploy.sh
+./scripts/deploy.sh
 ```
 
 The deploy script handles:
@@ -219,6 +220,6 @@ If a provider adds a new column or table, or if you need to add an index:
    npx wrangler d1 migrations create DB_<PROVIDER_NAME_UPPERCASE> add_new_column
    ```
 3. **Add your SQL** (e.g., `ALTER TABLE ... ADD COLUMN ...`) to the newly generated file in `migrations/<provider>/<timestamp>_add_new_column.sql`.
-4. **Apply the migration** by running `./deploy.sh` (or `npx wrangler d1 migrations apply ...`).
+4. **Apply the migration** by running `./scripts/deploy.sh` (or `npx wrangler d1 migrations apply ...`).
 
 Because the schema is parsed dynamically at compile time, no Rust code changes are required! The next time your GitHub Action runs, it will recompile the importer and automatically start mapping the new column from the CSV.

@@ -120,7 +120,7 @@ done
 echo ""
 # ── Step 2: Regenerate wrangler.toml ─────────────────────────────────────────
 echo "→ Regenerating unified wrangler.toml from providers.toml..."
-bash ./generate-wrangler.sh
+bash ./scripts/generate-wrangler.sh
 echo ""
 
 # ── Step 3: Apply D1 migrations ──────────────────────────────────────────────

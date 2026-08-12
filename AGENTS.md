@@ -19,7 +19,7 @@ All subsequent Agentic tasks must use specific Model Context Protocol (MCP) serv
 - Any manual compilation validation must be flagged to the human user for out-of-band execution.
 
 ## 4. Multi-Tenant Deployment & Schemas
-- Agents deploying or configuring databases must utilize the unified `./deploy.sh` orchestrator which provisions D1, creates empty migration folders (if missing), and triggers `generate-wrangler.sh`. 
+- Agents deploying or configuring databases must utilize the unified `./scripts/deploy.sh` orchestrator which provisions D1, creates empty migration folders (if missing), and triggers `scripts/generate-wrangler.sh`. 
 - `providers.toml` is the absolute source of truth.
 - Do not edit `wrangler.toml` directly, it is auto-generated.
 - **Schema Modifications**: The `importer/build.rs` script parses `0_gtfs_schema.sql` at **compile time**. To add a new table or column, agents MUST do both:
