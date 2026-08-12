@@ -56,7 +56,7 @@ for block in blocks:
 " || true)
 
     if [ -z "$DB_ID" ]; then
-        DB_NAME="gtfs-${PROVIDER}-db"
+        DB_NAME="gtfs-${PROVIDER}-db-$(date -u +%Y%m%d)"
         echo "→ database_id is empty for provider '${PROVIDER}'. Checking if '${DB_NAME}' exists..."
         
         if ! wrangler d1 info "$DB_NAME" > .d1_info.tmp 2>/dev/null; then

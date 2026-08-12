@@ -167,4 +167,45 @@ impl D1Client {
         .await?;
         Ok(())
     }
+
+    pub async fn get_database_size(&self, db_id: &str) -> Result<u64, D1Error> {
+        let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{}", self.account_id, db_id);
+        let resp = self.client.get(&url).header("Authorization", format!("Bearer {}", self.api_token)).send().await?;
+        if !resp.status().is_success() {
+            return Err(D1Error::ApiError(format!("Failed to get database {}: {}", db_id, resp.text().await.unwrap_or_default())));
+        }
+        
+        let json: serde_json::Value = resp.json().await?;
+        if !json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(D1Error::ApiError(format!("API success=false: {:?}", json)));
+        }
+        
+        let size = json.get("result").and_then(|r| r.get("file_size")).and_then(|v| v.as_u64()).unwrap_or(0);
+        Ok(size)
+    }
+
+    pub async fn create_database(&self, name: &str) -> Result<String, D1Error> {
+        let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database", self.account_id);
+        let payload = serde_json::json!({ "name": name });
+        let resp = self.client.post(&url).header("Authorization", format!("Bearer {}", self.api_token)).json(&payload).send().await?;
+        if !resp.status().is_success() {
+            return Err(D1Error::ApiError(format!("Failed to create database {}: {}", name, resp.text().await.unwrap_or_default())));
+        }
+        
+        let json: serde_json::Value = resp.json().await?;
+        if !json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(D1Error::ApiError(format!("API success=false: {:?}", json)));
+        }
+        
+        let uuid = json.get("result").and_then(|r| r.get("uuid")).and_then(|v| v.as_str()).map(|s| s.to_string());
+        uuid.ok_or_else(|| D1Error::ApiError("No uuid in create database response".into()))
+    }
+
+    pub async fn execute_schema(&self, db_id: &str, schema_sql: &str) -> Result<(), D1Error> {
+        let statements: Vec<&str> = schema_sql.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        for stmt in statements {
+            self.query(db_id, D1Query { sql: stmt.to_string(), params: vec![] }).await?;
+        }
+        Ok(())
+    }
 }

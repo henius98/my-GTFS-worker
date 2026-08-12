@@ -30,9 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = d1_client.clone();
         let csv_sem = csv_semaphore.clone();
         let d1_sem = d1_semaphore.clone();
+        let mut provider = provider;
         let handle = tokio::spawn(async move {
             println!("[{}] Processing provider", provider.name);
-            if let Err(e) = processor::process_provider(&client, &provider, csv_sem, d1_sem).await {
+            if let Err(e) = processor::process_provider(&client, &mut provider, csv_sem, d1_sem).await {
                 println!("[{}] Error processing provider: {}", provider.name, e);
                 return Err(format!("Provider {} failed: {}", provider.name, e));
             }

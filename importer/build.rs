@@ -82,7 +82,7 @@ fn parse_schema_file(path: &Path) -> std::collections::HashMap<String, Vec<Strin
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=../migrations");
     let out_dir = env::var("OUT_DIR")?;
-    let dest_path = PathBuf::from(out_dir).join("schemas.rs");
+    let dest_path = PathBuf::from(out_dir.clone()).join("schemas.rs");
 
     let mut generated_code = String::new();
     generated_code.push_str("match provider_name {\n");
@@ -117,5 +117,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     generated_code.push_str("}\n");
 
     fs::write(&dest_path, generated_code)?;
+
+    // Generate schema_sql.rs to embed the full SQL content for D1 database rotation
+    let sql_dest_path = PathBuf::from(&out_dir).join("schema_sql.rs");
+    let mut sql_code = String::new();
+    sql_code.push_str("match provider_name {\n");
+
+    if migrations_dir.exists() {
+        for entry in fs::read_dir(&migrations_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir()
+                && let Some(file_name) = path.file_name()
+                && let Some(provider_name) = file_name.to_str()
+            {
+                let schema_path = path.join("0_gtfs_schema.sql");
+                if schema_path.exists() {
+                    let sql = fs::read_to_string(&schema_path).unwrap_or_default();
+                    sql_code.push_str(&format!("    \"{}\" => Some(r#\"{}\"#),\n", provider_name, sql));
+                }
+            }
+        }
+    }
+    
+    sql_code.push_str("    _ => None,\n");
+    sql_code.push_str("}\n");
+
+    fs::write(&sql_dest_path, sql_code)?;
     Ok(())
 }

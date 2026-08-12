@@ -11,7 +11,6 @@ name = "mybas-johor"
 is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "mybas-johor"
-database_name = "gtfs-mybas-johor-db-20260730"
 database_id = "1d10de8c-b95e-4586-b2ee-80329adeda22"
 
 [[providers]]

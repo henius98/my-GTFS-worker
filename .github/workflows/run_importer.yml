@@ -19,6 +19,8 @@ jobs:
   import:
     runs-on: ubuntu-latest
     timeout-minutes: 10 # Fail-safe to prevent runaways from consuming free tier minutes
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout Code
@@ -38,4 +40,28 @@ jobs:
           D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT }}
           MAX_ROWS_PER_RUN: ${{ vars.MAX_ROWS_PER_RUN }}
           QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE }}
+          DB_SIZE_THRESHOLD_MB: ${{ vars.DB_SIZE_THRESHOLD_MB || '450' }}
         run: ./importer_bin
+
+      - name: Auto-Commit and Redeploy on Rotation
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if ! git diff --quiet providers.toml; then
+            echo "Database rotation detected. Committing changes..."
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git add providers.toml
+            git commit -m "chore: auto-rotate D1 databases"
+            git push
+
+            echo "Regenerating wrangler.toml..."
+            bash ./scripts/generate-wrangler.sh
+
+            echo "Deploying updated worker..."
+            npm install -g wrangler
+            wrangler deploy
+          else
+            echo "No database rotation occurred."
+          fi

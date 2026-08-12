@@ -104,6 +104,10 @@ pub fn parse_provider_schemas(provider_name: &str) -> Option<&'static [(&'static
     include!(concat!(env!("OUT_DIR"), "/schemas.rs"))
 }
 
+pub fn get_provider_schema_sql(provider_name: &str) -> Option<&'static str> {
+    include!(concat!(env!("OUT_DIR"), "/schema_sql.rs"))
+}
+
 pub async fn check_etag(d1_client: &D1Client, provider: &ProviderConfig) -> Result<(String, String, bool), ProcessorError> {
     let target_url = format!("{}{}", provider.static_url, provider.static_provider);
     let mut head_resp = d1_client.client.head(&target_url).send().await?;
@@ -332,7 +336,51 @@ impl ProviderProcessor {
     }
 }
 
-pub async fn process_provider(d1_client: &D1Client, provider: &ProviderConfig, csv_semaphore: Arc<tokio::sync::Semaphore>, d1_semaphore: Arc<tokio::sync::Semaphore>) -> Result<(), ProcessorError> {
+pub async fn process_provider(d1_client: &D1Client, provider: &mut ProviderConfig, csv_semaphore: Arc<tokio::sync::Semaphore>, d1_semaphore: Arc<tokio::sync::Semaphore>) -> Result<(), ProcessorError> {
+    // Database size check and rotation
+    let size = d1_client.get_database_size(&provider.database_id).await?;
+    let threshold_mb = std::env::var("DB_SIZE_THRESHOLD_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(450);
+    let threshold_bytes = threshold_mb * 1024 * 1024;
+    
+    if size >= threshold_bytes {
+        println!("[{}] Database size {} exceeds threshold {}. Rotating...", provider.name, size, threshold_bytes);
+        
+        let now = chrono::Utc::now();
+        let new_db_name = format!("gtfs-{}-db-{}", provider.name, now.format("%Y%m%d"));
+        let new_uuid = d1_client.create_database(&new_db_name).await?;
+        println!("[{}] Created new database {} with UUID {}", provider.name, new_db_name, new_uuid);
+        
+        if let Some(schema_sql) = get_provider_schema_sql(&provider.name) {
+            println!("[{}] Applying schema to new database...", provider.name);
+            d1_client.execute_schema(&new_uuid, schema_sql).await?;
+        } else {
+            println!("[{}] Warning: No schema SQL found for provider", provider.name);
+        }
+        
+        let toml_path = "providers.toml";
+        if let Ok(content) = std::fs::read_to_string(toml_path) {
+            let mut new_content = String::new();
+            let mut in_target_provider = false;
+            for line in content.lines() {
+                if line.trim().starts_with("name =") && line.contains(&format!("\"{}\"", provider.name)) {
+                    in_target_provider = true;
+                } else if line.trim().starts_with("[[providers]]") {
+                    in_target_provider = false;
+                }
+                
+                if in_target_provider && line.trim().starts_with("database_id =") {
+                    new_content.push_str(&format!("database_id = \"{}\"\n", new_uuid));
+                } else {
+                    new_content.push_str(line);
+                    new_content.push('\n');
+                }
+            }
+            std::fs::write(toml_path, new_content).map_err(|e| ProcessorError::D1(D1Error::ApiError(format!("Failed to write providers.toml: {}", e))))?;
+        }
+        
+        provider.database_id = new_uuid;
+    }
+
     let (target_url, remote_etag, etag_changed) = check_etag(d1_client, provider).await?;
 
     if !etag_changed {
