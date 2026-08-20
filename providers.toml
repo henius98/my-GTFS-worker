@@ -11,7 +11,7 @@ name = "mybas-johor"
 is_active = true
 static_url = "https://api.data.gov.my/gtfs-static/"
 static_provider = "mybas-johor"
-database_id = "1d10de8c-b95e-4586-b2ee-80329adeda22"
+database_id = "325427d7-fbb0-4618-bb26-d70b696b6936"
 
 [[providers]]
 name = "ktmb"
