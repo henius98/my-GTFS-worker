@@ -12,10 +12,13 @@ serde.workspace = true
 serde_json.workspace = true
 zip.workspace = true
 csv.workspace = true
-bytes.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
-toml_edit = "0.25.13"
+toml_edit = "0.22.27"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "resume_checkpoint"
+harness = false

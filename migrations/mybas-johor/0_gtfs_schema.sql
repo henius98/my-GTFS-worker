@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS import_progress (
     FileName TEXT,
     CRC TEXT,
     LastProcessedLine INTEGER,
+    LastProcessedByte INTEGER NOT NULL DEFAULT 0 CHECK (LastProcessedByte >= 0),
     Status TINYINT CHECK (Status IN (0, 1)), -- 0 = COMPLETED, 1 = IN_PROGRESS
     UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (Provider, FileName)
@@ -117,6 +118,9 @@ CREATE TABLE IF NOT EXISTS fare_leg_rules (
     to_area_id TEXT,
     fare_product_id TEXT
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_fare_leg_rules_import_key
+ON fare_leg_rules (leg_group_id, from_area_id, to_area_id, fare_product_id);
 
 CREATE TABLE IF NOT EXISTS fare_media (
     fare_media_id TEXT PRIMARY KEY,

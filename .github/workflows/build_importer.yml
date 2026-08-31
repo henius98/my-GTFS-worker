@@ -12,15 +12,35 @@ on:
       - "rust-toolchain"
       - ".github/workflows/build_importer.yml"
       - "providers.toml"
+      - "worker/**"
+      - "test/**"
+      - "scripts/build.sh"
+  pull_request:
+    paths:
+      - "importer/**"
+      - "worker/**"
+      - "migrations/**"
+      - "test/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain"
+      - "scripts/build.sh"
+      - ".github/workflows/build_importer.yml"
+      - "providers.toml"
   workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   NODE_OPTIONS: "--no-deprecation"
 
+concurrency:
+  group: build-importer-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write # Needed for creating a GitHub release
 
@@ -29,15 +49,43 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: clippy, rustfmt
 
       - name: Cache Rust Dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Check Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Unit Tests
+        run: cargo test --workspace --locked
+
+      - name: Validate Live GTFS Schemas
+        run: python3 test/verify_migrations.py --no-report
+
+      - name: Run JSON Payload Benchmark Guard
+        run: python3 test/benchmark_json_payload.py
+
+      - name: Run UPSERT Replay Benchmark Guard
+        run: python3 test/benchmark_upsert_replay.py
+
+      - name: Run Resume Checkpoint Benchmark Guard
+        run: cargo bench -p importer --bench resume_checkpoint --locked
+
+      - name: Build Worker
+        run: bash ./scripts/build.sh
+
       - name: Build Importer
-        run: cargo build --release -p importer
+        run: cargo build --release --locked -p importer
 
       - name: Publish to GitHub Release
+        if: github.event_name == 'push'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

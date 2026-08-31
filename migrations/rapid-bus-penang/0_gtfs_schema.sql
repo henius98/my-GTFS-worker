@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS import_progress (
     FileName TEXT,
     CRC TEXT,
     LastProcessedLine INTEGER,
+    LastProcessedByte INTEGER NOT NULL DEFAULT 0 CHECK (LastProcessedByte >= 0),
     Status TINYINT CHECK (Status IN (0, 1)), -- 0 = COMPLETED, 1 = IN_PROGRESS
     UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (Provider, FileName)

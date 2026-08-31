@@ -3,10 +3,12 @@
 set -euo pipefail
 
 PROVIDERS_FILE="providers.toml"
+D1_MAX_DATABASES="${D1_MAX_DATABASES:-10}"
 
 # ── Pre-flight Checks ────────────────────────────────────────────────────────
 if [ -f ".env" ]; then
     set -a
+    # shellcheck source=/dev/null
     source .env
     set +a
 fi
@@ -19,6 +21,10 @@ fi
 # Ensure Python 3 is available for robust TOML parsing
 if ! command -v python3 &> /dev/null; then
     echo "❌ Error: 'python3' is required to securely parse providers.toml."
+    exit 1
+fi
+if ! [[ "$D1_MAX_DATABASES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "❌ Error: D1_MAX_DATABASES must be a positive integer."
     exit 1
 fi
 
@@ -61,12 +67,32 @@ for block in blocks:
         
         if ! wrangler d1 info "$DB_NAME" > .d1_info.tmp 2>/dev/null; then
             echo "→ '${DB_NAME}' info failed. Checking if it already exists in list..."
-            # Note: wrangler d1 list may not show un-bound DBs easily without parsing JSON or grep.
-            # Let's try parsing it from wrangler d1 list output
-            wrangler d1 list > .d1_list.tmp 2>/dev/null
-            EXISTING_ID=$(grep -oP "[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}(?=\s*│\s*$DB_NAME)" .d1_list.tmp || true)
+            wrangler d1 list --json > .d1_list.tmp
+            DATABASE_COUNT=$(python3 -c "
+import json
+with open('.d1_list.tmp', encoding='utf-8') as source:
+    payload = json.load(source)
+databases = payload.get('result', []) if isinstance(payload, dict) else payload
+print(len(databases))
+")
+            EXISTING_ID=$(python3 -c "
+import json
+with open('.d1_list.tmp', encoding='utf-8') as source:
+    payload = json.load(source)
+databases = payload.get('result', []) if isinstance(payload, dict) else payload
+for database in databases:
+    if database.get('name') == '$DB_NAME':
+        print(database.get('uuid', ''))
+        break
+")
             
             if [ -z "$EXISTING_ID" ]; then
+                if [ "$DATABASE_COUNT" -ge "$D1_MAX_DATABASES" ]; then
+                    echo "❌ Error: creating '${DB_NAME}' would exceed the configured D1 database limit (${DATABASE_COUNT}/${D1_MAX_DATABASES})."
+                    echo "Archive and explicitly delete a retired database recorded in providers.toml before retrying."
+                    rm -f .d1_info.tmp .d1_list.tmp
+                    exit 1
+                fi
                 echo "→ '${DB_NAME}' not found. Creating it now..."
                 wrangler d1 create "$DB_NAME" > .d1_info.tmp
             else

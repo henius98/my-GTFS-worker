@@ -1,0 +1,25 @@
+# Shared formatting baseline for VS Code, Zed, and other EditorConfig-aware tools.
+# Install this at a project root or common parent directory to apply it to source files.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+indent_size = 2
+tab_width = 2
+# Markdown is included; two-space hard breaks are intentionally removed.
+trim_trailing_whitespace = true
+
+# Make requires command lines to begin with a real tab character.
+[{Makefile,makefile,GNUmakefile,*.mk}]
+indent_style = tab
+
+# Trailing whitespace can be significant in patch content.
+[*.{diff,patch}]
+trim_trailing_whitespace = false
+
+# Windows command scripts
+[*.{bat,cmd}]
+end_of_line = crlf
