@@ -30,6 +30,7 @@ strip = true
 [profile.worker-release]
 inherits = "release"
 opt-level = "s"
+strip = false
 
 [profile.dev.package."*"]
 opt-level = 3

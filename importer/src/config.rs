@@ -125,13 +125,13 @@ impl RuntimeConfig {
     let query_statement_batch_size = bounded_usize("QUERY_STATEMENT_BATCH_SIZE", 1_000, 10_000)?;
     let d1_statements_per_request = bounded_usize("D1_STATEMENTS_PER_REQUEST", 4, 16)?;
     let max_d1_rows_written_per_workflow = positive_u64("MAX_D1_ROWS_WRITTEN_PER_WORKFLOW", 40_000)?;
-    if max_d1_rows_written_per_workflow > 100_000 {
-      return Err(ConfigError::InvalidEnvironment {
-        name: "MAX_D1_ROWS_WRITTEN_PER_WORKFLOW",
-        value: max_d1_rows_written_per_workflow.to_string(),
-        requirement: "must not exceed the D1 Free daily write allowance of 100,000 rows",
-      });
-    }
+    // if max_d1_rows_written_per_workflow > 100_000 {
+    //   return Err(ConfigError::InvalidEnvironment {
+    //     name: "MAX_D1_ROWS_WRITTEN_PER_WORKFLOW",
+    //     value: max_d1_rows_written_per_workflow.to_string(),
+    //     requirement: "must not exceed the D1 Free daily write allowance of 100,000 rows",
+    //   });
+    // }
     let maximum_group_rows = u64::try_from(query_statement_batch_size)
       .unwrap_or(u64::MAX)
       .saturating_mul(u64::try_from(d1_statements_per_request).unwrap_or(u64::MAX));

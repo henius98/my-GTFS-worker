@@ -3,7 +3,21 @@
 //! Note: Heavy GTFS import processing (ZIP download, CSV parsing) has been
 //! moved to an external GitHub Actions workflow to respect Cloudflare Worker CPU limits.
 
+use serde::{Deserialize, Serialize};
 use worker::{Cache, Context, Env, Method, Request, Response, Result, event};
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ImportProgress {
+  provider: Option<String>,
+  file_name: Option<String>,
+  #[serde(rename = "CRC")]
+  crc: Option<String>,
+  last_processed_line: Option<i64>,
+  last_processed_byte: Option<i64>,
+  status: Option<i64>,
+  updated_at: Option<String>,
+}
 
 #[event(fetch)]
 pub async fn fetch_route(req: Request, env: Env, ctx: Context) -> Result<Response> {
@@ -37,16 +51,21 @@ pub async fn fetch_route(req: Request, env: Env, ctx: Context) -> Result<Respons
       };
 
       // Fetch detailed import progress
-      let progress_results = match d1.prepare("SELECT * FROM import_progress").all().await {
+      let progress_results = match d1
+        .prepare("SELECT Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM import_progress")
+        .all()
+        .await
+      {
         Ok(res) => res,
         Err(e) => return Response::error(format!("Database error: {}", e), 500),
       };
 
-      let mut details = Vec::new();
-      // In a real scenario we'd define a proper struct, using dynamic JSON for simplicity here
-      if let Ok(results) = progress_results.results::<serde_json::Value>() {
-        details = results;
-      }
+      // Deserialize directly into the response shape to avoid building an
+      // intermediate dynamic JSON object tree on every cache miss.
+      let details = match progress_results.results::<ImportProgress>() {
+        Ok(results) => results,
+        Err(e) => return Response::error(format!("Database response error: {}", e), 500),
+      };
 
       let mut response = Response::from_json(&details)?;
       response.headers_mut().set("Cache-Control", "public, max-age=60")?;

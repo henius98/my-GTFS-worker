@@ -7,6 +7,7 @@ It handles multiple Malaysian public transport operator datasets dynamically usi
 ## Architecture
 
 **Single codebase, multiple isolated instances.** The system consists of two cleanly separated Rust crates within a Cargo Workspace:
+
 1. **`worker`**: A lightweight Cloudflare Worker compiled to WebAssembly that exposes `/<provider>/status` endpoints to report on import progress.
 2. **`importer`**: A standalone CLI designed to run in GitHub Actions. It downloads GTFS feeds, parses CSVs, and performs batch `INSERT` operations to Cloudflare D1 via the HTTP API concurrently.
 
@@ -35,7 +36,7 @@ scripts/deploy.sh               ← Provisions D1 DB + applies migrations + depl
 - 🔄 **Write-Eliding UPSERT Imports** — Uses a null-safe conditional `ON CONFLICT DO UPDATE` so replaying a committed range is safe while identical rows cause no database changes. Rows removed from an upstream snapshot are not deleted automatically.
 - 📊 **D1 Usage Telemetry** — Aggregates Cloudflare's per-query `rows_read` and `rows_written` metadata and reports actual usage at the end of each workflow.
 - 🌐 **Edge-Cached Status API** — Canonicalizes status URLs and caches successful JSON responses for 60 seconds so repeated public requests do not repeatedly consume D1 reads.
-- ⏱️ **Free-Tier-Aware Scheduling** — GitHub Actions cron triggers (`0 */12 * * *`) run twice daily.
+- ⏱️ **Hourly Feed Checks** — GitHub Actions cron (`0 * * * *`) checks feeds hourly; conditional requests and write-eliding UPSERTs avoid data writes when an upstream feed is unchanged.
 - 🧾 **Auditable Rotation History** — Automatic rotation records the retired database name, UUID, provider, and timestamp in `providers.toml`; old databases remain available for explicit archive/delete operations.
 - 🗄️ **Full Provider Isolation** — Each provider gets its own D1 database with bare GTFS table names.
 
@@ -72,9 +73,9 @@ my-GTFS-worker/
 
 ### Crate Responsibilities
 
-| Crate | Purpose |
-|---|---|
-| `worker` | Deploys to Cloudflare Workers. Handles incoming HTTP requests to check database status via `/<provider>/status`. |
+| Crate      | Purpose                                                                                                                                                                                                      |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `worker`   | Deploys to Cloudflare Workers. Handles incoming HTTP requests to check database status via `/<provider>/status`.                                                                                             |
 | `importer` | Runs via GitHub Actions. Handles downloading ZIPs, schema-aware file selection, concurrent CSV parsing, and parallel asynchronous multi-row batch inserts to D1. Tracks row progress to ensure resumability. |
 
 ### Data Flow
@@ -83,9 +84,9 @@ my-GTFS-worker/
 graph TD
     Start([GitHub Actions Cron]) --> Config[Load providers.toml]
     Config --> D1Init[Initialize D1Client & Global CSV Semaphore]
-    
+
     D1Init -->|Iterate Active Providers| PrepareSpawn
-    
+
     subgraph "Concurrent Preparation"
         PrepareSpawn{tokio::spawn per Provider} --> Prepare[rotate / conditional download / CRC scan]
         Prepare --> Etag[Conditional HTTP GET using stored ETag]
@@ -93,7 +94,7 @@ graph TD
         Etag -->|304: no body| CheckIncomplete{Any incomplete files?}
         CheckIncomplete -->|No| Skip[Skip Provider]
         CheckIncomplete -->|Yes: Resume| Download
-        
+
         Download --> EarlySchemaCheck{Schema-Aware File Selection}
         EarlySchemaCheck --> GetProgress[Query D1: Get All Files Progress]
         GetProgress --> FilterFiles{Keep only feeds with pending files}
@@ -103,27 +104,27 @@ graph TD
     FairBudget --> CSVSpawn
 
     subgraph "Bounded Concurrent Import"
-        
+
         subgraph "File Concurrency (All CSVs Spawn Simultaneously)"
             CSVSpawn{tokio::spawn per File} --> CSVTask[process_csv_file]
             CSVTask --> SemAcquire((Acquire Global CSV Semaphore Permit))
-            
+
             SemAcquire -->|Isolates CPU Work| ChannelSetup{Setup MPSC Channel}
-            
+
             subgraph "Decoupled Processing (Prevents Tokio Starvation)"
                 ChannelSetup -->|tokio::task::spawn_blocking| BlockingTask[Blocking Thread pool: Producer]
                 BlockingTask --> Parse[Zip decompress; raw-skip to byte checkpoint; CSV parse]
                 Parse --> JSON[Stream positional JSON batches]
-                
+
                 ChannelSetup -->|Runs on Async Executor| AsyncTask[Async Thread: Consumer]
-                
+
                 JSON -.->|Sends Batch via Channel| AsyncTask
-                
+
                 AsyncTask --> Limit{Enforce D1 Concurrency Limit}
                 Limit -->|Global + per-DB limits| Flush[Group statements]
                 Flush --> HTTP[One HTTP POST per statement group]
             end
-            
+
             HTTP --> Join[Wait for all flushes to complete]
             Join --> Status[Update Final Status in D1]
         end
@@ -156,48 +157,51 @@ Ensure your local environment is correctly configured with:
 ## Setup
 
 ### 1. Environment Variables
+
 Copy the provided example environment file and add your Cloudflare credentials:
+
 ```bash
 cp .env.example .env
 ```
+
 Then, edit `.env` and fill in `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` (this allows you to skip `wrangler login`).
 
-The checked-in profile is deliberately bounded for Cloudflare D1 Free and a standard two-vCPU GitHub-hosted Ubuntu runner:
+The checked-in `.env.example` profile is deliberately aggressive and exceeds the documented Cloudflare D1 Free quotas. The GitHub workflow keeps conservative fallback values unless matching repository variables are configured.
 
-| Variable | Default | Purpose |
-|---|---:|---|
-| `CSV_CONCURRENCY_LIMIT` | 2 in CI | Concurrent blocking ZIP/CSV producers; an unset local value detects CPUs, capped at 8 |
-| `D1_CONCURRENCY_LIMIT` | 6 | Concurrent D1 REST requests across the account (one per active database) |
-| `D1_DATABASE_CONCURRENCY_LIMIT` | 1 | Requests to one single-threaded D1 database |
-| `D1_MAX_DATABASES` | 10 | Refuse automatic rotation once the Free-plan account database count is exhausted |
-| `QUERY_STATEMENT_BATCH_SIZE` | 1000 | CSV rows encoded in one SQL statement |
-| `D1_STATEMENTS_PER_REQUEST` | 4 | SQL statements grouped into one REST request |
-| `MAX_D1_ROWS_WRITTEN_PER_WORKFLOW` | 40000 | Hard importer-data write reservation; no-op UPSERTs release unused capacity |
-| `MAX_ROWS_PER_WORKFLOW` | 1750000 | Logical scan ceiling shared fairly by providers, independent of actual writes |
-| `MAX_FEED_DOWNLOAD_MB` | 256 | Reject a declared or streamed ZIP larger than this temporary-file safety limit |
-| `MAX_UNCOMPRESSED_FEED_MB` | 512 | Reject supported CSV entries whose combined declared expansion exceeds this ZIP-bomb/work cap |
-| `MAX_CSV_RECORD_KB` | 512 | Reject pathological CSV headers/records well below D1's 2,000,000-byte value limit |
-| `MAX_STATEMENT_PAYLOAD_KB` | 1536 | Flush serialized positional-JSON bind values below D1's 2,000,000-byte hard limit |
-| `MAX_TEMP_FEED_STORAGE_MB` | 2048 | Workflow-wide cap for all retained provider ZIPs in one importer process; must be at least the per-feed cap |
-| `DB_SIZE_THRESHOLD_MB` | 400 | Rotation threshold with per-database and account-storage headroom |
+| Variable                           | Example value | Purpose                                                                                                     |
+| ---------------------------------- | ------------: | ----------------------------------------------------------------------------------------------------------- |
+| `CSV_CONCURRENCY_LIMIT`            |            20 | Concurrent blocking ZIP/CSV producers; an unset local value detects CPUs                                    |
+| `D1_CONCURRENCY_LIMIT`             |            10 | Concurrent D1 REST requests across the account (one per active database)                                    |
+| `D1_DATABASE_CONCURRENCY_LIMIT`    |             8 | Concurrent requests permitted to one D1 database                                                            |
+| `D1_MAX_DATABASES`                 |            20 | Refuse automatic rotation once the configured account database count is exhausted                           |
+| `QUERY_STATEMENT_BATCH_SIZE`       |          2000 | CSV rows encoded in one SQL statement                                                                       |
+| `D1_STATEMENTS_PER_REQUEST`        |             8 | SQL statements grouped into one REST request                                                                |
+| `MAX_D1_ROWS_WRITTEN_PER_WORKFLOW` |        200000 | Hard importer-data write reservation; no-op UPSERTs release unused capacity                                 |
+| `MAX_ROWS_PER_WORKFLOW`            |       5000000 | Logical scan ceiling shared fairly by providers, independent of actual writes                               |
+| `MAX_FEED_DOWNLOAD_MB`             |           256 | Reject a declared or streamed ZIP larger than this temporary-file safety limit                              |
+| `MAX_UNCOMPRESSED_FEED_MB`         |           512 | Reject supported CSV entries whose combined declared expansion exceeds this ZIP-bomb/work cap               |
+| `MAX_CSV_RECORD_KB`                |           512 | Reject pathological CSV headers/records well below D1's 2,000,000-byte value limit                          |
+| `MAX_STATEMENT_PAYLOAD_KB`         |          1536 | Flush serialized positional-JSON bind values below D1's 2,000,000-byte hard limit                           |
+| `MAX_TEMP_FEED_STORAGE_MB`         |          2048 | Workflow-wide cap for all retained provider ZIPs in one importer process; must be at least the per-feed cap |
+| `DB_SIZE_THRESHOLD_MB`             |           490 | Rotation threshold with minimal headroom below the documented 500 MB database limit                         |
 
 `MAX_ROWS_PER_RUN` remains a deprecated fallback when invoking the importer directly, but its value now has workflow-wide semantics. The checked-in GitHub workflow deliberately ignores that legacy repository variable so an old 100,000-row setting cannot silently reintroduce the non-converging scan cap; configure `MAX_ROWS_PER_WORKFLOW` instead.
 
-### Free-tier operating envelope
+### Hourly operating envelope
 
 As of 2026-08-28, D1 Free includes 100,000 rows written and 5 million rows read per account per UTC day, 500 MB per database, 10 databases, and 5 GB total storage. Indexed writes count toward the write allowance as additional rows. See Cloudflare's [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/) and [platform limits](https://developers.cloudflare.com/d1/platform/limits/).
 
-The scheduled profile runs twice per day and reserves at most 40,000 importer-data writes per workflow: 80,000 D1 row writes/day, leaving about 20% for checkpoints, dataset metadata, manual work, and operational variance. Its 1,750,000-row logical scan cap limits scheduled work to 3.5 million source rows/day, leaving 1.5 million rows of the Free plan's read allowance for index/read amplification and status traffic. A logical source row is not an exact D1 billing unit, so the final response metadata and Cloudflare dashboard remain authoritative. Before each REST batch, the importer reserves two writes per logical row: one table write plus the one primary/unique-index write permitted by the validated schemas. D1 response metadata settles the reservation; identical conditional UPSERTs report zero writes and immediately release their capacity. A terminal ambiguous request consumes its entire reservation instead of risking quota reuse.
+The hourly schedule triggers up to 24 importer runs per UTC day. Each run applies its own configured write and logical-row caps. The workflow's built-in fallback profile reserves at most 40,000 importer-data writes and scans at most 1,750,000 logical rows per run; the aggressive `.env.example` profile permits 200,000 reserved writes and 5 million logical rows per run. Configure the corresponding GitHub repository variables to use the aggressive values in scheduled runs. Conditional GETs and write-eliding UPSERTs mean an unchanged feed does not import data rows, but every scheduled run can still use GitHub Actions time and Cloudflare API/read capacity. A logical source row is not an exact D1 billing unit, so the final response metadata and Cloudflare dashboard remain authoritative. Before each REST batch, the importer reserves two writes per logical row: one table write plus the one primary/unique-index write permitted by the validated schemas. D1 response metadata settles the reservation; identical conditional UPSERTs report zero writes and immediately release their capacity. A terminal ambiguous request consumes its entire reservation instead of risking quota reuse.
 
-The six feeds contained 1,562,132 source rows when measured on 2026-08-28. A fixed 40,000-logical-row daily limit therefore needed at least 39 days for one scan and could restart large files faster than it completed them. The separate 1,750,000-row logical ceiling now lets a mostly unchanged snapshot traverse in one workflow, while the actual-write reservation still stops a changed or initial load safely near 20,000 indexed source rows per run. The final `D1 query metadata` log totals successfully decoded responses; use the Cloudflare dashboard as the account-wide authority for the full UTC day.
+The six feeds contained 1,562,132 source rows when measured on 2026-08-28. An earlier fixed 40,000-logical-row daily limit therefore needed at least 39 days for one scan and could restart large files faster than it completed them. The workflow fallback's separate 1,750,000-row logical ceiling now lets a mostly unchanged snapshot traverse in one workflow, while the actual-write reservation still stops a changed or initial load near 20,000 indexed source rows per run. The final `D1 query metadata` log totals successfully decoded responses; use the Cloudflare dashboard as the account-wide authority for the full UTC day.
 
-Compressed downloads, retained temporary ZIPs, archive entry counts, declared uncompressed CSV bytes, individual CSV records, and serialized SQL parameter payloads are all bounded independently. The current six live feeds expand to less than 50 MB each (largest observed on 2026-08-28), so the 512 MB default leaves substantial growth headroom while preventing a malformed or hostile archive from turning a small download into an unbounded CPU/memory workload. The 1.5 MiB statement cap also bounds each default four-statement REST batch near 6 MiB before HTTP framing and remains below D1's maximum string-value size.
+Compressed downloads, retained temporary ZIPs, archive entry counts, declared uncompressed CSV bytes, individual CSV records, and serialized SQL parameter payloads are all bounded independently. The current six live feeds expand to less than 50 MB each (largest observed on 2026-08-28), so the 512 MB default leaves substantial growth headroom while preventing a malformed or hostile archive from turning a small download into an unbounded CPU/memory workload. The 1.5 MiB statement cap also bounds the workflow fallback's four-statement REST batch near 6 MiB before HTTP framing and remains below D1's maximum string-value size.
 
 Imports intentionally do not delete rows omitted by a later upstream snapshot. Correct deletion across resumable, multi-workflow imports requires generation tracking or staging tables, which would add at least one persistent write per source row and erase the Free-tier write headroom above. Do not replace this with a pre-import `DELETE`: that would expose partial datasets while a capped import is in progress. If exact snapshot replacement is required, provision additional write/storage capacity and implement an atomic staging-generation swap.
 
-The 400 MB rotation threshold limits ten retained databases to at most about 4 GB, leaving storage headroom below the 5 GB account limit. Rotation is serialized across providers and stops before creating database 11. Every successful rotation appends a `[[retired_databases]]` record to `providers.toml`, so the old name and UUID are not orphaned. Old databases are intentionally not deleted automatically: export a recorded name with `npx wrangler d1 export <name> --remote --output <archive.sql>`, verify the archive, then explicitly delete that database before retrying a blocked rotation.
+The workflow fallback's 400 MB rotation threshold limits ten retained databases to at most about 4 GB, leaving storage headroom below the 5 GB account limit. The aggressive `.env.example` profile instead rotates at 490 MB and permits 20 databases, so it relies on the observed Cloudflare headroom rather than the documented Free-tier storage envelope. Rotation is serialized across providers. Every successful rotation appends a `[[retired_databases]]` record to `providers.toml`, so the old name and UUID are not orphaned. Old databases are intentionally not deleted automatically: export a recorded name with `npx wrangler d1 export <name> --remote --output <archive.sql>`, verify the archive, then explicitly delete that database before retrying a blocked rotation.
 
-The import job has a 10-minute timeout and runs at most twice per day. In a 31-day month that is at most 620 Linux runner minutes, leaving roughly 1,380 of the 2,000 minutes included for GitHub Free private repositories for builds and manual runs. Standard GitHub-hosted runners are free for public repositories. See GitHub's [included usage](https://docs.github.com/en/billing/reference/product-usage-included). Manual dispatches are deliberately limited by the workflow UI to 1,000 or 2,000 logical rows; they still consume the account's remaining Actions and D1 daily reserve, so inspect the usage log before triggering one.
+The import job has a 10-minute timeout and runs hourly. If every run reaches its timeout, a 31-day month could consume up to 7,440 Linux runner minutes, which exceeds the 2,000 minutes included for GitHub Free private repositories. Standard GitHub-hosted runners are free for public repositories. See GitHub's [included usage](https://docs.github.com/en/billing/reference/product-usage-included). Manual dispatches are deliberately limited by the workflow UI to 1,000 or 2,000 logical rows; they still consume the account's remaining Actions and D1 capacity, so inspect the usage log before triggering one.
 
 ### 2. Add a Provider
 
@@ -212,7 +216,7 @@ static_provider = "mybas-johor"
 database_id = ""   # ← Leave empty! scripts/deploy.sh will auto-fill this
 ```
 
-*Note: You no longer need to manually run `wrangler d1 create` or set up the `migrations/` folder. `scripts/deploy.sh` will automatically provision the database, create an empty `migrations/` folder (if missing), and update your `providers.toml`.*
+_Note: You no longer need to manually run `wrangler d1 create` or set up the `migrations/` folder. `scripts/deploy.sh` will automatically provision the database, create an empty `migrations/` folder (if missing), and update your `providers.toml`._
 
 ### 3. Deploy the Database and Worker
 
@@ -222,6 +226,7 @@ database_id = ""   # ← Leave empty! scripts/deploy.sh will auto-fill this
 ```
 
 The deploy script handles:
+
 1. Iterates over all active providers (`is_active = true`) in `providers.toml`
 2. Auto-provisions the D1 database if `database_id` is empty and updates `providers.toml`
 3. Regenerates `wrangler.toml` dynamically
@@ -229,7 +234,9 @@ The deploy script handles:
 5. Deploys the unified worker
 
 ### 4. Setup GitHub Actions
+
 To start the automatic import pipeline:
+
 1. Push your code to GitHub.
 2. Add `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` as Repository Secrets.
 3. Add the tuning variables listed above as Repository Variables when overriding defaults.
@@ -247,6 +254,7 @@ npx wrangler dev --remote
 Visit `http://localhost:8787/<provider>/status` (e.g., `http://localhost:8787/mybas-johor/status`) to check the progress of your background imports!
 
 To run the importer locally for testing:
+
 ```bash
 set -a; source .env; set +a
 cargo run --release -p importer
@@ -269,7 +277,7 @@ Run `./scripts/deploy.sh` before publishing the new importer so every active D1 
 
 If a provider adds a new column or table, or if you need to add an index:
 
-1. **Update `0_gtfs_schema.sql`**: The Rust importer parses `migrations/<provider>/0_gtfs_schema.sql` at **build time** to determine which CSV columns to extract. You *must* add your new column to this file.
+1. **Update `0_gtfs_schema.sql`**: The Rust importer parses `migrations/<provider>/0_gtfs_schema.sql` at **build time** to determine which CSV columns to extract. You _must_ add your new column to this file.
 2. **Create a new D1 migration**: Because D1 ignores changes to already-applied migrations, you must also create a new migration to actually alter the database:
    ```bash
    npx wrangler d1 migrations create DB_<PROVIDER_NAME_UPPERCASE> add_new_column

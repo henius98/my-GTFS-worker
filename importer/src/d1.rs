@@ -82,6 +82,13 @@ pub struct D1DatabaseInfo {
   pub file_size: u64,
 }
 
+pub struct FileProgressInit<'a> {
+  pub file: &'a str,
+  pub crc: &'a str,
+  pub line: u64,
+  pub byte: u64,
+}
+
 #[derive(Debug)]
 struct D1WriteBudgetState {
   remaining: u64,
@@ -389,26 +396,24 @@ impl D1Client {
         },
       )
       .await?;
-    Ok(res.first().map(|result| result.results.clone()).unwrap_or_default())
+    Ok(res.into_iter().next().map(|result| result.results).unwrap_or_default())
   }
 
-  #[allow(clippy::too_many_arguments)]
-  pub async fn init_file_progress(&self, db_id: &str, provider: &str, file: &str, crc: &str, line: u64, byte: u64, status: i64) -> Result<(), D1Error> {
-    self.query(
-            db_id,
-            D1Query {
-                sql: "INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(Provider, FileName) DO UPDATE SET CRC = excluded.CRC, LastProcessedLine = excluded.LastProcessedLine, LastProcessedByte = excluded.LastProcessedByte, Status = excluded.Status, UpdatedAt = CURRENT_TIMESTAMP WHERE import_progress.CRC IS NOT excluded.CRC OR import_progress.LastProcessedLine IS NOT excluded.LastProcessedLine OR import_progress.LastProcessedByte IS NOT excluded.LastProcessedByte OR import_progress.Status IS NOT excluded.Status",
-                params: vec![
-                    serde_json::Value::String(provider.to_owned()),
-                    serde_json::Value::String(file.to_owned()),
-                    serde_json::Value::String(crc.to_owned()),
-                    serde_json::Value::Number(line.into()),
-                    serde_json::Value::Number(byte.into()),
-                    serde_json::Value::Number(status.into()),
-                ],
-            },
-        )
-        .await?;
+  pub async fn init_files_progress(&self, db_id: &str, provider: &str, files: &[FileProgressInit<'_>]) -> Result<(), D1Error> {
+    let queries = files
+      .iter()
+      .map(|file| D1Query {
+        sql: "INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt) VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP) ON CONFLICT(Provider, FileName) DO UPDATE SET CRC = excluded.CRC, LastProcessedLine = excluded.LastProcessedLine, LastProcessedByte = excluded.LastProcessedByte, Status = 1, UpdatedAt = CURRENT_TIMESTAMP WHERE import_progress.CRC IS NOT excluded.CRC OR import_progress.LastProcessedLine IS NOT excluded.LastProcessedLine OR import_progress.LastProcessedByte IS NOT excluded.LastProcessedByte OR import_progress.Status IS NOT 1",
+        params: vec![
+          serde_json::Value::String(provider.to_owned()),
+          serde_json::Value::String(file.file.to_owned()),
+          serde_json::Value::String(file.crc.to_owned()),
+          serde_json::Value::Number(file.line.into()),
+          serde_json::Value::Number(file.byte.into()),
+        ],
+      })
+      .collect::<Vec<_>>();
+    self.batch_with_retry_state(db_id, &queries).await?;
     Ok(())
   }
 
@@ -504,10 +509,21 @@ impl D1Client {
   }
 
   pub async fn execute_schema(&self, db_id: &str, schema_sql: &str) -> Result<(), D1Error> {
-    for statement in schema_sql.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
-      let (results, _) = self.execute_query_body(db_id, &D1Query { sql: statement, params: Vec::new() }, 0).await?;
-      validate_result_count(results, 1)?;
+    let queries = schema_sql
+      .split(';')
+      .map(str::trim)
+      .filter(|statement| !statement.is_empty())
+      .map(|statement| D1Query { sql: statement, params: Vec::new() })
+      .collect::<Vec<_>>();
+    if queries.is_empty() {
+      return Ok(());
     }
+    // Migration statements are ordered and transactional, so send each
+    // migration file as one batch instead of one REST request per statement.
+    // Keep retries disabled because an ambiguous DDL response is not
+    // necessarily safe to replay.
+    let (results, _) = self.execute_query_body(db_id, &D1BatchRequest { batch: &queries }, 0).await?;
+    validate_result_count(results, queries.len())?;
     Ok(())
   }
 

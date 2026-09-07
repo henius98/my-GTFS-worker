@@ -59,7 +59,6 @@ header = """# AUTO-GENERATED from providers.toml — do not edit directly.
 name = "my-gtfs-worker"
 main = "worker/build/worker/shim.mjs"
 compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat"]
 
 [observability]
 enabled = true

@@ -2,8 +2,8 @@ name: GTFS Import Pipeline
 
 on:
   schedule:
-    # Two bounded runs/day preserve both D1 read/write and Actions headroom.
-    - cron: "0 */12 * * *"
+    # Run hourly to pick up changed GTFS feeds as soon as possible.
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       max_rows:
@@ -33,7 +33,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download Pre-built Importer
         env:
@@ -48,7 +48,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CSV_CONCURRENCY_LIMIT: ${{ vars.CSV_CONCURRENCY_LIMIT || '2' }}
           D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT || '6' }}
-          D1_DATABASE_CONCURRENCY_LIMIT: ${{ vars.D1_DATABASE_CONCURRENCY_LIMIT || '1' }}
+          D1_DATABASE_CONCURRENCY_LIMIT: ${{ vars.D1_DATABASE_CONCURRENCY_LIMIT || '8' }}
           D1_MAX_DATABASES: ${{ vars.D1_MAX_DATABASES || '10' }}
           D1_STATEMENTS_PER_REQUEST: ${{ vars.D1_STATEMENTS_PER_REQUEST || '4' }}
           MAX_D1_ROWS_WRITTEN_PER_WORKFLOW: ${{ vars.MAX_D1_ROWS_WRITTEN_PER_WORKFLOW || '40000' }}

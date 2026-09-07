@@ -1,5 +1,5 @@
 use crate::config::{ProviderConfig, RuntimeConfig};
-use crate::d1::{D1Client, D1Error, D1Query};
+use crate::d1::{D1Client, D1Error, D1Query, FileProgressInit};
 use reqwest::{
   StatusCode,
   header::{CONTENT_LENGTH, ETAG, IF_NONE_MATCH},
@@ -744,16 +744,11 @@ impl ProviderProcessor {
     &self,
     feed: Arc<TemporaryFeed>,
     csv_file: &str,
-    file_crc: &str,
     table_name: &str,
     db_columns: &'static [&'static str],
     checkpoint: Checkpoint,
   ) -> Result<CsvExtractOutcome, ProcessorError> {
     println!("[{}] Importing {} (resuming from row {}, byte {})", self.provider.name, csv_file, checkpoint.line, checkpoint.byte);
-    self
-      .d1_client
-      .init_file_progress(&self.provider.database_id, &self.provider.name, csv_file, file_crc, checkpoint.line, checkpoint.byte, 1)
-      .await?;
 
     if self.rows_processed_this_run.load(Ordering::Relaxed) >= self.max_rows {
       return Ok(CsvExtractOutcome {
@@ -1004,6 +999,17 @@ pub async fn prepare_provider(
     return Ok(None);
   }
 
+  let progress = files
+    .iter()
+    .map(|file| FileProgressInit {
+      file: &file.csv_file,
+      crc: &file.crc,
+      line: file.checkpoint.line,
+      byte: file.checkpoint.byte,
+    })
+    .collect::<Vec<_>>();
+  d1_client.init_files_progress(&provider.database_id, &provider.name, &progress).await?;
+
   Ok(Some(PreparedProvider { provider, download, files }))
 }
 
@@ -1026,7 +1032,7 @@ pub async fn process_prepared_provider(
     let processor = processor.clone();
     let feed = download.file.clone();
     csv_tasks.spawn(async move {
-      match processor.process_csv_file(feed, &file.csv_file, &file.crc, &file.table_name, file.db_columns, file.checkpoint).await {
+      match processor.process_csv_file(feed, &file.csv_file, &file.table_name, file.db_columns, file.checkpoint).await {
         Ok(outcome) => {
           file.checkpoint = outcome.checkpoint;
           Ok((file, outcome.file_done, outcome.write_budget_exhausted))

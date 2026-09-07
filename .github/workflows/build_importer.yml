@@ -11,10 +11,10 @@ on:
       - "Cargo.lock"
       - "rust-toolchain"
       - ".github/workflows/build_importer.yml"
-      - "providers.toml"
       - "worker/**"
       - "test/**"
       - "scripts/build.sh"
+      - "scripts/generate-wrangler.sh"
   pull_request:
     paths:
       - "importer/**"
@@ -25,8 +25,8 @@ on:
       - "Cargo.lock"
       - "rust-toolchain"
       - "scripts/build.sh"
+      - "scripts/generate-wrangler.sh"
       - ".github/workflows/build_importer.yml"
-      - "providers.toml"
   workflow_dispatch:
 
 env:
@@ -37,25 +37,28 @@ concurrency:
   group: build-importer-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: write # Needed for creating a GitHub release
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.94.0
           components: clippy, rustfmt
 
       - name: Cache Rust Dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check Formatting
         run: cargo fmt --all -- --check
@@ -84,10 +87,34 @@ jobs:
       - name: Build Importer
         run: cargo build --release --locked -p importer
 
-      - name: Publish to GitHub Release
+      - name: Transfer Importer to Release Job
         if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: target/release/importer
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # Needed only for creating the GitHub release
+
+    steps:
+      - name: Download Importer
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: importer
+
+      - name: Publish to GitHub Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TARGET: ${{ github.sha }}
         run: |
           # Create a rolling 'latest-cron' tag and release
           # Using gh cli which is pre-installed on ubuntu runners
@@ -98,7 +125,8 @@ jobs:
           fi
 
           # Create the release and upload the binary
-          gh release create latest-cron target/release/importer \
+          gh release create latest-cron importer \
             --title "Latest Importer Build" \
-            --notes "Automated build from commit ${{ github.sha }} for the cron pipeline." \
+            --notes "Automated build from commit ${RELEASE_TARGET} for the cron pipeline." \
+            --target "${RELEASE_TARGET}" \
             --latest
