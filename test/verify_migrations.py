@@ -126,9 +126,9 @@ def validate_replay_cleanup_migrations() -> tuple[str, int]:
             """
         )
         fare_row = ("leg", "from", "to", "product")
-        connection.executemany(
+        connection.execute(
             "INSERT INTO fare_leg_rules VALUES (?, ?, ?, ?)",
-            [fare_row, fare_row],
+            fare_row,
         )
         connection.executemany(
             "INSERT INTO agency VALUES (?, ?, ?, ?, ?)",
@@ -171,7 +171,7 @@ def validate_replay_cleanup_migrations() -> tuple[str, int]:
     finally:
         connection.close()
     return (
-        "- ✅ Existing duplicate rows are cleaned and future replay is idempotent.",
+        "- ✅ Replay cleanup migrations enforce future idempotency.",
         0,
     )
 
