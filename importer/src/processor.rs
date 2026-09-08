@@ -639,6 +639,10 @@ fn contiguous_committed_checkpoint(initial: Checkpoint, statuses: &BTreeMap<u64,
   committed
 }
 
+fn producer_checkpoint_is_committed(producer: Checkpoint, committed: Checkpoint) -> bool {
+  producer.line == committed.line && producer.byte >= committed.byte
+}
+
 #[derive(Clone)]
 pub struct ProviderProcessor {
   d1_client: D1Client,
@@ -847,7 +851,7 @@ impl ProviderProcessor {
         return Err(error);
       }
     };
-    if extraction.checkpoint != upload.committed_through {
+    if !producer_checkpoint_is_committed(extraction.checkpoint, upload.committed_through) {
       self
         .d1_client
         .update_file_progress(
@@ -1464,6 +1468,16 @@ mod tests {
 
     let statuses = BTreeMap::from([(100, (Checkpoint { line: 200, byte: 2_000 }, true))]);
     assert_eq!(contiguous_committed_checkpoint(Checkpoint::default(), &statuses), Checkpoint::default());
+  }
+
+  #[test]
+  fn byte_only_producer_progress_does_not_require_a_d1_batch() {
+    let initial = Checkpoint::default();
+    let header_only = Checkpoint { line: 0, byte: 31 };
+
+    assert!(producer_checkpoint_is_committed(header_only, initial));
+    assert!(!producer_checkpoint_is_committed(Checkpoint { line: 1, byte: 31 }, initial));
+    assert!(!producer_checkpoint_is_committed(initial, header_only));
   }
 
   #[test]
