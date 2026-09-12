@@ -6,6 +6,9 @@
 # The deploy script will automatically provision the D1 database,
 # fill in the `database_id`, generate wrangler.toml, and deploy!
 
+# Keep the budget on this provider; moving it requires preserving its ledger.
+budget_provider = "ktmb"
+
 [[providers]]
 name = "mybas-johor"
 is_active = true

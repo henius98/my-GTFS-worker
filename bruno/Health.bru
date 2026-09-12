@@ -1,0 +1,16 @@
+meta {
+  name: Worker health
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/
+  body: none
+  auth: none
+}
+
+docs {
+  Returns plain text confirming that the Worker is running.
+  This endpoint does not check database connectivity.
+}

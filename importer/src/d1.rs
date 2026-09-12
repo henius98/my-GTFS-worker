@@ -16,6 +16,10 @@ use tokio::sync::{Notify, Semaphore};
 
 const MAX_QUERY_RETRIES: u32 = 3;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+pub const DAILY_WRITE_LIMIT: u64 = 100_000;
+pub const METADATA_WRITE_RESERVE: u64 = 1_000;
+// One ledger update to acquire a lease and one to return unused capacity.
+pub const LEDGER_WRITE_RESERVE: u64 = 2;
 
 #[derive(Error, Debug)]
 pub enum D1Error {
@@ -58,7 +62,7 @@ pub struct D1Result {
 
 impl D1Result {
   pub fn rows_written(&self) -> Option<u64> {
-    self.meta.as_ref().map(|meta| meta.rows_written)
+    self.meta.as_ref().and_then(|meta| meta.rows_written)
   }
 }
 
@@ -67,7 +71,7 @@ pub struct D1Meta {
   #[serde(default)]
   rows_read: u64,
   #[serde(default)]
-  rows_written: u64,
+  rows_written: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -205,9 +209,16 @@ pub struct D1Client {
   authorization: HeaderValue,
   concurrency_limit: Arc<Semaphore>,
   write_budget: Arc<D1WriteBudget>,
+  metadata_budget: Arc<D1WriteBudget>,
+  daily_lease: Option<Arc<DailyLease>>,
   query_timeout: Duration,
   rows_read: Arc<AtomicU64>,
   rows_written: Arc<AtomicU64>,
+}
+
+struct DailyLease {
+  database_id: String,
+  day: String,
 }
 
 impl D1Client {
@@ -226,10 +237,69 @@ impl D1Client {
       authorization,
       concurrency_limit: Arc::new(Semaphore::new(runtime.d1_global_concurrency_limit)),
       write_budget: Arc::new(D1WriteBudget::new(runtime.max_d1_rows_written_per_workflow)),
+      metadata_budget: Arc::new(D1WriteBudget::new(METADATA_WRITE_RESERVE)),
+      daily_lease: None,
       query_timeout: runtime.d1_query_timeout,
       rows_read: Arc::new(AtomicU64::new(0)),
       rows_written: Arc::new(AtomicU64::new(0)),
     })
+  }
+
+  pub async fn acquire_daily_budget(&mut self, database_id: &str, workflow_limit: u64) -> Result<bool, D1Error> {
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let requested = workflow_limit;
+    if requested <= METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE {
+      return Err(D1Error::ApiError("Workflow budget is too small for metadata and ledger writes".into()));
+    }
+    let query = D1Query {
+      sql: "WITH allowance AS MATERIALIZED (SELECT MIN(?, ? - (CASE WHEN Day = date('now') THEN Reserved ELSE 0 END)) AS Granted FROM daily_import_budget WHERE Id = 1) UPDATE daily_import_budget SET Day = date('now'), Reserved = (CASE WHEN Day = date('now') THEN Reserved ELSE 0 END) + (SELECT Granted FROM allowance) WHERE Id = 1 AND date('now') = ? AND (SELECT Granted FROM allowance) > ? RETURNING (SELECT Granted FROM allowance) AS Granted",
+      params: vec![requested.into(), DAILY_WRITE_LIMIT.into(), day.clone().into(), (METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE).into()],
+    };
+    let (results, _) = self.execute_query_body(database_id, &query, 0).await?;
+    let Some(row) = results.first().and_then(|result| result.results.first()) else {
+      println!("Daily D1 budget cannot cover another workflow's metadata and ledger writes; deferring until the next UTC day.");
+      return Ok(false);
+    };
+    let granted = row
+      .get("Granted")
+      .and_then(serde_json::Value::as_u64)
+      .filter(|granted| *granted > METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE && *granted <= requested)
+      .ok_or_else(|| D1Error::ApiError("Daily D1 budget returned an invalid workflow allowance".into()))?;
+    println!("Daily D1 budget granted {granted} writes for this workflow (configured maximum: {requested}).");
+    self.write_budget = Arc::new(D1WriteBudget::new(granted - METADATA_WRITE_RESERVE - LEDGER_WRITE_RESERVE));
+    self.daily_lease = Some(Arc::new(DailyLease {
+      database_id: database_id.to_owned(),
+      day,
+    }));
+    Ok(true)
+  }
+
+  pub async fn release_daily_budget(&self) -> Result<(), D1Error> {
+    let Some(lease) = &self.daily_lease else {
+      return Ok(());
+    };
+    let unused = self.write_budget.state().remaining + self.metadata_budget.state().remaining;
+    let query = D1Query {
+      sql: "UPDATE daily_import_budget SET Reserved = Reserved - ? WHERE Id = 1 AND Day = ? AND Reserved >= ?",
+      params: vec![unused.into(), lease.day.clone().into(), unused.into()],
+    };
+    // Never retry this subtraction: a lost response leaves a conservative lease.
+    self.execute_query_body(&lease.database_id, &query, 0).await?;
+    Ok(())
+  }
+
+  pub fn is_budget_database(&self, database_id: &str) -> bool {
+    self.daily_lease.as_ref().is_some_and(|lease| lease.database_id == database_id)
+  }
+
+  fn check_daily_window(&self) -> Result<(), D1Error> {
+    if let Some(lease) = &self.daily_lease {
+      let now = chrono::Utc::now();
+      if now.format("%Y-%m-%d").to_string() != lease.day || now.timestamp().rem_euclid(86_400) >= 86_340 {
+        return Err(D1Error::WriteBudgetExhausted { requested: 1, remaining: 0 });
+      }
+    }
+    Ok(())
   }
 
   pub fn usage(&self) -> D1Usage {
@@ -240,19 +310,50 @@ impl D1Client {
   }
 
   pub async fn reserve_import_writes(&self, maximum_writes: u64) -> Result<D1WriteReservation, D1Error> {
+    // Stop data early enough to drain requests and save checkpoints before
+    // the final-minute guard closes all D1 traffic for this lease.
+    if chrono::Utc::now().timestamp().rem_euclid(86_400) >= 86_280 {
+      return Err(D1Error::WriteBudgetExhausted {
+        requested: maximum_writes,
+        remaining: 0,
+      });
+    }
     self.write_budget.reserve(maximum_writes).await
   }
 
   pub async fn query(&self, db_id: &str, query: D1Query<'_>) -> Result<Vec<D1Result>, D1Error> {
+    if !query.sql.trim_start().starts_with("SELECT") {
+      return self.metadata_batch(db_id, &[query], 2).await;
+    }
     let (results, _) = self.execute_query_body(db_id, &query, MAX_QUERY_RETRIES).await?;
     validate_result_count(results, 1)
+  }
+
+  async fn metadata_batch(&self, db_id: &str, queries: &[D1Query<'_>], maximum_writes: u64) -> Result<Vec<D1Result>, D1Error> {
+    let reservation = self.metadata_budget.reserve(maximum_writes).await?;
+    self.reserved_metadata_batch(db_id, queries, reservation).await
+  }
+
+  pub async fn reserve_checkpoint(&self) -> Result<D1WriteReservation, D1Error> {
+    self.metadata_budget.reserve(2).await
+  }
+
+  async fn reserved_metadata_batch(&self, db_id: &str, queries: &[D1Query<'_>], reservation: D1WriteReservation) -> Result<Vec<D1Result>, D1Error> {
+    let (results, _) = self.execute_query_body(db_id, &D1BatchRequest { batch: queries }, 0).await?;
+    let results = validate_result_count(results, queries.len())?;
+    let actual = results.iter().try_fold(0_u64, |total, result| result.rows_written().and_then(|writes| total.checked_add(writes)));
+    match actual {
+      Some(actual) => reservation.finish(actual)?,
+      None => return Err(D1Error::ApiError("Missing metadata write accounting".into())),
+    }
+    Ok(results)
   }
 
   pub async fn batch_with_retry_state(&self, db_id: &str, queries: &[D1Query<'_>]) -> Result<(Vec<D1Result>, bool), D1Error> {
     if queries.is_empty() {
       return Ok((Vec::new(), false));
     }
-    let (results, had_ambiguous_retry) = self.execute_query_body(db_id, &D1BatchRequest { batch: queries }, MAX_QUERY_RETRIES).await?;
+    let (results, had_ambiguous_retry) = self.execute_query_body(db_id, &D1BatchRequest { batch: queries }, 0).await?;
     Ok((validate_result_count(results, queries.len())?, had_ambiguous_retry))
   }
 
@@ -271,6 +372,7 @@ impl D1Client {
         .acquire()
         .await
         .map_err(|error| D1Error::ApiError(format!("Failed to acquire D1 request permit: {error}")))?;
+      self.check_daily_window()?;
       let response = self
         .client
         .post(&url)
@@ -333,7 +435,7 @@ impl D1Client {
 
   fn record_usage(&self, results: &[D1Result]) {
     let rows_read = results.iter().filter_map(|result| result.meta.as_ref()).map(|meta| meta.rows_read).sum();
-    let rows_written = results.iter().filter_map(|result| result.meta.as_ref()).map(|meta| meta.rows_written).sum();
+    let rows_written = results.iter().filter_map(D1Result::rows_written).sum();
     self.rows_read.fetch_add(rows_read, Ordering::Relaxed);
     self.rows_written.fetch_add(rows_written, Ordering::Relaxed);
   }
@@ -413,14 +515,15 @@ impl D1Client {
         ],
       })
       .collect::<Vec<_>>();
-    self.batch_with_retry_state(db_id, &queries).await?;
+    self.metadata_batch(db_id, &queries, files.len() as u64 * 2).await?;
     Ok(())
   }
 
-  pub async fn update_file_progress(&self, db_id: &str, provider: &str, file: &str, line: u64, byte: u64, status: i64) -> Result<(), D1Error> {
-    self.query(
+  #[allow(clippy::too_many_arguments)]
+  pub async fn update_file_progress(&self, reservation: D1WriteReservation, db_id: &str, provider: &str, file: &str, line: u64, byte: u64, status: i64) -> Result<(), D1Error> {
+    self.reserved_metadata_batch(
             db_id,
-            D1Query {
+            &[D1Query {
                 sql: "UPDATE import_progress SET LastProcessedLine = ?, LastProcessedByte = ?, Status = ?, UpdatedAt = CURRENT_TIMESTAMP WHERE Provider = ? AND FileName = ? AND (LastProcessedLine IS NOT ? OR LastProcessedByte IS NOT ? OR Status IS NOT ?)",
                 params: vec![
                     serde_json::Value::Number(line.into()),
@@ -432,7 +535,8 @@ impl D1Client {
                     serde_json::Value::Number(byte.into()),
                     serde_json::Value::Number(status.into()),
                 ],
-            },
+            }],
+            reservation,
         )
         .await?;
     Ok(())
@@ -522,8 +626,7 @@ impl D1Client {
     // migration file as one batch instead of one REST request per statement.
     // Keep retries disabled because an ambiguous DDL response is not
     // necessarily safe to replay.
-    let (results, _) = self.execute_query_body(db_id, &D1BatchRequest { batch: &queries }, 0).await?;
-    validate_result_count(results, queries.len())?;
+    self.metadata_batch(db_id, &queries, queries.len() as u64 * 4).await?;
     Ok(())
   }
 
@@ -572,6 +675,25 @@ fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn omitted_write_metadata_is_not_a_zero_write_response() -> Result<(), serde_json::Error> {
+    let result: D1Result = serde_json::from_str(r#"{"meta":{"rows_read":0},"success":true}"#)?;
+    assert_eq!(result.rows_written(), None);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn exhausted_data_budget_preserves_checkpoint_capacity() -> Result<(), D1Error> {
+    let data = Arc::new(D1WriteBudget::new(8));
+    let metadata = Arc::new(D1WriteBudget::new(2));
+    let checkpoint = metadata.reserve(2).await?;
+    data.reserve(8).await?.consume_all();
+    assert!(matches!(data.reserve(1).await, Err(D1Error::WriteBudgetExhausted { .. })));
+    checkpoint.finish(1)?;
+    assert_eq!(metadata.state().remaining, 1);
+    Ok(())
+  }
 
   #[test]
   fn retry_after_accepts_delta_seconds() {
@@ -638,12 +760,12 @@ mod tests {
     client.record_usage(&[
       D1Result {
         results: Vec::new(),
-        meta: Some(D1Meta { rows_read: 7, rows_written: 3 }),
+        meta: Some(D1Meta { rows_read: 7, rows_written: Some(3) }),
         success: Some(true),
       },
       D1Result {
         results: Vec::new(),
-        meta: Some(D1Meta { rows_read: 11, rows_written: 5 }),
+        meta: Some(D1Meta { rows_read: 11, rows_written: Some(5) }),
         success: Some(true),
       },
     ]);

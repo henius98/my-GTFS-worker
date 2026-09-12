@@ -1,0 +1,6 @@
+{
+  "version": "1",
+  "name": "my-GTFS-worker",
+  "type": "collection",
+  "ignore": ["node_modules", ".git"]
+}

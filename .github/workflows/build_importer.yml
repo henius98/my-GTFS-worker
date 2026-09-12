@@ -69,6 +69,9 @@ jobs:
       - name: Run Unit Tests
         run: cargo test --workspace --locked
 
+      - name: Verify Daily Write Budget SQL
+        run: python3 test/test_daily_budget.py
+
       - name: Validate Live GTFS Schemas
         run: python3 test/verify_migrations.py --no-report
 

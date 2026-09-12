@@ -2,12 +2,13 @@ name: GTFS Import Pipeline
 
 on:
   schedule:
-    # Run hourly to pick up changed GTFS feeds as soon as possible.
-    - cron: "0 * * * *"
+    # Run twice daily at 05:00 and 13:00 UTC+8; the durable UTC-day budget also covers manual runs.
+    - cron: "0 5,13 * * *"
+      timezone: "Asia/Kuala_Lumpur"
   workflow_dispatch:
     inputs:
       max_rows:
-        description: Logical-row cap for this manual run (keep daily D1 write headroom)
+        description: Logical-row cap for this manual run (shares the daily D1 write allowance)
         required: true
         default: "1000"
         type: choice
@@ -51,7 +52,7 @@ jobs:
           D1_DATABASE_CONCURRENCY_LIMIT: ${{ vars.D1_DATABASE_CONCURRENCY_LIMIT || '8' }}
           D1_MAX_DATABASES: ${{ vars.D1_MAX_DATABASES || '10' }}
           D1_STATEMENTS_PER_REQUEST: ${{ vars.D1_STATEMENTS_PER_REQUEST || '4' }}
-          MAX_D1_ROWS_WRITTEN_PER_WORKFLOW: ${{ vars.MAX_D1_ROWS_WRITTEN_PER_WORKFLOW || '40000' }}
+          MAX_D1_ROWS_WRITTEN_PER_WORKFLOW: ${{ vars.MAX_D1_ROWS_WRITTEN_PER_WORKFLOW }}
           MAX_ROWS_PER_WORKFLOW: ${{ github.event_name == 'workflow_dispatch' && inputs.max_rows || vars.MAX_ROWS_PER_WORKFLOW || '1750000' }}
           MAX_FEED_DOWNLOAD_MB: ${{ vars.MAX_FEED_DOWNLOAD_MB || '256' }}
           MAX_UNCOMPRESSED_FEED_MB: ${{ vars.MAX_UNCOMPRESSED_FEED_MB || '512' }}

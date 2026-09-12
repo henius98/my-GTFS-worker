@@ -30,6 +30,7 @@ fn default() -> bool {
 
 #[derive(Deserialize, Debug)]
 pub struct ProvidersToml {
+  pub budget_provider: String,
   pub providers: Vec<ProviderConfig>,
 }
 
@@ -124,7 +125,7 @@ impl RuntimeConfig {
 
     let query_statement_batch_size = bounded_usize("QUERY_STATEMENT_BATCH_SIZE", 1_000, 10_000)?;
     let d1_statements_per_request = bounded_usize("D1_STATEMENTS_PER_REQUEST", 4, 16)?;
-    let max_d1_rows_written_per_workflow = positive_u64("MAX_D1_ROWS_WRITTEN_PER_WORKFLOW", 40_000)?;
+    let max_d1_rows_written_per_workflow = positive_u64("MAX_D1_ROWS_WRITTEN_PER_WORKFLOW", crate::d1::DAILY_WRITE_LIMIT)?;
     // if max_d1_rows_written_per_workflow > 100_000 {
     //   return Err(ConfigError::InvalidEnvironment {
     //     name: "MAX_D1_ROWS_WRITTEN_PER_WORKFLOW",
@@ -135,11 +136,13 @@ impl RuntimeConfig {
     let maximum_group_rows = u64::try_from(query_statement_batch_size)
       .unwrap_or(u64::MAX)
       .saturating_mul(u64::try_from(d1_statements_per_request).unwrap_or(u64::MAX));
-    if maximum_group_rows.saturating_mul(2) > max_d1_rows_written_per_workflow {
+    if max_d1_rows_written_per_workflow > crate::d1::DAILY_WRITE_LIMIT
+      || maximum_group_rows.saturating_mul(2).saturating_add(crate::d1::METADATA_WRITE_RESERVE + crate::d1::LEDGER_WRITE_RESERVE) > max_d1_rows_written_per_workflow
+    {
       return Err(ConfigError::InvalidEnvironment {
         name: "MAX_D1_ROWS_WRITTEN_PER_WORKFLOW",
         value: max_d1_rows_written_per_workflow.to_string(),
-        requirement: "must reserve at least two indexed D1 writes for every row in one maximum statement group",
+        requirement: "must fit the daily allowance and cover one indexed statement group plus metadata and ledger reserves",
       });
     }
 

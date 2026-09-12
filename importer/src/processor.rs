@@ -188,6 +188,7 @@ struct BatchWorker {
   database_id: Arc<str>,
   insert_sql: Arc<str>,
   database_semaphore: Arc<tokio::sync::Semaphore>,
+  provider_name: Arc<str>,
 }
 
 impl BatchWorker {
@@ -231,6 +232,11 @@ impl BatchWorker {
           "D1 response omitted or overflowed rows_written metadata; consumed the full write reservation".to_owned(),
         )));
       };
+      println!(
+        "[{}] {}: {logical_rows} logical rows, {actual_writes} D1 writes",
+        self.provider_name,
+        self.insert_sql.split_whitespace().nth(2).unwrap_or("unknown table")
+      );
       if had_ambiguous_retry {
         reservation.consume_all();
       } else {
@@ -402,7 +408,7 @@ fn extract_and_batch_csv(job: CsvExtractJob, rows_processed_this_run: Arc<Atomic
     });
   }
 
-  let insert_sql = positional_insert_sql(&job.table_name, &matched_cols);
+  let insert_sql = positional_insert_sql(&job.table_name, &matched_cols, primary_keys(&job.provider_name, &job.table_name));
   tx.blocking_send(BatchMessage::InitSql(insert_sql)).map_err(|_| ProcessorError::UploaderClosed)?;
 
   let file = archive.by_name(&job.csv_file)?;
@@ -541,11 +547,16 @@ fn extract_and_batch_csv(job: CsvExtractJob, rows_processed_this_run: Arc<Atomic
   })
 }
 
-fn positional_insert_sql(table_name: &str, columns: &[&str]) -> String {
+fn primary_keys(provider_name: &str, table_name: &str) -> &'static [&'static str] {
+  include!(concat!(env!("OUT_DIR"), "/primary_keys.rs"))
+}
+
+fn positional_insert_sql(table_name: &str, columns: &[&str], keys: &[&str]) -> String {
   let column_list = columns.iter().map(|column| quote_identifier(column)).collect::<Vec<_>>().join(", ");
   let selects = (0..columns.len()).map(|index| format!("json_extract(value, '$[{index}]')")).collect::<Vec<_>>().join(", ");
   let assignments = columns
     .iter()
+    .filter(|column| !keys.contains(column))
     .map(|column| {
       let quoted = quote_identifier(column);
       format!("{quoted} = excluded.{quoted}")
@@ -553,8 +564,12 @@ fn positional_insert_sql(table_name: &str, columns: &[&str]) -> String {
     .collect::<Vec<_>>()
     .join(", ");
   let quoted_table = quote_identifier(table_name);
+  if assignments.is_empty() {
+    return format!("INSERT INTO {quoted_table} ({column_list}) SELECT {selects} FROM json_each(?) WHERE TRUE ON CONFLICT DO NOTHING");
+  }
   let changed = columns
     .iter()
+    .filter(|column| !keys.contains(column))
     .map(|column| {
       let quoted = quote_identifier(column);
       format!("{quoted_table}.{quoted} IS NOT excluded.{quoted}")
@@ -684,6 +699,7 @@ impl ProviderProcessor {
               database_id: Arc::from(self.provider.database_id.as_str()),
               insert_sql: Arc::from(sql),
               database_semaphore: self.database_semaphore.clone(),
+              provider_name: Arc::from(self.provider.name.as_str()),
             }));
           }
         }
@@ -762,6 +778,17 @@ impl ProviderProcessor {
       });
     }
 
+    let progress_reservation = match self.d1_client.reserve_checkpoint().await {
+      Ok(reservation) => reservation,
+      Err(D1Error::WriteBudgetExhausted { .. }) => {
+        return Ok(CsvExtractOutcome {
+          file_done: false,
+          checkpoint,
+          write_budget_exhausted: true,
+        });
+      }
+      Err(error) => return Err(error.into()),
+    };
     let csv_permit = self
       .csv_semaphore
       .clone()
@@ -797,6 +824,7 @@ impl ProviderProcessor {
       self
         .d1_client
         .update_file_progress(
+          progress_reservation,
           &self.provider.database_id,
           &self.provider.name,
           csv_file,
@@ -815,6 +843,7 @@ impl ProviderProcessor {
       self
         .d1_client
         .update_file_progress(
+          progress_reservation,
           &self.provider.database_id,
           &self.provider.name,
           csv_file,
@@ -840,6 +869,7 @@ impl ProviderProcessor {
         self
           .d1_client
           .update_file_progress(
+            progress_reservation,
             &self.provider.database_id,
             &self.provider.name,
             csv_file,
@@ -855,6 +885,7 @@ impl ProviderProcessor {
       self
         .d1_client
         .update_file_progress(
+          progress_reservation,
           &self.provider.database_id,
           &self.provider.name,
           csv_file,
@@ -872,6 +903,7 @@ impl ProviderProcessor {
     self
       .d1_client
       .update_file_progress(
+        progress_reservation,
         &self.provider.database_id,
         &self.provider.name,
         csv_file,
@@ -912,6 +944,9 @@ fn discover_supported_files(
     let Some(table_name) = base_name.strip_suffix(".txt") else {
       continue;
     };
+    if table_name == "daily_import_budget" {
+      continue;
+    }
     let Some(db_columns) = schemas.iter().find(|(schema_table, _)| *schema_table == table_name).map(|(_, columns)| *columns) else {
       println!("[{provider_name}] Skipping unsupported GTFS file: {table_name} (no schema)");
       continue;
@@ -1175,6 +1210,11 @@ async fn rotate_database_if_needed(
   if database.file_size < threshold_bytes {
     return Ok(());
   }
+  if d1_client.is_budget_database(&provider.database_id) {
+    return Err(ProcessorError::D1(D1Error::ApiError(
+      "The daily-budget database cannot rotate automatically; preserve its ledger when moving it".into(),
+    )));
+  }
 
   let _rotation_guard = database_rotation_lock.lock().await;
   let database_count = d1_client.get_database_count().await?;
@@ -1300,9 +1340,23 @@ mod tests {
   #[test]
   fn positional_sql_quotes_identifiers() {
     assert_eq!(
-      positional_insert_sql("stop_times", &["trip_id", "stop_sequence"]),
+      positional_insert_sql("stop_times", &["trip_id", "stop_sequence"], &[]),
       "INSERT INTO \"stop_times\" (\"trip_id\", \"stop_sequence\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?) WHERE TRUE ON CONFLICT DO UPDATE SET \"trip_id\" = excluded.\"trip_id\", \"stop_sequence\" = excluded.\"stop_sequence\" WHERE \"stop_times\".\"trip_id\" IS NOT excluded.\"trip_id\" OR \"stop_times\".\"stop_sequence\" IS NOT excluded.\"stop_sequence\""
     );
+  }
+
+  #[test]
+  fn upserts_preserve_primary_keys_and_skip_key_only_conflicts() {
+    let keys = primary_keys("ktmb", "stop_times");
+    assert_eq!(keys, &["trip_id", "stop_sequence"]);
+    let sql = positional_insert_sql("stop_times", &["trip_id", "stop_sequence", "arrival_time"], keys);
+    let update = sql.split_once("DO UPDATE SET").map(|(_, update)| update).unwrap_or_default();
+    assert!(update.contains("\"arrival_time\" = excluded.\"arrival_time\""));
+    assert!(!update.contains("\"trip_id\""));
+    assert!(!update.contains("\"stop_sequence\""));
+    assert!(positional_insert_sql("stop_times", keys, keys).ends_with("DO NOTHING"));
+    assert_eq!(primary_keys("mybas-johor", "areas"), &["area_id"]);
+    assert!(primary_keys("mybas-johor", "fare_leg_rules").is_empty());
   }
 
   #[test]

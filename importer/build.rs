@@ -126,6 +126,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   fs::write(&dest_path, generated_code)?;
 
+  let mut keys_code = String::from("match (provider_name, table_name) {\n");
+  for path in &provider_dirs {
+    let Some(provider_name) = path.file_name().and_then(|name| name.to_str()) else {
+      continue;
+    };
+    let schema_path = path.join("0_gtfs_schema.sql");
+    if !schema_path.exists() {
+      continue;
+    }
+    let sql = fs::read_to_string(schema_path)?;
+    for statement in sql.split(';') {
+      let Some((_, definition)) = statement.split_once("CREATE TABLE IF NOT EXISTS ") else {
+        continue;
+      };
+      let Some((table, body)) = definition.split_once('(') else {
+        continue;
+      };
+      let mut keys = Vec::new();
+      if let Some((_, primary)) = body.split_once("PRIMARY KEY (") {
+        if let Some((columns, _)) = primary.split_once(')') {
+          keys.extend(columns.split(',').map(str::trim));
+        }
+      } else {
+        for line in body.lines() {
+          if line.contains("PRIMARY KEY")
+            && let Some(column) = line.split_whitespace().next()
+          {
+            keys.push(column);
+          }
+        }
+      }
+      keys_code.push_str(&format!("    ({provider_name:?}, {:?}) => &{keys:?},\n", table.trim()));
+    }
+  }
+  keys_code.push_str("    _ => &[],\n}\n");
+  fs::write(PathBuf::from(&out_dir).join("primary_keys.rs"), keys_code)?;
+
   // Generate schema_sql.rs to embed the full SQL content for D1 database rotation
   let sql_dest_path = PathBuf::from(&out_dir).join("schema_sql.rs");
   let mut sql_code = String::new();

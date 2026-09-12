@@ -31,7 +31,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let providers = config::load_config("providers.toml")?;
   let runtime = Arc::new(config::RuntimeConfig::from_env()?);
 
-  let d1_client = D1Client::new(account_id, api_token, &runtime)?;
+  let budget_database = providers
+    .providers
+    .iter()
+    .find(|provider| provider.name == providers.budget_provider)
+    .filter(|provider| !provider.database_id.is_empty())
+    .ok_or("budget_provider must name a configured provider with a database_id")?;
+  let mut d1_client = D1Client::new(account_id, api_token, &runtime)?;
+  if !d1_client.acquire_daily_budget(&budget_database.database_id, runtime.max_d1_rows_written_per_workflow).await? {
+    return Ok(());
+  }
   let csv_semaphore = Arc::new(Semaphore::new(runtime.csv_concurrency_limit));
   let temp_storage = Arc::new(processor::TempFeedStorage::new(runtime.max_temp_feed_storage_bytes));
   let providers_file_lock = Arc::new(Mutex::new(()));
@@ -39,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let mut preparation_tasks = JoinSet::new();
 
   println!(
-    "Importer limits: {} logical workflow rows, {} reserved D1 data-row writes, {} CSV producers, {} global D1 requests, {} request(s) per database, {} rows per statement, {} statements per request, {} databases, {}-byte downloads, {} uncompressed bytes/feed, {} bytes/CSV record, {} bytes/statement, {} bytes temporary feed storage",
+    "Importer limits: {} logical workflow rows, {} configured maximum D1 writes, {} CSV producers, {} global D1 requests, {} request(s) per database, {} rows per statement, {} statements per request, {} databases, {}-byte downloads, {} uncompressed bytes/feed, {} bytes/CSV record, {} bytes/statement, {} bytes temporary feed storage",
     runtime.max_rows_per_workflow,
     runtime.max_d1_rows_written_per_workflow,
     runtime.csv_concurrency_limit,
@@ -183,6 +192,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pending.len()
   );
 
+  if !has_error {
+    d1_client.release_daily_budget().await?;
+  }
   let usage = d1_client.usage();
   println!("D1 query metadata for this workflow: {} rows read, {} rows written", usage.rows_read, usage.rows_written);
 
