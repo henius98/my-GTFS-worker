@@ -3,8 +3,4 @@ build/
 node_modules/
 .wrangler/
 .env
-
-# Pipeline / script temp files
-recreate-providers.txt
-importer_bin
 __pycache__/

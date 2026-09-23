@@ -65,7 +65,12 @@ my-GTFS-worker/
 ├── worker/             # Cloudflare Worker crate
 │   ├── Cargo.toml
 │   └── src/
-│       └── lib.rs      # API entry points (/status)
+│       ├── lib.rs      # Worker entry point and route dispatch
+│       ├── database.rs # Provider D1 binding lookup
+│       └── routes/
+│           ├── mod.rs
+│           ├── data.rs   # GTFS table data endpoint
+│           └── status.rs # Import progress endpoint
 ├── migrations/         # D1 migration files for infrastructure tables
 ├── schema.sql          # Reference schema (not applied directly)
 └── .github/workflows/  # GitHub Actions pipelines (e.g., run_importer.yml)
@@ -75,7 +80,7 @@ my-GTFS-worker/
 
 | Crate      | Purpose                                                                                                                                                                                                      |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `worker`   | Deploys to Cloudflare Workers. Handles incoming HTTP requests to check database status via `/<provider>/status`.                                                                                             |
+| `worker`   | Deploys to Cloudflare Workers. Handles incoming HTTP requests for database status via `/<provider>/status` and GTFS table data via `/<provider>/data/<table>`.                                             |
 | `importer` | Runs via GitHub Actions. Handles downloading ZIPs, schema-aware file selection, concurrent CSV parsing, and parallel asynchronous multi-row batch inserts to D1. Tracks row progress to ensure resumability. |
 
 ### Data Flow

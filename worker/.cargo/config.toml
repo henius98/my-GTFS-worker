@@ -1,4 +1,0 @@
-[build]
-rustflags = ["-C", "target-feature=+reference-types"]
-[target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+reference-types"]
