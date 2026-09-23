@@ -2,9 +2,19 @@ name: GTFS Import Pipeline
 
 on:
   schedule:
-    # Run every 1 hours. Adjust frequency based on chunk sizes and D1 limits.
-    - cron: "0 */1 * * *"
-  workflow_dispatch: # Allow manual triggers
+    # Run twice daily at 05:00 and 13:00 UTC+8; the durable UTC-day budget also covers manual runs.
+    - cron: "0 5,13 * * *"
+      timezone: "Asia/Kuala_Lumpur"
+  workflow_dispatch:
+    inputs:
+      max_rows:
+        description: Logical-row cap for this manual run (shares the daily D1 write allowance)
+        required: true
+        default: "1000"
+        type: choice
+        options:
+          - "1000"
+          - "2000"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -18,13 +28,13 @@ concurrency:
 jobs:
   import:
     runs-on: ubuntu-latest
-    timeout-minutes: 30 # Increased to allow for potential DB recreation + re-import
+    timeout-minutes: 10 # Fail-safe to prevent runaways from consuming free tier minutes
     permissions:
-      contents: write # Needed for pushing updated providers.toml after DB recreation
+      contents: write
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download Pre-built Importer
         env:
@@ -34,74 +44,43 @@ jobs:
           chmod +x importer_bin
 
       - name: Run Importer
-        id: importer
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT }}
-          MAX_ROWS_PER_RUN: ${{ vars.MAX_ROWS_PER_RUN }}
-          QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE }}
-        run: |
-          set +e
-          ./importer_bin
-          EXIT_CODE=$?
-          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
-          if [ "$EXIT_CODE" -eq 42 ]; then
-            echo "🔄 Database full detected (exit code 42). Recreation will follow."
-            exit 0
-          elif [ "$EXIT_CODE" -ne 0 ]; then
-            exit "$EXIT_CODE"
-          fi
-
-      # ── DB Recreation Steps (only when exit code 42) ──────────────────────
-      - name: Setup Node.js
-        if: steps.importer.outputs.exit_code == '42'
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install Wrangler
-        if: steps.importer.outputs.exit_code == '42'
-        run: npm install -g wrangler
-
-      - name: Setup Rust
-        if: steps.importer.outputs.exit_code == '42'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust Dependencies
-        if: steps.importer.outputs.exit_code == '42'
-        uses: Swatinem/rust-cache@v2
-
-      - name: Recreate Databases
-        if: steps.importer.outputs.exit_code == '42'
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: |
-          echo "Providers needing recreation:"
-          cat recreate-providers.txt
-          echo ""
-          bash ./recreate-db.sh recreate-providers.txt
-
-      - name: Re-run Importer
-        if: steps.importer.outputs.exit_code == '42'
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT }}
-          MAX_ROWS_PER_RUN: ${{ vars.MAX_ROWS_PER_RUN }}
-          QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE }}
+          CSV_CONCURRENCY_LIMIT: ${{ vars.CSV_CONCURRENCY_LIMIT || '2' }}
+          D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT || '6' }}
+          D1_DATABASE_CONCURRENCY_LIMIT: ${{ vars.D1_DATABASE_CONCURRENCY_LIMIT || '8' }}
+          D1_MAX_DATABASES: ${{ vars.D1_MAX_DATABASES || '10' }}
+          D1_STATEMENTS_PER_REQUEST: ${{ vars.D1_STATEMENTS_PER_REQUEST || '4' }}
+          MAX_D1_ROWS_WRITTEN_PER_WORKFLOW: ${{ vars.MAX_D1_ROWS_WRITTEN_PER_WORKFLOW }}
+          MAX_ROWS_PER_WORKFLOW: ${{ github.event_name == 'workflow_dispatch' && inputs.max_rows || vars.MAX_ROWS_PER_WORKFLOW || '1750000' }}
+          MAX_FEED_DOWNLOAD_MB: ${{ vars.MAX_FEED_DOWNLOAD_MB || '256' }}
+          MAX_UNCOMPRESSED_FEED_MB: ${{ vars.MAX_UNCOMPRESSED_FEED_MB || '512' }}
+          MAX_CSV_RECORD_KB: ${{ vars.MAX_CSV_RECORD_KB || '512' }}
+          MAX_STATEMENT_PAYLOAD_KB: ${{ vars.MAX_STATEMENT_PAYLOAD_KB || '1536' }}
+          MAX_TEMP_FEED_STORAGE_MB: ${{ vars.MAX_TEMP_FEED_STORAGE_MB || '2048' }}
+          QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE || '1000' }}
+          DB_SIZE_THRESHOLD_MB: ${{ vars.DB_SIZE_THRESHOLD_MB || '400' }}
         run: ./importer_bin
 
-      - name: Commit Updated Config
-        if: steps.importer.outputs.exit_code == '42'
+      - name: Auto-Commit and Redeploy on Rotation
+        if: always()
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add providers.toml wrangler.toml
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "chore: recreate D1 database(s) due to 500MB limit
+          if ! git diff --quiet providers.toml; then
+            echo "Database rotation detected. Committing changes..."
+            bash ./scripts/generate-wrangler.sh
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git add providers.toml wrangler.toml
+            git commit -m "chore: auto-rotate D1 databases"
+            git push
 
-          Auto-recreated by GTFS Import Pipeline.
-          Providers: $(cat recreate-providers.txt | tr '\n' ', ' | sed 's/,$//')"
-          git push
+            echo "Deploying updated worker..."
+            npm ci
+            npx wrangler deploy
+          else
+            echo "No database rotation occurred."
+          fi

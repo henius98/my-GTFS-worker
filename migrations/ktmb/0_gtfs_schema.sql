@@ -3,6 +3,13 @@
 -- ============================================================================
 -- Infrastructure Tables
 -- ============================================================================
+CREATE TABLE IF NOT EXISTS daily_import_budget (
+    Id INTEGER PRIMARY KEY CHECK (Id = 1),
+    Day TEXT NOT NULL,
+    Reserved INTEGER NOT NULL CHECK (Reserved >= 0)
+);
+INSERT OR IGNORE INTO daily_import_budget (Id, Day, Reserved) VALUES (1, '', 0);
+
 CREATE TABLE IF NOT EXISTS logs (
     Id INTEGER PRIMARY KEY, -- timestamp + random number
     Level TINYINT NOT NULL CHECK (Level IN (0, 1, 2, 3, 4, 5)),
@@ -14,6 +21,7 @@ CREATE TABLE IF NOT EXISTS import_progress (
     FileName TEXT,
     CRC TEXT,
     LastProcessedLine INTEGER,
+    LastProcessedByte INTEGER NOT NULL DEFAULT 0 CHECK (LastProcessedByte >= 0),
     Status TINYINT CHECK (Status IN (0, 1)), -- 0 = COMPLETED, 1 = IN_PROGRESS
     UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (Provider, FileName)
@@ -47,6 +55,13 @@ CREATE TABLE IF NOT EXISTS calendar (
     start_date INTEGER,
     end_date INTEGER,
     PRIMARY KEY (service_id, start_date, end_date)
+);
+
+CREATE TABLE IF NOT EXISTS calendar_dates (
+    service_id TEXT,
+    date INTEGER,
+    exception_type INTEGER,
+    PRIMARY KEY (service_id, date)
 );
 
 CREATE TABLE IF NOT EXISTS routes (

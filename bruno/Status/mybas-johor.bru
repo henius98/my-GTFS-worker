@@ -1,0 +1,24 @@
+meta {
+  name: mybas-johor status
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/mybas-johor/status
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  Generated from providers.toml by scripts/generate-bruno.py.
+  Regenerate with: python3 scripts/generate-bruno.py
+  Returns an array of import progress records; an empty array is valid.
+  Fields: Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt.
+  Successful responses are publicly cached for 60 seconds.
+  Errors: 404 for an unbound provider; 500 for a database or response decoding error.
+}

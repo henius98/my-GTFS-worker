@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS import_progress (
     FileName TEXT,
     CRC TEXT,
     LastProcessedLine INTEGER,
+    LastProcessedByte INTEGER NOT NULL DEFAULT 0 CHECK (LastProcessedByte >= 0),
     Status TINYINT CHECK (Status IN (0, 1)), -- 0 = COMPLETED, 1 = IN_PROGRESS
     UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (Provider, FileName)
@@ -94,6 +95,9 @@ CREATE TABLE IF NOT EXISTS agency (
     agency_phone TEXT,
     agency_lang TEXT
 );
+
+-- This provider publishes exactly one agency and does not provide agency_id.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agency_single_row ON agency ((1));
 
 CREATE TABLE IF NOT EXISTS calendar_dates (
     service_id TEXT,

@@ -11,7 +11,6 @@ crate-type = ["cdylib", "rlib"]
 worker.workspace = true
 console_error_panic_hook.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true

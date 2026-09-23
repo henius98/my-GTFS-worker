@@ -3,23 +3,29 @@
 set -euo pipefail
 
 PROVIDERS_FILE="providers.toml"
+D1_MAX_DATABASES="${D1_MAX_DATABASES:-10}"
 
 # ── Pre-flight Checks ────────────────────────────────────────────────────────
 if [ -f ".env" ]; then
-    set -a
-    source .env
-    set +a
+  set -a
+  # shellcheck source=/dev/null
+  source .env
+  set +a
 fi
 if ! command -v wrangler &> /dev/null; then
-    echo "❌ Error: 'wrangler' CLI is not installed."
-    echo "Please install it via: npm install -g wrangler"
-    exit 1
+  echo "❌ Error: 'wrangler' CLI is not installed."
+  echo "Please install it via: npm install -g wrangler"
+  exit 1
 fi
 
 # Ensure Python 3 is available for robust TOML parsing
 if ! command -v python3 &> /dev/null; then
-    echo "❌ Error: 'python3' is required to securely parse providers.toml."
-    exit 1
+  echo "❌ Error: 'python3' is required to securely parse providers.toml."
+  exit 1
+fi
+if ! [[ "$D1_MAX_DATABASES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "❌ Error: D1_MAX_DATABASES must be a positive integer."
+  exit 1
 fi
 
 echo "🚀 Starting Unified GTFS Worker Deployment..."
@@ -42,7 +48,7 @@ except Exception as e:
 
 # ── Step 1: Provision Missing Databases ──────────────────────────────────────
 for PROVIDER in $PROVIDERS; do
-    DB_ID=$(python3 -c "
+  DB_ID=$(python3 -c "
 import sys, re
 with open('$PROVIDERS_FILE', 'r') as f:
     blocks = f.read().split('[[providers]]')
@@ -55,43 +61,49 @@ for block in blocks:
             sys.exit(0)
 " || true)
 
-    if [ -z "$DB_ID" ]; then
-        # Check for explicit database_name in providers.toml
-        DB_NAME=$(python3 -c "
-import sys, re
-with open('$PROVIDERS_FILE', 'r') as f:
-    blocks = f.read().split('[[providers]]')
-for block in blocks:
-    name_match = re.search(r'name\s*=\s*\"([^\"]+)\"', block)
-    if name_match and name_match.group(1) == '$PROVIDER':
-        db_name_match = re.search(r'database_name\s*=\s*\"([^\"]+)\"', block)
-        if db_name_match:
-            print(db_name_match.group(1))
-        else:
-            print('gtfs-${PROVIDER}-db')
-        sys.exit(0)
-" || echo "gtfs-${PROVIDER}-db")
-        echo "→ database_id is empty for provider '${PROVIDER}'. Checking if '${DB_NAME}' exists..."
-        
-        if ! wrangler d1 info "$DB_NAME" > .d1_info.tmp 2>/dev/null; then
-            echo "→ '${DB_NAME}' info failed. Checking if it already exists in list..."
-            # Note: wrangler d1 list may not show un-bound DBs easily without parsing JSON or grep.
-            # Let's try parsing it from wrangler d1 list output
-            wrangler d1 list > .d1_list.tmp 2>/dev/null
-            EXISTING_ID=$(grep -oP "[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}(?=\s*│\s*$DB_NAME)" .d1_list.tmp || true)
-            
-            if [ -z "$EXISTING_ID" ]; then
-                echo "→ '${DB_NAME}' not found. Creating it now..."
-                wrangler d1 create "$DB_NAME" > .d1_info.tmp
-            else
-                echo "→ '${DB_NAME}' already exists (ID: $EXISTING_ID). Emulating info output..."
-                echo "$EXISTING_ID" > .d1_info.tmp
-            fi
-        else
-            echo "→ '${DB_NAME}' info retrieved successfully."
+  if [ -z "$DB_ID" ]; then
+    DB_NAME="gtfs-${PROVIDER}-db-$(date -u +%Y%m%d)"
+    echo "→ database_id is empty for provider '${PROVIDER}'. Checking if '${DB_NAME}' exists..."
+
+    if ! wrangler d1 info "$DB_NAME" > .d1_info.tmp 2> /dev/null; then
+      echo "→ '${DB_NAME}' info failed. Checking if it already exists in list..."
+      wrangler d1 list --json > .d1_list.tmp
+      DATABASE_COUNT=$(python3 -c "
+import json
+with open('.d1_list.tmp', encoding='utf-8') as source:
+    payload = json.load(source)
+databases = payload.get('result', []) if isinstance(payload, dict) else payload
+print(len(databases))
+")
+      EXISTING_ID=$(python3 -c "
+import json
+with open('.d1_list.tmp', encoding='utf-8') as source:
+    payload = json.load(source)
+databases = payload.get('result', []) if isinstance(payload, dict) else payload
+for database in databases:
+    if database.get('name') == '$DB_NAME':
+        print(database.get('uuid', ''))
+        break
+")
+
+      if [ -z "$EXISTING_ID" ]; then
+        if [ "$DATABASE_COUNT" -ge "$D1_MAX_DATABASES" ]; then
+          echo "❌ Error: creating '${DB_NAME}' would exceed the configured D1 database limit (${DATABASE_COUNT}/${D1_MAX_DATABASES})."
+          echo "Archive and explicitly delete a retired database recorded in providers.toml before retrying."
+          rm -f .d1_info.tmp .d1_list.tmp
+          exit 1
         fi
-        
-        DB_ID=$(python3 -c "
+        echo "→ '${DB_NAME}' not found. Creating it now..."
+        wrangler d1 create "$DB_NAME" > .d1_info.tmp
+      else
+        echo "→ '${DB_NAME}' already exists (ID: $EXISTING_ID). Emulating info output..."
+        echo "$EXISTING_ID" > .d1_info.tmp
+      fi
+    else
+      echo "→ '${DB_NAME}' info retrieved successfully."
+    fi
+
+    DB_ID=$(python3 -c "
 import sys, re
 with open('.d1_info.tmp', 'r') as f:
     text = f.read()
@@ -99,16 +111,16 @@ m = re.search(r'([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-
 if m:
     print(m.group(1))
 ")
-        rm -f .d1_info.tmp .d1_list.tmp
+    rm -f .d1_info.tmp .d1_list.tmp
 
-        if [ -z "$DB_ID" ]; then
-            echo "❌ Error: Could not parse database_id from wrangler output for ${PROVIDER}."
-            exit 1
-        fi
-        
-        echo "→ Found database_id: ${DB_ID}. Updating ${PROVIDERS_FILE}..."
-        
-        python3 - << EOF
+    if [ -z "$DB_ID" ]; then
+      echo "❌ Error: Could not parse database_id from wrangler output for ${PROVIDER}."
+      exit 1
+    fi
+
+    echo "→ Found database_id: ${DB_ID}. Updating ${PROVIDERS_FILE}..."
+
+    python3 - << EOF
 import sys, re
 with open('$PROVIDERS_FILE', 'r') as f:
     content = f.read()
@@ -128,29 +140,29 @@ for block in blocks[1:]:
 with open('$PROVIDERS_FILE', 'w') as f:
     f.write('[[providers]]'.join(new_blocks))
 EOF
-    fi
+  fi
 done
 
 echo ""
 # ── Step 2: Regenerate wrangler.toml ─────────────────────────────────────────
 echo "→ Regenerating unified wrangler.toml from providers.toml..."
-bash ./generate-wrangler.sh
+bash ./scripts/generate-wrangler.sh
 echo ""
 
 # ── Step 3: Apply D1 migrations ──────────────────────────────────────────────
 for PROVIDER in $PROVIDERS; do
-    if [ ! -d "migrations/${PROVIDER}" ]; then
-        echo "→ Migrations folder 'migrations/${PROVIDER}' not found. Creating empty directory..."
-        mkdir -p "migrations/${PROVIDER}"
-        echo "  Please add your specific migrations to this folder before deploying."
-    fi
+  if [ ! -d "migrations/${PROVIDER}" ]; then
+    echo "→ Migrations folder 'migrations/${PROVIDER}' not found. Creating empty directory..."
+    mkdir -p "migrations/${PROVIDER}"
+    echo "  Please add your specific migrations to this folder before deploying."
+  fi
 
-    # Convert provider name to uppercase and replace dashes with underscores
-    BINDING_NAME="DB_$(echo "$PROVIDER" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
-    
-    echo "→ Applying D1 migrations for '${PROVIDER}' (Binding: ${BINDING_NAME})..."
-    CI=true wrangler d1 migrations apply "${BINDING_NAME}" --remote
-    echo ""
+  # Convert provider name to uppercase and replace dashes with underscores
+  BINDING_NAME="DB_$(echo "$PROVIDER" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+
+  echo "→ Applying D1 migrations for '${PROVIDER}' (Binding: ${BINDING_NAME})..."
+  CI=true wrangler d1 migrations apply "${BINDING_NAME}" --remote
+  echo ""
 done
 
 # ── Step 4: Deploy the unified worker ────────────────────────────────────────

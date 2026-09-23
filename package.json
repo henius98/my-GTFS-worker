@@ -1,14 +1,15 @@
 {
   "name": "my-gtfs-worker",
   "version": "1.0.0",
+  "packageManager": "pnpm@11.9.0",
   "description": "Cloudflare Worker GTFS importer",
   "main": "build/worker/shim.mjs",
   "scripts": {
-    "build": "bash ./build.sh",
+    "build": "bash ./scripts/build.sh",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {
-    "wrangler": "^4.85.0"
+    "wrangler": "^4.131.1"
   }
 }
