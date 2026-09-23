@@ -103,14 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   prepared.sort_by(|left, right| left.name().cmp(right.name()));
   let prepared_count = u64::try_from(prepared.len()).unwrap_or(u64::MAX);
   if runtime.max_rows_per_workflow < prepared_count {
-    return Err(
-      format!(
-        "MAX_ROWS_PER_WORKFLOW={} cannot provide at least one row to each of the {} providers with pending work",
-        runtime.max_rows_per_workflow,
-        prepared.len()
-      )
-      .into(),
-    );
+    return Err(format!("MAX_ROWS_PER_WORKFLOW={} cannot provide at least one row to each of the {} providers with pending work", runtime.max_rows_per_workflow, prepared.len()).into());
   }
 
   let mut pending = prepared;

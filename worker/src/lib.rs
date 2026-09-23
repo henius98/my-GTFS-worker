@@ -47,15 +47,13 @@ pub async fn fetch_route(req: Request, env: Env, ctx: Context) -> Result<Respons
       let binding_name = format!("DB_{}", provider.to_uppercase().replace("-", "_"));
       let d1 = match env.d1(&binding_name) {
         Ok(db) => db,
-        Err(_) => return Response::error(format!("Provider '{}' not found or DB not bound", provider), 404),
+        Err(_) => {
+          return Response::error(format!("Provider '{}' not found or DB not bound", provider), 404);
+        }
       };
 
       // Fetch detailed import progress
-      let progress_results = match d1
-        .prepare("SELECT Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM import_progress")
-        .all()
-        .await
-      {
+      let progress_results = match d1.prepare("SELECT Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM import_progress").all().await {
         Ok(res) => res,
         Err(e) => return Response::error(format!("Database error: {}", e), 500),
       };

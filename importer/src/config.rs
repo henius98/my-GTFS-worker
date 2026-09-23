@@ -59,11 +59,8 @@ impl RuntimeConfig {
   pub fn from_env() -> Result<Self, ConfigError> {
     let detected_parallelism = std::thread::available_parallelism().map(|parallelism| parallelism.get()).unwrap_or(2).clamp(1, 8);
     let threshold_mb = positive_u64("DB_SIZE_THRESHOLD_MB", 400)?;
-    let db_size_threshold_bytes = threshold_mb.checked_mul(1024 * 1024).ok_or_else(|| ConfigError::InvalidEnvironment {
-      name: "DB_SIZE_THRESHOLD_MB",
-      value: threshold_mb.to_string(),
-      requirement: "must fit in bytes",
-    })?;
+    let db_size_threshold_bytes =
+      threshold_mb.checked_mul(1024 * 1024).ok_or_else(|| ConfigError::InvalidEnvironment { name: "DB_SIZE_THRESHOLD_MB", value: threshold_mb.to_string(), requirement: "must fit in bytes" })?;
     let max_feed_download_mb = positive_u64("MAX_FEED_DOWNLOAD_MB", 256)?;
     let max_feed_download_bytes = max_feed_download_mb.checked_mul(1024 * 1024).ok_or_else(|| ConfigError::InvalidEnvironment {
       name: "MAX_FEED_DOWNLOAD_MB",
@@ -77,17 +74,10 @@ impl RuntimeConfig {
       requirement: "must fit in bytes",
     })?;
     let max_csv_record_kb = positive_u64("MAX_CSV_RECORD_KB", 512)?;
-    let max_csv_record_bytes = max_csv_record_kb.checked_mul(1024).ok_or_else(|| ConfigError::InvalidEnvironment {
-      name: "MAX_CSV_RECORD_KB",
-      value: max_csv_record_kb.to_string(),
-      requirement: "must fit in bytes",
-    })?;
+    let max_csv_record_bytes =
+      max_csv_record_kb.checked_mul(1024).ok_or_else(|| ConfigError::InvalidEnvironment { name: "MAX_CSV_RECORD_KB", value: max_csv_record_kb.to_string(), requirement: "must fit in bytes" })?;
     if max_csv_record_bytes > max_uncompressed_feed_bytes {
-      return Err(ConfigError::InvalidEnvironment {
-        name: "MAX_CSV_RECORD_KB",
-        value: max_csv_record_kb.to_string(),
-        requirement: "must not exceed MAX_UNCOMPRESSED_FEED_MB",
-      });
+      return Err(ConfigError::InvalidEnvironment { name: "MAX_CSV_RECORD_KB", value: max_csv_record_kb.to_string(), requirement: "must not exceed MAX_UNCOMPRESSED_FEED_MB" });
     }
     let max_statement_payload_kb = positive_u64("MAX_STATEMENT_PAYLOAD_KB", 1_536)?;
     let max_statement_payload_bytes = max_statement_payload_kb.checked_mul(1024).ok_or_else(|| ConfigError::InvalidEnvironment {
@@ -96,11 +86,7 @@ impl RuntimeConfig {
       requirement: "must fit in bytes",
     })?;
     if max_statement_payload_bytes < max_csv_record_bytes {
-      return Err(ConfigError::InvalidEnvironment {
-        name: "MAX_STATEMENT_PAYLOAD_KB",
-        value: max_statement_payload_kb.to_string(),
-        requirement: "must be at least MAX_CSV_RECORD_KB",
-      });
+      return Err(ConfigError::InvalidEnvironment { name: "MAX_STATEMENT_PAYLOAD_KB", value: max_statement_payload_kb.to_string(), requirement: "must be at least MAX_CSV_RECORD_KB" });
     }
     if max_statement_payload_bytes > D1_MAX_VALUE_BYTES {
       return Err(ConfigError::InvalidEnvironment {
@@ -116,11 +102,7 @@ impl RuntimeConfig {
       requirement: "must fit in bytes",
     })?;
     if max_temp_feed_storage_bytes < max_feed_download_bytes {
-      return Err(ConfigError::InvalidEnvironment {
-        name: "MAX_TEMP_FEED_STORAGE_MB",
-        value: max_temp_feed_storage_mb.to_string(),
-        requirement: "must be at least MAX_FEED_DOWNLOAD_MB",
-      });
+      return Err(ConfigError::InvalidEnvironment { name: "MAX_TEMP_FEED_STORAGE_MB", value: max_temp_feed_storage_mb.to_string(), requirement: "must be at least MAX_FEED_DOWNLOAD_MB" });
     }
 
     let query_statement_batch_size = bounded_usize("QUERY_STATEMENT_BATCH_SIZE", 1_000, 10_000)?;
@@ -133,9 +115,7 @@ impl RuntimeConfig {
     //     requirement: "must not exceed the D1 Free daily write allowance of 100,000 rows",
     //   });
     // }
-    let maximum_group_rows = u64::try_from(query_statement_batch_size)
-      .unwrap_or(u64::MAX)
-      .saturating_mul(u64::try_from(d1_statements_per_request).unwrap_or(u64::MAX));
+    let maximum_group_rows = u64::try_from(query_statement_batch_size).unwrap_or(u64::MAX).saturating_mul(u64::try_from(d1_statements_per_request).unwrap_or(u64::MAX));
     if max_d1_rows_written_per_workflow > crate::d1::DAILY_WRITE_LIMIT
       || maximum_group_rows.saturating_mul(2).saturating_add(crate::d1::METADATA_WRITE_RESERVE + crate::d1::LEDGER_WRITE_RESERVE) > max_d1_rows_written_per_workflow
     {
@@ -176,17 +156,9 @@ fn bounded_usize(name: &'static str, default: usize, maximum: usize) -> Result<u
   let Some(value) = environment_value(name) else {
     return Ok(default);
   };
-  let parsed = value.parse::<usize>().map_err(|_| ConfigError::InvalidEnvironment {
-    name,
-    value: value.clone(),
-    requirement: "must be a positive integer",
-  })?;
+  let parsed = value.parse::<usize>().map_err(|_| ConfigError::InvalidEnvironment { name, value: value.clone(), requirement: "must be a positive integer" })?;
   if parsed == 0 || parsed > maximum {
-    return Err(ConfigError::InvalidEnvironment {
-      name,
-      value,
-      requirement: "is outside the supported positive range",
-    });
+    return Err(ConfigError::InvalidEnvironment { name, value, requirement: "is outside the supported positive range" });
   }
   Ok(parsed)
 }
@@ -195,17 +167,9 @@ fn positive_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
   let Some(value) = environment_value(name) else {
     return Ok(default);
   };
-  let parsed = value.parse::<u64>().map_err(|_| ConfigError::InvalidEnvironment {
-    name,
-    value: value.clone(),
-    requirement: "must be a positive integer",
-  })?;
+  let parsed = value.parse::<u64>().map_err(|_| ConfigError::InvalidEnvironment { name, value: value.clone(), requirement: "must be a positive integer" })?;
   if parsed == 0 {
-    return Err(ConfigError::InvalidEnvironment {
-      name,
-      value,
-      requirement: "must be greater than zero",
-    });
+    return Err(ConfigError::InvalidEnvironment { name, value, requirement: "must be greater than zero" });
   }
   Ok(parsed)
 }

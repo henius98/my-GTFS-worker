@@ -95,11 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   generated_code.push_str("match provider_name {\n");
 
   let migrations_dir = PathBuf::from("../migrations");
-  let mut provider_dirs = if migrations_dir.exists() {
-    fs::read_dir(&migrations_dir)?.map(|entry| entry.map(|entry| entry.path())).collect::<Result<Vec<_>, _>>()?
-  } else {
-    Vec::new()
-  };
+  let mut provider_dirs = if migrations_dir.exists() { fs::read_dir(&migrations_dir)?.map(|entry| entry.map(|entry| entry.path())).collect::<Result<Vec<_>, _>>()? } else { Vec::new() };
   provider_dirs.retain(|path| path.is_dir());
   provider_dirs.sort();
 

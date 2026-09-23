@@ -1,8 +1,7 @@
 # Worker API collection
 
-Open this directory as a collection in Bruno. The collection variable `baseUrl`
-defaults to `http://localhost:8787`. Change it to your deployed Worker URL (without
-a trailing slash) to use the deployed API. No authentication is required.
+Open this directory as a collection in Bruno and select the `Local` environment.
+Its `baseUrl` is `http://localhost:8787`. No authentication is required.
 
 - **Worker health**: `GET /`, returning a plain-text liveness message.
 - **Status**: `GET /<provider>/status` for every active provider in `providers.toml`.

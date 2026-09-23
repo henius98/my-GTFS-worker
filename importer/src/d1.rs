@@ -107,13 +107,7 @@ struct D1WriteBudget {
 
 impl D1WriteBudget {
   fn new(maximum_writes: u64) -> Self {
-    Self {
-      state: Mutex::new(D1WriteBudgetState {
-        remaining: maximum_writes,
-        in_flight: 0,
-      }),
-      notify: Notify::new(),
-    }
+    Self { state: Mutex::new(D1WriteBudgetState { remaining: maximum_writes, in_flight: 0 }), notify: Notify::new() }
   }
 
   fn state(&self) -> MutexGuard<'_, D1WriteBudgetState> {
@@ -133,17 +127,10 @@ impl D1WriteBudget {
         if requested <= state.remaining {
           state.remaining -= requested;
           state.in_flight = state.in_flight.saturating_add(1);
-          return Ok(D1WriteReservation {
-            budget: self.clone(),
-            reserved: requested,
-            settled: false,
-          });
+          return Ok(D1WriteReservation { budget: self.clone(), reserved: requested, settled: false });
         }
         if state.in_flight == 0 {
-          return Err(D1Error::WriteBudgetExhausted {
-            requested,
-            remaining: state.remaining,
-          });
+          return Err(D1Error::WriteBudgetExhausted { requested, remaining: state.remaining });
         }
       }
       notified.await;
@@ -176,10 +163,7 @@ impl D1WriteReservation {
     let exceeded_reservation = self.budget.settle(self.reserved, actual);
     self.settled = true;
     if exceeded_reservation {
-      return Err(D1Error::ApiError(format!(
-        "D1 reported {actual} row writes for a {}-write reservation; the schema write-amplification invariant was exceeded",
-        self.reserved
-      )));
+      return Err(D1Error::ApiError(format!("D1 reported {actual} row writes for a {}-write reservation; the schema write-amplification invariant was exceeded", self.reserved)));
     }
     Ok(())
   }
@@ -223,11 +207,7 @@ struct DailyLease {
 
 impl D1Client {
   pub fn new(account_id: String, api_token: String, runtime: &RuntimeConfig) -> Result<Self, D1Error> {
-    let client = Client::builder()
-      .connect_timeout(runtime.http_connect_timeout)
-      .timeout(runtime.http_request_timeout)
-      .user_agent(concat!("my-GTFS-worker/", env!("CARGO_PKG_VERSION")))
-      .build()?;
+    let client = Client::builder().connect_timeout(runtime.http_connect_timeout).timeout(runtime.http_request_timeout).user_agent(concat!("my-GTFS-worker/", env!("CARGO_PKG_VERSION"))).build()?;
     let mut authorization = HeaderValue::from_str(&format!("Bearer {api_token}")).map_err(|error| D1Error::ApiError(format!("Invalid API token header: {error}")))?;
     authorization.set_sensitive(true);
 
@@ -267,10 +247,7 @@ impl D1Client {
       .ok_or_else(|| D1Error::ApiError("Daily D1 budget returned an invalid workflow allowance".into()))?;
     println!("Daily D1 budget granted {granted} writes for this workflow (configured maximum: {requested}).");
     self.write_budget = Arc::new(D1WriteBudget::new(granted - METADATA_WRITE_RESERVE - LEDGER_WRITE_RESERVE));
-    self.daily_lease = Some(Arc::new(DailyLease {
-      database_id: database_id.to_owned(),
-      day,
-    }));
+    self.daily_lease = Some(Arc::new(DailyLease { database_id: database_id.to_owned(), day }));
     Ok(true)
   }
 
@@ -279,10 +256,8 @@ impl D1Client {
       return Ok(());
     };
     let unused = self.write_budget.state().remaining + self.metadata_budget.state().remaining;
-    let query = D1Query {
-      sql: "UPDATE daily_import_budget SET Reserved = Reserved - ? WHERE Id = 1 AND Day = ? AND Reserved >= ?",
-      params: vec![unused.into(), lease.day.clone().into(), unused.into()],
-    };
+    let query =
+      D1Query { sql: "UPDATE daily_import_budget SET Reserved = Reserved - ? WHERE Id = 1 AND Day = ? AND Reserved >= ?", params: vec![unused.into(), lease.day.clone().into(), unused.into()] };
     // Never retry this subtraction: a lost response leaves a conservative lease.
     self.execute_query_body(&lease.database_id, &query, 0).await?;
     Ok(())
@@ -303,20 +278,14 @@ impl D1Client {
   }
 
   pub fn usage(&self) -> D1Usage {
-    D1Usage {
-      rows_read: self.rows_read.load(Ordering::Relaxed),
-      rows_written: self.rows_written.load(Ordering::Relaxed),
-    }
+    D1Usage { rows_read: self.rows_read.load(Ordering::Relaxed), rows_written: self.rows_written.load(Ordering::Relaxed) }
   }
 
   pub async fn reserve_import_writes(&self, maximum_writes: u64) -> Result<D1WriteReservation, D1Error> {
     // Stop data early enough to drain requests and save checkpoints before
     // the final-minute guard closes all D1 traffic for this lease.
     if chrono::Utc::now().timestamp().rem_euclid(86_400) >= 86_280 {
-      return Err(D1Error::WriteBudgetExhausted {
-        requested: maximum_writes,
-        remaining: 0,
-      });
+      return Err(D1Error::WriteBudgetExhausted { requested: maximum_writes, remaining: 0 });
     }
     self.write_budget.reserve(maximum_writes).await
   }
@@ -344,7 +313,9 @@ impl D1Client {
     let actual = results.iter().try_fold(0_u64, |total, result| result.rows_written().and_then(|writes| total.checked_add(writes)));
     match actual {
       Some(actual) => reservation.finish(actual)?,
-      None => return Err(D1Error::ApiError("Missing metadata write accounting".into())),
+      None => {
+        return Err(D1Error::ApiError("Missing metadata write accounting".into()));
+      }
     }
     Ok(results)
   }
@@ -367,20 +338,9 @@ impl D1Client {
     let mut had_ambiguous_retry = false;
 
     loop {
-      let permit = self
-        .concurrency_limit
-        .acquire()
-        .await
-        .map_err(|error| D1Error::ApiError(format!("Failed to acquire D1 request permit: {error}")))?;
+      let permit = self.concurrency_limit.acquire().await.map_err(|error| D1Error::ApiError(format!("Failed to acquire D1 request permit: {error}")))?;
       self.check_daily_window()?;
-      let response = self
-        .client
-        .post(&url)
-        .header(AUTHORIZATION, self.authorization.clone())
-        .timeout(self.query_timeout)
-        .json(body)
-        .send()
-        .await;
+      let response = self.client.post(&url).header(AUTHORIZATION, self.authorization.clone()).timeout(self.query_timeout).json(body).send().await;
 
       match response {
         Ok(response) if response.status().is_success() => {
@@ -441,23 +401,8 @@ impl D1Client {
   }
 
   pub async fn get_dataset_version(&self, db_id: &str, provider_name: &str) -> Result<Option<String>, D1Error> {
-    let res = self
-      .query(
-        db_id,
-        D1Query {
-          sql: "SELECT ETag FROM dataset_versions WHERE Provider = ?",
-          params: vec![serde_json::Value::String(provider_name.to_owned())],
-        },
-      )
-      .await?;
-    Ok(
-      res
-        .first()
-        .and_then(|result| result.results.first())
-        .and_then(|row| row.get("ETag"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned),
-    )
+    let res = self.query(db_id, D1Query { sql: "SELECT ETag FROM dataset_versions WHERE Provider = ?", params: vec![serde_json::Value::String(provider_name.to_owned())] }).await?;
+    Ok(res.first().and_then(|result| result.results.first()).and_then(|row| row.get("ETag")).and_then(serde_json::Value::as_str).map(str::to_owned))
   }
 
   pub async fn set_dataset_version(&self, db_id: &str, provider: &str, etag: &str) -> Result<(), D1Error> {
@@ -555,15 +500,8 @@ impl D1Client {
     }
 
     let result = json.get("result").ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a result")))?;
-    let name = result
-      .get("name")
-      .and_then(serde_json::Value::as_str)
-      .map(str::to_owned)
-      .ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a name")))?;
-    let file_size = result
-      .get("file_size")
-      .and_then(serde_json::Value::as_u64)
-      .ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a numeric file_size")))?;
+    let name = result.get("name").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a name")))?;
+    let file_size = result.get("file_size").and_then(serde_json::Value::as_u64).ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a numeric file_size")))?;
     Ok(D1DatabaseInfo { name, file_size })
   }
 
@@ -588,13 +526,7 @@ impl D1Client {
 
   pub async fn create_database(&self, name: &str) -> Result<String, D1Error> {
     let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database", self.account_id);
-    let response = self
-      .client
-      .post(&url)
-      .header(AUTHORIZATION, self.authorization.clone())
-      .json(&serde_json::json!({ "name": name }))
-      .send()
-      .await?;
+    let response = self.client.post(&url).header(AUTHORIZATION, self.authorization.clone()).json(&serde_json::json!({ "name": name })).send().await?;
     if !response.status().is_success() {
       return Err(D1Error::ApiError(format!("Failed to create database {name}: {}", response.text().await.unwrap_or_default())));
     }
@@ -604,21 +536,11 @@ impl D1Client {
       return Err(D1Error::ApiError(format!("API success=false: {json:?}")));
     }
 
-    json
-      .get("result")
-      .and_then(|result| result.get("uuid"))
-      .and_then(serde_json::Value::as_str)
-      .map(str::to_owned)
-      .ok_or_else(|| D1Error::ApiError("No uuid in create database response".into()))
+    json.get("result").and_then(|result| result.get("uuid")).and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| D1Error::ApiError("No uuid in create database response".into()))
   }
 
   pub async fn execute_schema(&self, db_id: &str, schema_sql: &str) -> Result<(), D1Error> {
-    let queries = schema_sql
-      .split(';')
-      .map(str::trim)
-      .filter(|statement| !statement.is_empty())
-      .map(|statement| D1Query { sql: statement, params: Vec::new() })
-      .collect::<Vec<_>>();
+    let queries = schema_sql.split(';').map(str::trim).filter(|statement| !statement.is_empty()).map(|statement| D1Query { sql: statement, params: Vec::new() }).collect::<Vec<_>>();
     if queries.is_empty() {
       return Ok(());
     }
@@ -703,32 +625,14 @@ mod tests {
 
   #[test]
   fn failed_statement_rejects_successful_envelope() {
-    let response = D1Response {
-      success: true,
-      result: Some(vec![D1Result {
-        results: Vec::new(),
-        meta: None,
-        success: Some(false),
-      }]),
-      errors: None,
-    };
+    let response = D1Response { success: true, result: Some(vec![D1Result { results: Vec::new(), meta: None, success: Some(false) }]), errors: None };
     assert!(validate_query_response(response).is_err());
   }
 
   #[test]
   fn result_count_must_match_submitted_statements() {
     assert!(validate_result_count(Vec::new(), 1).is_err());
-    assert!(
-      validate_result_count(
-        vec![D1Result {
-          results: Vec::new(),
-          meta: None,
-          success: Some(true),
-        }],
-        1
-      )
-      .is_ok()
-    );
+    assert!(validate_result_count(vec![D1Result { results: Vec::new(), meta: None, success: Some(true) }], 1).is_ok());
   }
 
   #[test]
@@ -758,16 +662,8 @@ mod tests {
       return;
     };
     client.record_usage(&[
-      D1Result {
-        results: Vec::new(),
-        meta: Some(D1Meta { rows_read: 7, rows_written: Some(3) }),
-        success: Some(true),
-      },
-      D1Result {
-        results: Vec::new(),
-        meta: Some(D1Meta { rows_read: 11, rows_written: Some(5) }),
-        success: Some(true),
-      },
+      D1Result { results: Vec::new(), meta: Some(D1Meta { rows_read: 7, rows_written: Some(3) }), success: Some(true) },
+      D1Result { results: Vec::new(), meta: Some(D1Meta { rows_read: 11, rows_written: Some(5) }), success: Some(true) },
     ]);
     assert_eq!(client.usage(), D1Usage { rows_read: 18, rows_written: 8 });
   }
@@ -796,7 +692,9 @@ mod tests {
 
     let joined = match tokio::time::timeout(Duration::from_secs(1), waiter).await {
       Ok(joined) => joined.map_err(|error| D1Error::ApiError(format!("write-budget waiter failed to join: {error}")))?,
-      Err(_) => return Err(D1Error::ApiError("write-budget waiter was not notified".to_owned())),
+      Err(_) => {
+        return Err(D1Error::ApiError("write-budget waiter was not notified".to_owned()));
+      }
     };
     let reservation = joined?;
     reservation.finish(0)?;
