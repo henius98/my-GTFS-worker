@@ -268,6 +268,14 @@ To run a read-only SQL query, send one `SELECT` (or `WITH ... SELECT`) as plain 
 curl -X POST http://localhost:8787/ktmb/sql -H 'Content-Type: text/plain' --data-binary 'SELECT * FROM stops LIMIT 10'
 ```
 
+For a frequency-based feed, `GET /<provider>/departures` estimates the next departures at a stop over the following seven days. The endpoint uses the provider's D1 binding and existing `stops`, `stop_times`, `trips`, `frequencies`, `calendar`, `routes`, and `agency` tables. It is available for providers whose database has a `frequencies` table (currently `rapid-rail-kl` and `rapid-bus-kl`). Other providers receive a 404 response.
+
+```bash
+curl --get 'http://localhost:8787/rapid-rail-kl/departures' --data-urlencode 'stop_id=KJ10' --data-urlencode 'limit=5'
+```
+
+`stop_id` is required. Optional `route_id` filters a route, `direction_id` is `0` or `1`, `limit` is 1–100 (default 5), and `at` is an RFC3339 instant with a timezone (default: now). The response includes `departures`, `requested_at`, `search_until`, and `is_estimate: true`; frequency headways are estimates, not live train positions. Only trips with frequency and calendar records are included. The endpoint is public like the existing `/data` and `/status` routes.
+
 Set the Worker `MAX_ROWS` variable to change the response cap for both `/data` and `/sql`; it must be a positive integer. If it is missing or invalid, the Worker uses 1000 rows.
 
 To run the importer locally for testing:

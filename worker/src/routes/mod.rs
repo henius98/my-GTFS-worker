@@ -1,6 +1,7 @@
 use worker::Env;
 
 pub mod data;
+pub mod departures;
 pub mod sql;
 pub mod status;
 
