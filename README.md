@@ -262,6 +262,14 @@ npx wrangler dev --remote
 
 Visit `http://localhost:8787/<provider>/status` (e.g., `http://localhost:8787/mybas-johor/status`) to check the progress of your background imports!
 
+To run a read-only SQL query, send one `SELECT` (or `WITH ... SELECT`) as plain text to `POST /<provider>/sql`. SQL comments are not accepted. The response contains a `data` array up to the configured row cap (1000 by default). For example:
+
+```bash
+curl -X POST http://localhost:8787/ktmb/sql -H 'Content-Type: text/plain' --data-binary 'SELECT * FROM stops LIMIT 10'
+```
+
+Set the Worker `MAX_ROWS` variable to change the response cap for both `/data` and `/sql`; it must be a positive integer. If it is missing or invalid, the Worker uses 1000 rows.
+
 To run the importer locally for testing:
 
 ```bash

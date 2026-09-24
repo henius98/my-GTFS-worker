@@ -12,9 +12,8 @@ struct ColumnName {
 }
 
 pub async fn handle(env: &Env, url: &Url, provider: &str, table_name: &str) -> Result<Response> {
-  let mut limit: u32 = url.query_pairs().find(|(k, _)| k == "limit").and_then(|(_, v)| v.parse().ok()).unwrap_or(100);
-  limit = std::cmp::min(limit, 1000); // Enforce maximum limit of 1000
-  let offset: u32 = url.query_pairs().find(|(k, _)| k == "offset").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+  let limit: u32 = url.query_pairs().find(|(k, _)| k == "limit").and_then(|(_, v)| v.parse::<u32>().ok()).map(|v| v.min(super::max_rows(env))).unwrap_or_else(|| super::max_rows(env)); // Enforce the configured maximum limit
+  let offset: u32 = url.query_pairs().find(|(k, _)| k == "offset").and_then(|(_, v)| v.parse::<u32>().ok()).unwrap_or(0);
 
   let d1 = match database::for_provider(env, provider) {
     Ok(db) => db,

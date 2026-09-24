@@ -9,7 +9,7 @@ mod routes;
 use worker::{Context, Env, Request, Response, Result, event};
 
 #[event(fetch)]
-pub async fn fetch_route(req: Request, env: Env, ctx: Context) -> Result<Response> {
+pub async fn fetch_route(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
   console_error_panic_hook::set_once();
   let url = req.url()?;
 
@@ -18,6 +18,7 @@ pub async fn fetch_route(req: Request, env: Env, ctx: Context) -> Result<Respons
 
   match (segments.next(), segments.next(), segments.next()) {
     (Some(provider), Some("status"), None) => routes::status::handle(&req, &env, ctx, &url, provider).await,
+    (Some(provider), Some("sql"), None) => routes::sql::handle(&mut req, &env, provider).await,
     (Some(provider), Some("data"), Some(table_name)) => routes::data::handle(&env, &url, provider, table_name).await,
     (Some(""), None, None) | (None, None, None) => Response::ok("Worker is running. Use /<provider>/status to check GTFS import progress."),
     _ => Response::error("Not Found", 404),

@@ -163,6 +163,42 @@ def test_data_api():
         print(f"❌ Range test failed: {e}")
         sys.exit(1)
 
+    # 9. Test raw SQL selection
+    sql_url = f"{BASE_URL}/{provider}/sql"
+    try:
+        request = urllib.request.Request(
+            sql_url,
+            data=b"WITH row AS (SELECT 1 AS value) SELECT value FROM row",
+            headers={"Content-Type": "text/plain"},
+            method="POST",
+        )
+        data = json.loads(urllib.request.urlopen(request).read())
+        assert data["data"] == [{"value": 1}], "SQL route should return selected rows"
+        print("✅ Raw SQL selection test passed!")
+    except Exception as e:
+        print(f"❌ Raw SQL selection test failed: {e}")
+        sys.exit(1)
+
+    # 10. Test SQL route rejects writes and multiple statements
+    for sql in (b"PRAGMA table_info(import_progress)", b"SELECT 1; SELECT 2"):
+        try:
+            request = urllib.request.Request(sql_url, data=sql, method="POST")
+            urllib.request.urlopen(request)
+            print(f"❌ Invalid SQL test failed: {sql!r} was accepted")
+            sys.exit(1)
+        except urllib.error.HTTPError as e:
+            assert e.code == 400, f"Expected 400 for {sql!r}, got {e.code}"
+    print("✅ Invalid SQL tests passed!")
+
+    # 11. Test SQL route requires POST
+    try:
+        urllib.request.urlopen(sql_url)
+        print("❌ SQL method test failed: GET was accepted")
+        sys.exit(1)
+    except urllib.error.HTTPError as e:
+        assert e.code == 405, f"Expected 405 for GET, got {e.code}"
+        print("✅ SQL method test passed!")
+
 if __name__ == "__main__":
     if wait_for_server():
         test_data_api()
