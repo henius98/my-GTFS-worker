@@ -18,6 +18,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parent.parent
 INFRASTRUCTURE_TABLES = {
     "daily_import_budget",
+    "departure_cache",
     "logs",
     "dataset_versions",
     "import_progress",

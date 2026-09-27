@@ -1,16 +1,16 @@
+mod cache;
+mod query;
 mod schedule;
 
 use chrono::{DateTime, Duration, Utc};
-use schedule::{Template, next_departures};
+use schedule::{Departure, next_departures};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use worker::wasm_bindgen::JsValue;
 use worker::{Date, Env, Method, Request, Response, Result, Url};
 
 use crate::database;
 
-const QUERY: &str = include_str!("departures/query.sql");
 const MAX_LIMIT: usize = 100;
 
 struct Parameters {
@@ -22,7 +22,7 @@ struct Parameters {
 }
 
 impl Parameters {
-  fn parse(url: &Url, now: DateTime<Utc>) -> std::result::Result<Self, &'static str> {
+  fn parse(url: &Url, now: DateTime<Utc>, cache_ttl_seconds: i64) -> std::result::Result<Self, &'static str> {
     let mut values = HashMap::new();
     for (key, value) in url.query_pairs() {
       if !matches!(key.as_ref(), "stop_id" | "route_id" | "direction_id" | "limit" | "at") {
@@ -56,7 +56,8 @@ impl Parameters {
       Some(value) => DateTime::parse_from_rfc3339(&value).map_err(|_| "at must be RFC3339 with a timezone, e.g. 2026-09-23T08:00:00Z")?.with_timezone(&Utc),
       None => now,
     };
-    if when.checked_add_signed(Duration::days(schedule::SEARCH_DAYS)).is_none() {
+    let cache_ttl = Duration::try_seconds(cache_ttl_seconds).ok_or("Departure cache lifetime is invalid")?;
+    if when.checked_add_signed(Duration::days(schedule::SEARCH_DAYS) + cache_ttl).is_none() {
       return Err("at is outside the supported date range");
     }
     Ok(Self { stop_id, route_id, when, direction_id, limit })
@@ -78,7 +79,8 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str) -> Resu
     return json_error(405, "Method not allowed");
   }
   let now = DateTime::from_timestamp_millis(Date::now().as_millis() as i64).ok_or_else(|| worker::Error::RustError("Invalid system time".into()))?;
-  let params = match Parameters::parse(url, now) {
+  let cache_ttl_seconds = cache::ttl_seconds(env);
+  let params = match Parameters::parse(url, now, cache_ttl_seconds) {
     Ok(params) => params,
     Err(message) => return json_error(400, message),
   };
@@ -86,7 +88,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str) -> Resu
     Ok(db) => db,
     Err(_) => return database::provider_not_found(provider),
   };
-  match query(&db, params).await {
+  match calculate(&db, params, now, cache_ttl_seconds).await {
     Ok(response) => Ok(response),
     Err(error) => {
       worker::console_error!("Departure lookup failed: {}", error);
@@ -95,27 +97,57 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str) -> Resu
   }
 }
 
-async fn query(db: &worker::D1Database, params: Parameters) -> Result<Response> {
-  let supported = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='frequencies'").first::<String>(Some("name")).await?;
-  if supported.is_none() {
-    return json_error(404, "Frequency departures are unavailable for this provider");
+async fn calculate(db: &worker::D1Database, params: Parameters, now: DateTime<Utc>, cache_ttl_seconds: i64) -> Result<Response> {
+  let until = params.when + Duration::days(schedule::SEARCH_DAYS);
+  let mut state = match cache::feed_state(db).await {
+    Ok(state) if state.cacheable() => Some(state),
+    Ok(_) => None,
+    Err(error) => {
+      worker::console_error!("Departure cache import state unavailable: {}", error);
+      None
+    }
+  };
+  if let Some(feed_state) = &state {
+    match cache::read(db, &params, feed_state, now).await {
+      Ok(Some(entry)) => {
+        if let Some(departures) = entry.select(params.when, until, params.limit) {
+          return response(&params, &entry.stop, departures, "HIT");
+        }
+      }
+      Ok(None) => {}
+      Err(error) => {
+        worker::console_error!("Departure cache read failed: {}", error);
+        state = None;
+      }
+    }
   }
   let stop = db.prepare("SELECT stop_id, stop_name FROM stops WHERE stop_id = ?1").bind(&[params.stop_id.clone().into()])?.first::<Stop>(None).await?;
   let Some(stop) = stop else {
     return json_error(404, "Unknown stop_id");
   };
-  let result = db
-    .prepare(QUERY)
-    .bind(&[params.stop_id.clone().into(), params.route_id.clone().map(JsValue::from).unwrap_or(JsValue::NULL), params.direction_id.map(JsValue::from).unwrap_or(JsValue::NULL)])?
-    .all()
-    .await?;
-  if !result.success() {
-    return json_error(503, "Departure data is unavailable");
+  let templates = query::load(db, &params).await?;
+  // Extend coverage by the cache lifetime so a later request still has a full
+  // seven-day horizon, including when this stop has very few departures.
+  let cache_ttl = Duration::try_seconds(cache_ttl_seconds).ok_or_else(|| worker::Error::RustError("Departure cache lifetime is invalid".into()))?;
+  let cache_until = until.checked_add_signed(cache_ttl).ok_or_else(|| worker::Error::RustError("Departure cache horizon is out of range".into()))?;
+  let departures = next_departures(&templates, params.when, cache_until, MAX_LIMIT).map_err(|message| worker::Error::RustError(message.into()))?;
+  let entry = cache::Entry { stop, from: params.when, until: cache_until, departures };
+  let mut cache_status = "BYPASS";
+  if let Some(state) = &state
+    && !templates.is_empty()
+  {
+    match cache::write(db, &params, state, now, cache_ttl_seconds, &entry).await {
+      Ok(()) => cache_status = "MISS",
+      Err(error) => worker::console_error!("Departure cache write failed: {}", error),
+    }
   }
-  // worker 0.8.x unwraps typed D1 deserialization internally. Decode plain JSON
-  // first so nullable/malformed feed fields return an error instead of a panic.
-  let templates = result.results::<serde_json::Value>()?.into_iter().map(serde_json::from_value).collect::<std::result::Result<Vec<Template>, _>>()?;
-  let departures = next_departures(&templates, params.when, params.limit).map_err(|message| worker::Error::RustError(message.into()))?;
+  let departures = entry.select(params.when, until, params.limit).ok_or_else(|| worker::Error::RustError("Incomplete departure results".into()))?;
+  response(&params, &entry.stop, departures, cache_status)
+}
+
+fn response(params: &Parameters, stop: &Stop, departures: Vec<Departure>, cache_status: &str) -> Result<Response> {
+  let method = departures.first().map(|departure| departure.estimate_method.as_str());
+  let method = if departures.iter().all(|departure| Some(departure.estimate_method.as_str()) == method) { method } else { Some("mixed") };
   let mut response = Response::from_json(&json!({
     "stop": stop,
     "route_id": params.route_id,
@@ -124,11 +156,12 @@ async fn query(db: &worker::D1Database, params: Parameters) -> Result<Response> 
     "search_until": params.when + Duration::days(schedule::SEARCH_DAYS),
     "limit": params.limit,
     "is_estimate": true,
-    "estimate_method": "frequency_start_plus_headway",
+    "estimate_method": method,
     "realtime": false,
     "departures": departures,
   }))?;
   response.headers_mut().set("Cache-Control", "no-store")?;
+  response.headers_mut().set("X-Departure-Cache", cache_status)?;
   Ok(response)
 }
 
@@ -155,10 +188,10 @@ mod tests {
       "stop_id=A&route_id=",
     ] {
       let url = Url::parse(&format!("https://example.com/departures?{query}")).unwrap();
-      assert!(Parameters::parse(&url, now).is_err(), "{query}");
+      assert!(Parameters::parse(&url, now, 24 * 60 * 60).is_err(), "{query}");
     }
     let url = Url::parse("https://example.com/departures?stop_id=KJ10&route_id=KJL&direction_id=1&limit=100&at=2026-09-23T08:00:00%2B08:00").unwrap();
-    let params = Parameters::parse(&url, now).unwrap();
+    let params = Parameters::parse(&url, now, 24 * 60 * 60).unwrap();
     assert_eq!(params.when, now);
     assert_eq!(params.limit, 100);
     assert_eq!(params.route_id.as_deref(), Some("KJL"));

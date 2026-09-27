@@ -19,6 +19,7 @@ pub async fn fetch_route(mut req: Request, env: Env, ctx: Context) -> Result<Res
   match (segments.next(), segments.next(), segments.next()) {
     (Some(provider), Some("status"), None) => routes::status::handle(&req, &env, ctx, &url, provider).await,
     (Some(provider), Some("departures"), None) => routes::departures::handle(&req, &env, &url, provider).await,
+    (Some(provider), Some("map"), None) => routes::map::handle(&req, &env, ctx, &url, provider).await,
     (Some(provider), Some("sql"), None) => routes::sql::handle(&mut req, &env, provider).await,
     (Some(provider), Some("data"), Some(table_name)) => routes::data::handle(&env, &url, provider, table_name).await,
     (Some(""), None, None) | (None, None, None) => Response::ok("Worker is running. Use /<provider>/status to check GTFS import progress."),

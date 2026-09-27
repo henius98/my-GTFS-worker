@@ -784,7 +784,7 @@ fn discover_supported_files(
     let Some(table_name) = base_name.strip_suffix(".txt") else {
       continue;
     };
-    if table_name == "daily_import_budget" {
+    if matches!(table_name, "daily_import_budget" | "departure_cache") {
       continue;
     }
     let Some(db_columns) = schemas.iter().find(|(schema_table, _)| *schema_table == table_name).map(|(_, columns)| *columns) else {
