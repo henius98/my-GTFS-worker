@@ -17,3 +17,6 @@ chrono-tz = "0.10"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -18,7 +18,7 @@ struct ImportProgress {
 
 pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider: &str) -> Result<Response> {
   if req.method() != Method::Get {
-    return Response::error("Method Not Allowed", 405);
+    return Response::error(format!("{} Method Not Allowed", req.method()), 405);
   }
 
   // Query strings, path casing, and a trailing slash do not alter status

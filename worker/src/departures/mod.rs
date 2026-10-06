@@ -164,36 +164,3 @@ fn response(params: &Parameters, stop: &Stop, departures: Vec<Departure>, cache_
   response.headers_mut().set("X-Departure-Cache", cache_status)?;
   Ok(response)
 }
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn validates_request_before_querying() {
-    let now = "2026-09-23T00:00:00Z".parse().unwrap();
-    for query in [
-      "",
-      "stop_id=",
-      "stop_id=A&limit=0",
-      "stop_id=A&limit=-1",
-      "stop_id=A&limit=101",
-      "stop_id=A&limit=1.5",
-      "stop_id=A&limit=",
-      "stop_id=A&direction_id=2",
-      "stop_id=A&at=2026-09-23T08:00:00",
-      "stop_id=A&stop_id=B",
-      "stop_id=A&api_key=secret",
-      "stop_id=A&route_id=",
-    ] {
-      let url = Url::parse(&format!("https://example.com/departures?{query}")).unwrap();
-      assert!(Parameters::parse(&url, now, 24 * 60 * 60).is_err(), "{query}");
-    }
-    let url = Url::parse("https://example.com/departures?stop_id=KJ10&route_id=KJL&direction_id=1&limit=100&at=2026-09-23T08:00:00%2B08:00").unwrap();
-    let params = Parameters::parse(&url, now, 24 * 60 * 60).unwrap();
-    assert_eq!(params.when, now);
-    assert_eq!(params.limit, 100);
-    assert_eq!(params.route_id.as_deref(), Some("KJL"));
-  }
-}

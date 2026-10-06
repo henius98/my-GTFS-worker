@@ -51,9 +51,7 @@ fn coordinates(lat: Option<f64>, lng: Option<f64>) -> Option<[f64; 2]> {
 }
 
 fn json_error(status: u16, message: &str) -> Result<Response> {
-  let mut response = Response::from_json(&json!({ "error": message }))?.with_status(status);
-  response.headers_mut().set("Access-Control-Allow-Origin", "*")?;
-  Ok(response)
+  Ok(Response::from_json(&json!({ "error": message }))?.with_status(status))
 }
 
 pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider: &str) -> Result<Response> {
@@ -86,7 +84,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   };
   let filter = route_id.as_deref().map(JsValue::from).unwrap_or(JsValue::NULL);
 
-  let route_result = db.prepare("SELECT * FROM routes WHERE (?1 IS NULL OR route_id = ?1) ORDER BY route_id").bind(&[filter.clone()])?.all().await?;
+  let route_result = db.prepare("SELECT * FROM routes WHERE (?1 IS NULL OR route_id = ?1) ORDER BY route_id").bind(std::slice::from_ref(&filter))?.all().await?;
   if !route_result.success() {
     return json_error(503, "Map data is unavailable");
   }
@@ -112,7 +110,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
          JOIN shapes ON shapes.shape_id = trip_shapes.shape_id \
          ORDER BY trip_shapes.route_id, trip_shapes.shape_id, shapes.shape_pt_sequence",
       )
-      .bind(&[filter.clone()])?
+      .bind(std::slice::from_ref(&filter))?
       .all()
       .await?;
     if !shape_result.success() {
@@ -145,7 +143,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
          WHERE consecutive.from_stop_id <> consecutive.to_stop_id \
          ORDER BY consecutive.route_id, consecutive.from_stop_id, consecutive.to_stop_id",
       )
-      .bind(&[filter.clone()])?
+      .bind(std::slice::from_ref(&filter))?
       .all()
       .await?;
     if !segment_result.success() {
@@ -225,8 +223,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   }
 
   let mut response = Response::from_json(&json!({ "type": "FeatureCollection", "features": features }))?;
-  response.headers_mut().set("Cache-Control", "public, max-age=300")?;
-  response.headers_mut().set("Access-Control-Allow-Origin", "*")?;
+  response.headers_mut().set("Cache-Control", "public, max-age=86400")?;
   let cached_response = response.cloned()?;
   ctx.wait_until(async move {
     let _ = Cache::default().put(cache_key, cached_response).await;

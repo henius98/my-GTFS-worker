@@ -7,7 +7,7 @@ use worker::{D1Database, D1Result, Result};
 use super::Parameters;
 use super::schedule::{Calendar, Exception, Service, Template};
 
-const QUERY: &str = include_str!("query.sql");
+const QUERY: &str = include_str!("sql/query.sql");
 
 #[derive(Deserialize)]
 struct Column {

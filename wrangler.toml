@@ -3,10 +3,21 @@
 
 name = "my-gtfs-worker"
 main = "worker/build/worker/shim.mjs"
-compatibility_date = "2024-09-23"
+compatibility_date = "2026-09-08"
 
-[observability]
+[placement]
+mode = "smart"
+
+[observability.logs]
 enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[observability.traces]
+enabled = false
+head_sampling_rate = 1
+persist = true
 
 [build]
 command = "bash ./scripts/build.sh"

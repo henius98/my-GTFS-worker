@@ -1,0 +1,33 @@
+meta {
+  name: Next departures
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/{{provider}}/departures
+  body: none
+  auth: none
+}
+
+params:query {
+  stop_id: {{stopId}}
+  limit: 5
+  ~route_id: {{routeId}}
+  ~direction_id: 0
+  ~at: 2026-09-23T08:00:00+08:00
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  Estimates the next departures over a seven-day window from static GTFS data.
+  stop_id is required. Optional route_id and direction_id filter the results.
+  direction_id must be 0 or 1; limit must be 1 to 100 (default 5).
+  at must be an RFC3339 timestamp with a timezone; it defaults to now.
+  The JSON response includes stop, departures, requested_at, search_until,
+  is_estimate, estimate_method, realtime, route_id, direction_id, and limit.
+  X-Departure-Cache reports HIT, MISS, or BYPASS. Unknown stops return 404.
+}

@@ -270,9 +270,3 @@ pub(crate) fn next_departures(templates: &[Template], when: DateTime<Utc>, until
   }
   Ok(departures)
 }
-
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests;

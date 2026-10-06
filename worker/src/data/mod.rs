@@ -1,4 +1,3 @@
-use serde::Deserialize;
 use worker::js_sys::{JSON, Object, Reflect};
 use worker::wasm_bindgen::JsValue;
 use worker::wasm_bindgen_futures::JsFuture;
@@ -6,53 +5,25 @@ use worker::{Env, Response, Result, Url};
 
 use crate::database;
 
-#[derive(Deserialize)]
-struct ColumnName {
-  name: String,
-}
+mod schema;
 
 pub async fn handle(env: &Env, url: &Url, provider: &str, table_name: &str) -> Result<Response> {
   let limit: u32 = url.query_pairs().find(|(k, _)| k == "limit").and_then(|(_, v)| v.parse::<u32>().ok()).map(|v| v.min(super::max_rows(env))).unwrap_or_else(|| super::max_rows(env)); // Enforce the configured maximum limit
   let offset: u32 = url.query_pairs().find(|(k, _)| k == "offset").and_then(|(_, v)| v.parse::<u32>().ok()).unwrap_or(0);
 
-  let d1 = match database::for_provider(env, provider) {
+  let binding_name = database::binding_name(provider);
+  let d1 = match env.d1(&binding_name) {
     Ok(db) => db,
     Err(_) => return database::provider_not_found(provider),
   };
 
   // Validate table name to prevent SQL injection
-  let check_query = "SELECT name FROM sqlite_master WHERE type='table' AND name=?1";
-  let statement = match d1.prepare(check_query).bind(&[table_name.into()]) {
-    Ok(stmt) => stmt,
+  let table_schema = match schema::load(&d1, &binding_name, table_name).await {
+    Ok(Some(schema)) => schema,
+    Ok(None) => return Response::error(format!("Table '{}' not found", table_name), 404),
     Err(e) => return Response::error(format!("Database error: {}", e), 500),
   };
-
-  let table_exists = match statement.first::<String>(Some("name")).await {
-    Ok(Some(_)) => true,
-    Ok(None) => false,
-    Err(e) => return Response::error(format!("Database error: {}", e), 500),
-  };
-
-  if !table_exists {
-    return Response::error(format!("Table '{}' not found", table_name), 404);
-  }
-
-  // Get valid columns for the table
-  let columns_statement = match d1.prepare("SELECT name FROM pragma_table_info(?1)").bind(&[table_name.into()]) {
-    Ok(stmt) => stmt,
-    Err(e) => return Response::error(format!("Database error: {}", e), 500),
-  };
-
-  let valid_columns: Vec<String> = match columns_statement.all().await {
-    Ok(res) => {
-      if let Ok(rows) = res.results::<ColumnName>() {
-        rows.into_iter().map(|row| row.name).collect()
-      } else {
-        Vec::new()
-      }
-    }
-    Err(e) => return Response::error(format!("Database error: {}", e), 500),
-  };
+  let valid_columns = &table_schema.columns;
 
   // Parse 'include' and 'exclude' from url
   let mut selected_columns = "*".to_string();
@@ -70,7 +41,7 @@ pub async fn handle(env: &Env, url: &Url, provider: &str, table_name: &str) -> R
     selected_columns = cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
   } else if let Some(cols) = exclude_cols {
     let mut final_cols = Vec::new();
-    for valid_col in &valid_columns {
+    for valid_col in valid_columns {
       if !cols.contains(valid_col) {
         final_cols.push(valid_col.clone());
       }

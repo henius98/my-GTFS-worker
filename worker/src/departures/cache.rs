@@ -7,7 +7,7 @@ use super::{MAX_LIMIT, Parameters, Stop};
 
 const DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 const MAX_TTL_SECONDS: i64 = i64::MAX / 1_000;
-const FEED_STATE_SQL: &str = include_str!("feed_state.sql");
+const FEED_STATE_SQL: &str = include_str!("sql/feed_state.sql");
 
 pub(super) fn ttl_seconds(env: &Env) -> i64 {
   parse_ttl_seconds(env.var("WORKER_DEPARTURE_CACHE_TTL_SECONDS").ok().map(|value| value.to_string()).as_deref())
@@ -62,7 +62,7 @@ pub(super) async fn feed_state(db: &D1Database) -> Result<FeedState> {
 
 pub(super) async fn read(db: &D1Database, params: &Parameters, state: &FeedState, now: DateTime<Utc>) -> Result<Option<Entry>> {
   let payload = db
-    .prepare(include_str!("cache_read.sql"))
+    .prepare(include_str!("sql/cache_read.sql"))
     .bind(&[params.stop_id.clone().into(), params.route_id.as_deref().unwrap_or("").into(), params.direction_id.unwrap_or(-1).into(), state.revision.clone().into(), (now.timestamp() as f64).into()])?
     .first::<String>(Some("payload"))
     .await?;
@@ -72,7 +72,7 @@ pub(super) async fn read(db: &D1Database, params: &Parameters, state: &FeedState
 pub(super) async fn write(db: &D1Database, params: &Parameters, state: &FeedState, now: DateTime<Utc>, ttl_seconds: i64, entry: &Entry) -> Result<()> {
   // Check the import revision in the same statement as the upsert so an import
   // starting during calculation cannot publish results under an old revision.
-  let sql = include_str!("cache_write.sql").replace("__FEED_STATE__", FEED_STATE_SQL);
+  let sql = include_str!("sql/cache_write.sql").replace("__FEED_STATE__", FEED_STATE_SQL);
   let ttl = Duration::try_seconds(ttl_seconds).ok_or_else(|| worker::Error::RustError("Departure cache lifetime is invalid".into()))?;
   let expires_at = now.checked_add_signed(ttl).ok_or_else(|| worker::Error::RustError("Departure cache expiry is out of range".into()))?.timestamp();
   let result = db
@@ -92,7 +92,3 @@ pub(super) async fn write(db: &D1Database, params: &Parameters, state: &FeedStat
   }
   Ok(())
 }
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests;

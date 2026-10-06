@@ -58,10 +58,21 @@ header = """# AUTO-GENERATED from providers.toml — do not edit directly.
 
 name = "my-gtfs-worker"
 main = "worker/build/worker/shim.mjs"
-compatibility_date = "2024-09-23"
+compatibility_date = "2026-09-08"
 
-[observability]
+[placement]
+mode = "smart"
+
+[observability.logs]
 enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[observability.traces]
+enabled = false
+head_sampling_rate = 1
+persist = true
 
 [build]
 command = "bash ./scripts/build.sh"
@@ -77,12 +88,12 @@ environments_count = 0
 
 with open(OUTPUT_FILE, "w") as out:
     out.write(header)
-    
+
     for provider in providers_data.get("providers", []):
         name = provider.get("name")
         if not name or provider.get("is_active") is False:
             continue
-            
+
         db_id = provider.get("database_id", "")
 
         if db_id and db_id in old_mappings:
@@ -90,7 +101,7 @@ with open(OUTPUT_FILE, "w") as out:
         else:
             today = datetime.utcnow().strftime('%Y%m%d')
             db_name = f"gtfs-{name}-db-{today}"
-            
+
         binding_name = f"DB_{name.upper().replace('-', '_')}"
 
         env_block = f"""
