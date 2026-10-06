@@ -4,8 +4,8 @@ SELECT payload
 FROM
   departure_cache
 WHERE
-  stop_id = ? 1
-  AND route_id = ? 2
-  AND direction_id = ? 3
-  AND feed_revision = ? 4
-  AND expires_at > ? 5;
+  stop_id = ?1
+  AND route_id = ?2
+  AND direction_id = ?3
+  AND feed_revision = ?4
+  AND expires_at > ?5;

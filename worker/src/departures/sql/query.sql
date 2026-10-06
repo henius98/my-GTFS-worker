@@ -38,6 +38,6 @@ FROM
   JOIN trips t ON t.trip_id = st.trip_id __FREQUENCY_JOIN__
   LEFT JOIN routes r ON r.route_id = t.route_id __AGENCY_JOIN__
 WHERE
-  st.stop_id = ? 1 __PICKUP_FILTER__
-  AND (? 2 IS NULL OR t.route_id = ? 2)
-  AND (? 3 IS NULL OR t.direction_id = ? 3);
+  st.stop_id = ?1 __PICKUP_FILTER__
+  AND (?2 IS NULL OR t.route_id = ?2)
+  AND (?3 IS NULL OR t.direction_id = ?3);
