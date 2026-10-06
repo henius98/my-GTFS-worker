@@ -5,8 +5,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::fs;
 
+type CacheColumn = (String, String, i64, Option<String>, i64);
+
 fn sql(name: &str) -> CheckResult<String> {
-  Ok(fs::read_to_string(root().join("worker/src/departures").join(name))?)
+  Ok(fs::read_to_string(root().join("worker/src/departures/sql").join(name))?)
 }
 
 fn database() -> CheckResult<Connection> {
@@ -95,7 +97,7 @@ fn revision_changes_when_a_checkpoint_moves_without_a_new_crc() -> CheckResult {
   Ok(())
 }
 
-fn cache_columns(db: &Connection) -> CheckResult<Vec<(String, String, i64, Option<String>, i64)>> {
+fn cache_columns(db: &Connection) -> CheckResult<Vec<CacheColumn>> {
   let mut statement = db.prepare("PRAGMA table_info(departure_cache)")?;
   Ok(statement.query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?.collect::<Result<_, _>>()?)
 }
