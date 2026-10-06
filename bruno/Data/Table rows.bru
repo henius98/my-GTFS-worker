@@ -1,0 +1,37 @@
+meta {
+  name: Table rows
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/{{provider}}/data/{{table}}
+  body: none
+  auth: none
+}
+
+params:query {
+  limit: 10
+  offset: 0
+  ~include: stop_id,stop_name
+  ~exclude: stop_lat,stop_lon
+  ~filter: KJ10@stop_id
+  ~ifilter: KJ10@stop_id
+  ~contains: KJ@stop_id
+  ~icontains: KJ@stop_id
+  ~range: stop_lat[1:7]
+  ~sort: stop_name
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  Returns { data, limit, offset } for an existing table in the selected provider's database.
+  limit defaults to the configured row cap (1000 by default), and cannot exceed it.
+  Enable optional query parameters above to select columns, filter rows, or sort results.
+  include and exclude are alternatives. filter and ifilter use value@column pairs.
+  contains and icontains also use value@column pairs; range uses column[begin:end].
+  A missing table returns 404; invalid columns return 400.
+}

@@ -1,0 +1,27 @@
+meta {
+  name: Read-only query
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/{{provider}}/sql
+  body: text
+  auth: none
+}
+
+headers {
+  Content-Type: text/plain
+  Accept: application/json
+}
+
+body:text {
+  SELECT stop_id, stop_name FROM stops LIMIT 10
+}
+
+docs {
+  Send one SELECT query or a WITH ... SELECT query as plain text.
+  SQL comments and multiple statements are rejected. A trailing semicolon is allowed.
+  Returns { data } with at most the configured row cap (1000 by default).
+  Invalid queries return 400. Other methods return 405.
+}

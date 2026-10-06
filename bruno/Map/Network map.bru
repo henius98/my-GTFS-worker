@@ -1,0 +1,26 @@
+meta {
+  name: Network map
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/{{provider}}/map
+  body: none
+  auth: none
+}
+
+params:query {
+  ~route_id: {{routeId}}
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  Returns the provider network as a GeoJSON FeatureCollection.
+  Enable route_id to fetch one route and its stops; an unknown route returns 404.
+  LineString features represent route shapes or straight stop-to-stop segments;
+  Point features represent stops. Successful responses are cached for five minutes.
+}

@@ -66,20 +66,17 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Run Unit Tests
+      - name: Run Unit and SQL Tests
         run: cargo test --workspace --locked
 
-      - name: Verify Daily Write Budget SQL
-        run: python3 test/test_daily_budget.py
-
       - name: Validate Live GTFS Schemas
-        run: python3 test/verify_migrations.py --no-report
+        run: cargo run --locked -p gtfs-checks --bin verify_migrations -- --no-report
 
       - name: Run JSON Payload Benchmark Guard
-        run: python3 test/benchmark_json_payload.py
+        run: cargo run --locked -p gtfs-checks --bin benchmark_json_payload
 
       - name: Run UPSERT Replay Benchmark Guard
-        run: python3 test/benchmark_upsert_replay.py
+        run: cargo run --locked -p gtfs-checks --bin benchmark_upsert_replay
 
       - name: Run Resume Checkpoint Benchmark Guard
         run: cargo bench -p importer --bench resume_checkpoint --locked

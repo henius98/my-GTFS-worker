@@ -1,0 +1,13 @@
+{
+  "name": "my-gtfs-worker-test",
+  "main": "../../worker/build/worker/shim.mjs",
+  "compatibility_date": "2026-09-08",
+  "d1_databases": [
+    {
+      "binding": "DB_KTMB",
+      "database_name": "gtfs-worker-test",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "../../migrations/ktmb"
+    }
+  ]
+}

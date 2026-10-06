@@ -65,7 +65,12 @@ my-GTFS-worker/
 ├── worker/             # Cloudflare Worker crate
 │   ├── Cargo.toml
 │   └── src/
-│       └── lib.rs      # API entry points (/status)
+│       ├── lib.rs      # Worker entry point and route dispatch
+│       ├── database.rs # Provider D1 binding lookup
+│       └── routes/
+│           ├── mod.rs
+│           ├── data.rs   # GTFS table data endpoint
+│           └── status.rs # Import progress endpoint
 ├── migrations/         # D1 migration files for infrastructure tables
 ├── schema.sql          # Reference schema (not applied directly)
 └── .github/workflows/  # GitHub Actions pipelines (e.g., run_importer.yml)
@@ -75,7 +80,7 @@ my-GTFS-worker/
 
 | Crate      | Purpose                                                                                                                                                                                                      |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `worker`   | Deploys to Cloudflare Workers. Handles incoming HTTP requests to check database status via `/<provider>/status`.                                                                                             |
+| `worker`   | Deploys to Cloudflare Workers. Handles incoming HTTP requests for database status via `/<provider>/status` and GTFS table data via `/<provider>/data/<table>`.                                               |
 | `importer` | Runs via GitHub Actions. Handles downloading ZIPs, schema-aware file selection, concurrent CSV parsing, and parallel asynchronous multi-row batch inserts to D1. Tracks row progress to ensure resumability. |
 
 ### Data Flow
@@ -168,22 +173,22 @@ Then, edit `.env` and fill in `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`
 
 The checked-in `.env.example` profile uses high scan concurrency. Both direct and scheduled imports must acquire capacity from the shared daily write ledger.
 
-| Variable                           | Example value | Purpose                                                                                                     |
-| ---------------------------------- | ------------: | ----------------------------------------------------------------------------------------------------------- |
-| `CSV_CONCURRENCY_LIMIT`            |            20 | Concurrent blocking ZIP/CSV producers; an unset local value detects CPUs                                    |
-| `D1_CONCURRENCY_LIMIT`             |            10 | Concurrent D1 REST requests across the account (one per active database)                                    |
-| `D1_DATABASE_CONCURRENCY_LIMIT`    |             8 | Concurrent requests permitted to one D1 database                                                            |
-| `D1_MAX_DATABASES`                 |            20 | Refuse automatic rotation once the configured account database count is exhausted                           |
-| `QUERY_STATEMENT_BATCH_SIZE`       |          2000 | CSV rows encoded in one SQL statement                                                                       |
-| `D1_STATEMENTS_PER_REQUEST`        |             8 | SQL statements grouped into one REST request                                                                |
+| Variable                           | Example value | Purpose                                                                                                         |
+| ---------------------------------- | ------------: | --------------------------------------------------------------------------------------------------------------- |
+| `CSV_CONCURRENCY_LIMIT`            |            20 | Concurrent blocking ZIP/CSV producers; an unset local value detects CPUs                                        |
+| `D1_CONCURRENCY_LIMIT`             |            10 | Concurrent D1 REST requests across the account (one per active database)                                        |
+| `D1_DATABASE_CONCURRENCY_LIMIT`    |             8 | Concurrent requests permitted to one D1 database                                                                |
+| `D1_MAX_DATABASES`                 |            20 | Refuse automatic rotation once the configured account database count is exhausted                               |
+| `QUERY_STATEMENT_BATCH_SIZE`       |          2000 | CSV rows encoded in one SQL statement                                                                           |
+| `D1_STATEMENTS_PER_REQUEST`        |             8 | SQL statements grouped into one REST request                                                                    |
 | `MAX_D1_ROWS_WRITTEN_PER_WORKFLOW` |        100000 | Maximum daily-ledger lease, including data, metadata and ledger writes; capped by the remaining daily allowance |
-| `MAX_ROWS_PER_WORKFLOW`            |       5000000 | Logical scan ceiling shared fairly by providers, independent of actual writes                               |
-| `MAX_FEED_DOWNLOAD_MB`             |           256 | Reject a declared or streamed ZIP larger than this temporary-file safety limit                              |
-| `MAX_UNCOMPRESSED_FEED_MB`         |           512 | Reject supported CSV entries whose combined declared expansion exceeds this ZIP-bomb/work cap               |
-| `MAX_CSV_RECORD_KB`                |           512 | Reject pathological CSV headers/records well below D1's 2,000,000-byte value limit                          |
-| `MAX_STATEMENT_PAYLOAD_KB`         |          1536 | Flush serialized positional-JSON bind values below D1's 2,000,000-byte hard limit                           |
-| `MAX_TEMP_FEED_STORAGE_MB`         |          2048 | Workflow-wide cap for all retained provider ZIPs in one importer process; must be at least the per-feed cap |
-| `DB_SIZE_THRESHOLD_MB`             |           490 | Rotation threshold with minimal headroom below the documented 500 MB database limit                         |
+| `MAX_ROWS_PER_WORKFLOW`            |       5000000 | Logical scan ceiling shared fairly by providers, independent of actual writes                                   |
+| `MAX_FEED_DOWNLOAD_MB`             |           256 | Reject a declared or streamed ZIP larger than this temporary-file safety limit                                  |
+| `MAX_UNCOMPRESSED_FEED_MB`         |           512 | Reject supported CSV entries whose combined declared expansion exceeds this ZIP-bomb/work cap                   |
+| `MAX_CSV_RECORD_KB`                |           512 | Reject pathological CSV headers/records well below D1's 2,000,000-byte value limit                              |
+| `MAX_STATEMENT_PAYLOAD_KB`         |          1536 | Flush serialized positional-JSON bind values below D1's 2,000,000-byte hard limit                               |
+| `MAX_TEMP_FEED_STORAGE_MB`         |          2048 | Workflow-wide cap for all retained provider ZIPs in one importer process; must be at least the per-feed cap     |
+| `DB_SIZE_THRESHOLD_MB`             |           490 | Rotation threshold with minimal headroom below the documented 500 MB database limit                             |
 
 `MAX_ROWS_PER_RUN` remains a deprecated fallback when invoking the importer directly, but its value now has workflow-wide semantics. The checked-in GitHub workflow deliberately ignores that legacy repository variable so an old 100,000-row setting cannot silently reintroduce the non-converging scan cap; configure `MAX_ROWS_PER_WORKFLOW` instead.
 
@@ -257,6 +262,43 @@ npx wrangler dev --remote
 
 Visit `http://localhost:8787/<provider>/status` (e.g., `http://localhost:8787/mybas-johor/status`) to check the progress of your background imports!
 
+To run a read-only SQL query, send one `SELECT` (or `WITH ... SELECT`) as plain text to `POST /<provider>/sql`. SQL comments are not accepted. The response contains a `data` array up to the configured row cap (1000 by default). For example:
+
+```bash
+curl -X POST http://localhost:8787/ktmb/sql -H 'Content-Type: text/plain' --data-binary 'SELECT * FROM stops LIMIT 10'
+```
+
+`GET /<provider>/departures` estimates the next departures at a stop over the following seven days for every provider in `providers.toml`. It uses each provider's existing GTFS schema: frequency trips expand their headways, while other trips use scheduled `stop_times`. `calendar_dates` additions and cancellations override the weekly calendar where available, including services with only added dates. Agency timezones and service times past midnight are respected; stop times marked `pickup_type = 1` are excluded.
+
+```bash
+curl --get 'http://localhost:8787/rapid-rail-kl/departures' --data-urlencode 'stop_id=KJ10' --data-urlencode 'limit=5'
+```
+
+`stop_id` is required. Optional `route_id` filters a route, `direction_id` is `0` or `1`, `limit` is 1–100 (default 5), and `at` is an RFC3339 instant with a timezone (default: now). The response includes `departures`, `requested_at`, `search_until`, `is_estimate: true`, and `realtime: false`. Each departure identifies its calculation as `gtfs_schedule` or `frequency_start_plus_headway`; scheduled trips have null `headway_secs` and `trip_start_secs`. These are static-feed estimates, with no live delay adjustment. The endpoint is public like the existing `/data` and `/status` routes.
+
+Calculated results are cached on demand in each provider's `departure_cache` table for 24 hours by default. Set `WORKER_DEPARTURE_CACHE_TTL_SECONDS` to a positive number of seconds to change that lifetime; missing, invalid, or zero values use the 24-hour default. Each stop/route/direction filter has one row containing up to 100 departures in its JSON `payload`; different `limit` and `at` requests reuse or replace that row. Cache hits remove elapsed departures and recalculate waits for the requested instant. `import_progress` changes invalidate the cache, and caching is bypassed while any import is incomplete. Expired rows are replaced when requested again. The `X-Departure-Cache` header reports `HIT`, `MISS`, or `BYPASS`; cache failures still return freshly calculated results.
+
+Apply the new `*_add_departure_cache.sql` migrations and deploy through `./scripts/deploy.sh` to enable persistence. Cache writes consume D1 write allowance in addition to the importer's daily ledger; hits do not write. The cache adds no indexes to imported GTFS tables. SQL/cache migration checks can run with `cargo test -p gtfs-checks --test departure_sql`; scheduling and cache-selection regressions are in the worker's Rust tests. Run `pnpm test:worker` for isolated HTTP and D1 integration checks of the built Rust Worker. This command builds the Worker, applies the KTMB migrations to a temporary local D1 database, and exercises the departures endpoint through Cloudflare's test harness.
+
+`GET /<provider>/map` returns a provider's whole network as a GeoJSON `FeatureCollection` for providers configured in `providers.toml`. Add `?route_id=KJL` to request one route; an unknown route returns 404. Each route shape is a `LineString` with ordered `[longitude, latitude]` coordinates, and each stop is a `Point`. KTMB has no shapes table, so its route lines connect consecutive stops with straight segments; line features identify this approximation with `geometry_source: "stop_sequence"` instead of `"shape"`. Feature properties also include `kind` (`route` or `stop`), `route_id`, and relevant shape, stop, name, or color fields. Whole-network requests are available for every provider; use `route_id` when a smaller map response is preferable. The public response permits cross-origin browser requests and is cached for five minutes.
+
+```js
+const response = await fetch(
+  "http://localhost:8787/rapid-rail-kl/map?route_id=KJL"
+);
+map.data.addGeoJson(await response.json());
+map.data.setStyle((feature) =>
+  feature.getProperty("kind") === "route"
+    ? {
+        strokeColor: `#${feature.getProperty("route_color") || "666666"}`,
+        strokeWeight: 4
+      }
+    : { icon: { path: google.maps.SymbolPath.CIRCLE, scale: 4 } }
+);
+```
+
+Set the Worker `MAX_ROWS` variable to change the response cap for both `/data` and `/sql`; it must be a positive integer. If it is missing or invalid, the Worker uses 1000 rows.
+
 To run the importer locally for testing:
 
 ```bash
@@ -264,14 +306,24 @@ set -a; source .env; set +a
 cargo run --release -p importer
 ```
 
-Correctness and the D1 JSON representation can be checked independently:
+Importer checks and benchmarks are under `test/importer/`:
 
 ```bash
-python3 test/verify_migrations.py --no-report
-python3 test/benchmark_json_payload.py
-python3 test/benchmark_upsert_replay.py
+cargo test -p gtfs-checks --test daily_budget
+cargo run -p gtfs-checks --bin verify_migrations -- --no-report
+cargo run -p gtfs-checks --bin benchmark_json_payload
+cargo run -p gtfs-checks --bin benchmark_upsert_replay
 cargo bench -p importer --bench resume_checkpoint
 ```
+
+Worker checks are under `test/worker/`:
+
+```bash
+cargo test -p gtfs-checks --test departure_sql
+pnpm test:worker
+```
+
+With a Worker running on `http://127.0.0.1:8787`, run `cargo run -p gtfs-checks --bin test_data_api` for the data API HTTP checks. Run `cargo test -p gtfs-checks` for both Rust test groups.
 
 Run `./scripts/deploy.sh` before publishing the new importer so every active D1 database receives the `LastProcessedByte` column. `import_progress` is the single source of truth for CRC, row, byte, and status, with no sidecar join or schema feature-probe branch. Existing checkpoints migrate with byte zero and safely reconstruct the byte offset from their saved line on the next pass.
 

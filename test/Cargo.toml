@@ -1,0 +1,45 @@
+[package]
+name = "gtfs-checks"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+path = "shared/lib.rs"
+
+[[test]]
+name = "daily_budget"
+path = "importer/daily_budget.rs"
+
+[[test]]
+name = "departure_sql"
+path = "worker/departure_sql.rs"
+
+[[bin]]
+name = "benchmark_json_payload"
+path = "importer/benchmark_json_payload.rs"
+
+[[bin]]
+name = "benchmark_upsert_replay"
+path = "importer/benchmark_upsert_replay.rs"
+
+[[bin]]
+name = "verify_migrations"
+path = "importer/verify_migrations.rs"
+
+[[bin]]
+name = "test_data_api"
+path = "worker/test_data_api.rs"
+
+[dependencies]
+csv.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tempfile = "3.27.0"
+zip.workspace = true
+
+[lints]
+workspace = true

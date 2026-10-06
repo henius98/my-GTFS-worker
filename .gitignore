@@ -2,5 +2,5 @@ target/
 build/
 node_modules/
 .wrangler/
-__pycache__/
 .env
+__pycache__/

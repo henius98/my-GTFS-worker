@@ -3,79 +3,46 @@
 //! Note: Heavy GTFS import processing (ZIP download, CSV parsing) has been
 //! moved to an external GitHub Actions workflow to respect Cloudflare Worker CPU limits.
 
-use serde::{Deserialize, Serialize};
-use worker::{Cache, Context, Env, Method, Request, Response, Result, event};
+mod data;
+mod database;
+mod departures;
+mod map;
+mod sql;
+mod status;
 
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct ImportProgress {
-  provider: Option<String>,
-  file_name: Option<String>,
-  #[serde(rename = "CRC")]
-  crc: Option<String>,
-  last_processed_line: Option<i64>,
-  last_processed_byte: Option<i64>,
-  status: Option<i64>,
-  updated_at: Option<String>,
+use worker::{Context, Env, Method, Request, Response, Result, event};
+
+const DEFAULT_MAX_ROWS: u32 = 1000;
+const CORS_ALLOW_ORIGIN: &str = "*";
+
+fn max_rows(env: &Env) -> u32 {
+  env.var("WORKER_SQL_MAX_ROWS").ok().and_then(|value| value.to_string().trim().parse::<u32>().ok()).filter(|rows| *rows > 0).unwrap_or(DEFAULT_MAX_ROWS)
 }
 
 #[event(fetch)]
-pub async fn fetch_route(req: Request, env: Env, ctx: Context) -> Result<Response> {
+pub async fn fetch_route(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
   console_error_panic_hook::set_once();
   let url = req.url()?;
 
   let path = url.path();
   let mut segments = path.trim_matches('/').split('/');
 
-  match (segments.next(), segments.next(), segments.next()) {
-    (Some(provider), Some("status"), None) => {
-      if req.method() != Method::Get {
-        return Response::error("Method Not Allowed", 405);
-      }
-
-      // Query strings, path casing, and a trailing slash do not alter status
-      // output; canonicalize them so callers cannot create arbitrary cache keys.
-      let mut cache_url = url.clone();
-      cache_url.set_path(&format!("/{}/status", provider.to_ascii_lowercase()));
-      cache_url.set_query(None);
-      let cache_key = cache_url.to_string();
-      let cache = Cache::default();
-      if let Ok(Some(response)) = cache.get(&cache_key, false).await {
-        return Ok(response);
-      }
-
-      let binding_name = format!("DB_{}", provider.to_uppercase().replace("-", "_"));
-      let d1 = match env.d1(&binding_name) {
-        Ok(db) => db,
-        Err(_) => {
-          return Response::error(format!("Provider '{}' not found or DB not bound", provider), 404);
-        }
-      };
-
-      // Fetch detailed import progress
-      let progress_results = match d1.prepare("SELECT Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM import_progress").all().await {
-        Ok(res) => res,
-        Err(e) => return Response::error(format!("Database error: {}", e), 500),
-      };
-
-      // Deserialize directly into the response shape to avoid building an
-      // intermediate dynamic JSON object tree on every cache miss.
-      let details = match progress_results.results::<ImportProgress>() {
-        Ok(results) => results,
-        Err(e) => return Response::error(format!("Database response error: {}", e), 500),
-      };
-
-      let mut response = Response::from_json(&details)?;
-      response.headers_mut().set("Cache-Control", "public, max-age=60")?;
-      let cached_response = response.cloned()?;
-      ctx.wait_until(async move {
-        let _ = Cache::default().put(cache_key, cached_response).await;
-      });
-      Ok(response)
-    }
-
-    (Some(""), None, None) | (None, None, None) => Response::ok("Worker is running. Use /<provider>/status to check GTFS import progress."),
-
-    _ => Response::error("Not Found", 404),
-  }
+  let mut response = if req.method() == Method::Options {
+    let mut response = Response::empty()?.with_status(204);
+    response.headers_mut().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")?;
+    response.headers_mut().set("Access-Control-Allow-Headers", "Content-Type")?;
+    response
+  } else {
+    match (segments.next(), segments.next(), segments.next()) {
+      (Some(provider), Some("status"), None) => status::handle(&req, &env, ctx, &url, provider).await,
+      (Some(provider), Some("departures"), None) => departures::handle(&req, &env, &url, provider).await,
+      (Some(provider), Some("map"), None) => map::handle(&req, &env, ctx, &url, provider).await,
+      (Some(provider), Some("sql"), None) => sql::handle(&mut req, &env, provider).await,
+      (Some(provider), Some("data"), Some(table_name)) => data::handle(&env, &url, provider, table_name).await,
+      (Some(""), None, None) | (None, None, None) => Response::ok("Worker is running. Use /<provider>/status to check GTFS import progress."),
+      _ => Response::error("Not Found", 404),
+    }?
+  };
+  response.headers_mut().set("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN)?;
+  Ok(response)
 }
