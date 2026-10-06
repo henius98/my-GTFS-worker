@@ -5,9 +5,10 @@
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS daily_import_budget (Id INTEGER PRIMARY KEY CHECK (Id = 1), DAY TEXT NOT NULL, Reserved INTEGER NOT NULL CHECK (Reserved >= 0));
 
-INSERT
-OR IGNORE INTO daily_import_budget (Id, DAY, Reserved)
-VALUES (1, '', 0);
+INSERT OR IGNORE INTO
+  daily_import_budget (Id, DAY, Reserved)
+VALUES
+  (1, '', 0);
 
 CREATE TABLE IF NOT EXISTS logs (
   Id INTEGER PRIMARY KEY, -- timestamp + random number
@@ -47,7 +48,7 @@ CREATE TABLE IF NOT EXISTS calendar (
   PRIMARY KEY (service_id, start_date, end_date)
 );
 
-CREATE TABLE IF NOT EXISTS calendar_dates (service_id TEXT, DATE INTEGER, exception_type INTEGER, PRIMARY KEY (service_id, DATE));
+CREATE TABLE IF NOT EXISTS calendar_dates (service_id TEXT, date INTEGER, exception_type INTEGER, PRIMARY KEY (service_id, date));
 
 CREATE TABLE IF NOT EXISTS routes (
   agency_id TEXT,

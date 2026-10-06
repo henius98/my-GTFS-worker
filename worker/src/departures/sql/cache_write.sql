@@ -9,8 +9,8 @@ FROM
   feed_state
 WHERE
   revision = ?4
-  AND importing = 0 ON CONFLICT (stop_id, route_id, direction_id) DO
-UPDATE
+  AND importing = 0
+ON CONFLICT (stop_id, route_id, direction_id) DO UPDATE
 SET
   feed_revision = excluded.feed_revision,
   expires_at = excluded.expires_at,

@@ -1,11 +1,9 @@
 # Migrations Validation Report
 
 ## Replay-safety migrations
-
-- ✅ Existing duplicate rows are cleaned and future replay is idempotent.
+- ✅ Replay cleanup migrations enforce future idempotency.
 
 ## Provider: `mybas-johor`
-
 - ✅ Local migration chain matches the compile-time schema and uses one progress table; identical UPSERT replay is idempotent with zero changed rows and every table satisfies the two-write reservation bound.
 - ✅ `agency` matches exactly.
 - ✅ `areas` matches exactly.
@@ -22,7 +20,6 @@
 - ✅ `trips` matches exactly.
 
 ## Provider: `ktmb`
-
 - ✅ Local migration chain matches the compile-time schema and uses one progress table; identical UPSERT replay is idempotent with zero changed rows and every table satisfies the two-write reservation bound.
 - ✅ `agency` matches exactly.
 - ✅ `calendar` matches exactly.
@@ -33,7 +30,6 @@
 - ✅ `trips` matches exactly.
 
 ## Provider: `rapid-bus-mrtfeeder`
-
 - ✅ Local migration chain matches the compile-time schema and uses one progress table; identical UPSERT replay is idempotent with zero changed rows and every table satisfies the two-write reservation bound.
 - ✅ `agency` matches exactly.
 - ✅ `calendar` matches exactly.
@@ -45,7 +41,6 @@
 - ✅ `trips` matches exactly.
 
 ## Provider: `rapid-rail-kl`
-
 - ✅ Local migration chain matches the compile-time schema and uses one progress table; identical UPSERT replay is idempotent with zero changed rows and every table satisfies the two-write reservation bound.
 - ✅ `agency` matches exactly.
 - ✅ `calendar` matches exactly.
@@ -57,7 +52,6 @@
 - ✅ `trips` matches exactly.
 
 ## Provider: `rapid-bus-kl`
-
 - ✅ Local migration chain matches the compile-time schema and uses one progress table; identical UPSERT replay is idempotent with zero changed rows and every table satisfies the two-write reservation bound.
 - ✅ `agency` matches exactly.
 - ✅ `calendar` matches exactly.
@@ -69,7 +63,6 @@
 - ✅ `trips` matches exactly.
 
 ## Provider: `rapid-bus-penang`
-
 - ✅ Local migration chain matches the compile-time schema and uses one progress table; identical UPSERT replay is idempotent with zero changed rows and every table satisfies the two-write reservation bound.
 - ✅ `agency` matches exactly.
 - ✅ `calendar` matches exactly.

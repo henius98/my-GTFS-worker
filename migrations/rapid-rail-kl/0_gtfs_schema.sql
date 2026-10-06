@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS stops (
   geometry TEXT,
   isOKU INTEGER,
   status TEXT,
-  SEARCH TEXT
+  search TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stop_times (

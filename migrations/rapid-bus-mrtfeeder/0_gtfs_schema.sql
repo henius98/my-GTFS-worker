@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS agency (agency_name TEXT, agency_url TEXT, agency_tim
 -- This provider publishes exactly one agency and does not provide agency_id.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_agency_single_row ON agency ((1));
 
-CREATE TABLE IF NOT EXISTS calendar_dates (service_id TEXT, DATE INTEGER, exception_type INTEGER, PRIMARY KEY (service_id, DATE));
+CREATE TABLE IF NOT EXISTS calendar_dates (service_id TEXT, date INTEGER, exception_type INTEGER, PRIMARY KEY (service_id, date));
 
 -- Calculated departures; empty route_id and direction_id -1 mean no filter.
 CREATE TABLE IF NOT EXISTS departure_cache (
