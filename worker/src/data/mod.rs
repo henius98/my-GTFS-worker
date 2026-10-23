@@ -46,10 +46,7 @@ pub(crate) fn parse_range_bounds(range_val: &str) -> std::result::Result<RangeBo
     return Err("empty range bounds");
   }
 
-  Ok(RangeBounds {
-    begin: if begin.is_empty() { None } else { Some(begin) },
-    end: if end.is_empty() { None } else { Some(end) },
-  })
+  Ok(RangeBounds { begin: if begin.is_empty() { None } else { Some(begin) }, end: if end.is_empty() { None } else { Some(end) } })
 }
 
 pub(crate) fn parse_range_part(part: &str) -> std::result::Result<RangeFilter<'_>, String> {
@@ -70,8 +67,7 @@ pub(crate) fn parse_range_part(part: &str) -> std::result::Result<RangeFilter<'_
   let column = part[..bracket_start].trim();
   let range_val = &part[bracket_start + 1..bracket_end];
 
-  let bounds = parse_range_bounds(range_val)
-    .map_err(|_| format!("Invalid range format for {}. Expected col[begin:end]", column))?;
+  let bounds = parse_range_bounds(range_val).map_err(|_| format!("Invalid range format for {}. Expected col[begin:end]", column))?;
 
   Ok(RangeFilter { column, bounds })
 }
@@ -299,34 +295,13 @@ mod tests {
 
   #[test]
   fn test_parse_range_bounds_valid_cases() {
-    assert_eq!(
-      parse_range_bounds("1:10"),
-      Ok(RangeBounds { begin: Some("1"), end: Some("10") })
-    );
-    assert_eq!(
-      parse_range_bounds(":10"),
-      Ok(RangeBounds { begin: None, end: Some("10") })
-    );
-    assert_eq!(
-      parse_range_bounds("5:"),
-      Ok(RangeBounds { begin: Some("5"), end: None })
-    );
-    assert_eq!(
-      parse_range_bounds("08:00:10:00"),
-      Ok(RangeBounds { begin: Some("08:00"), end: Some("10:00") })
-    );
-    assert_eq!(
-      parse_range_bounds("08:00:00:10:00:00"),
-      Ok(RangeBounds { begin: Some("08:00:00"), end: Some("10:00:00") })
-    );
-    assert_eq!(
-      parse_range_bounds(":10:00:00"),
-      Ok(RangeBounds { begin: None, end: Some("10:00:00") })
-    );
-    assert_eq!(
-      parse_range_bounds("08:00:00:"),
-      Ok(RangeBounds { begin: Some("08:00:00"), end: None })
-    );
+    assert_eq!(parse_range_bounds("1:10"), Ok(RangeBounds { begin: Some("1"), end: Some("10") }));
+    assert_eq!(parse_range_bounds(":10"), Ok(RangeBounds { begin: None, end: Some("10") }));
+    assert_eq!(parse_range_bounds("5:"), Ok(RangeBounds { begin: Some("5"), end: None }));
+    assert_eq!(parse_range_bounds("08:00:10:00"), Ok(RangeBounds { begin: Some("08:00"), end: Some("10:00") }));
+    assert_eq!(parse_range_bounds("08:00:00:10:00:00"), Ok(RangeBounds { begin: Some("08:00:00"), end: Some("10:00:00") }));
+    assert_eq!(parse_range_bounds(":10:00:00"), Ok(RangeBounds { begin: None, end: Some("10:00:00") }));
+    assert_eq!(parse_range_bounds("08:00:00:"), Ok(RangeBounds { begin: Some("08:00:00"), end: None }));
   }
 
   #[test]
@@ -339,32 +314,14 @@ mod tests {
 
   #[test]
   fn test_parse_range_part_validation() {
-    assert_eq!(
-      parse_range_part("Status[1:10]"),
-      Ok(RangeFilter {
-        column: "Status",
-        bounds: RangeBounds { begin: Some("1"), end: Some("10") }
-      })
-    );
+    assert_eq!(parse_range_part("Status[1:10]"), Ok(RangeFilter { column: "Status", bounds: RangeBounds { begin: Some("1"), end: Some("10") } }));
     assert!(parse_range_part("").is_err());
     assert!(parse_range_part("Status").is_err());
     assert!(parse_range_part("Status[1:10").is_err());
     assert!(parse_range_part("[1:10]").is_err());
-    assert_eq!(
-      parse_range_part("Status[0:1:2]"),
-      Err("Invalid range format for Status. Expected col[begin:end]".into())
-    );
-    assert_eq!(
-      parse_range_part("Status[08:00:00]"),
-      Err("Invalid range format for Status. Expected col[begin:end]".into())
-    );
-    assert_eq!(
-      parse_range_part("Status[:]"),
-      Err("Invalid range format for Status. Expected col[begin:end]".into())
-    );
-    assert_eq!(
-      parse_range_part("Status[::]"),
-      Err("Invalid range format for Status. Expected col[begin:end]".into())
-    );
+    assert_eq!(parse_range_part("Status[0:1:2]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
+    assert_eq!(parse_range_part("Status[08:00:00]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
+    assert_eq!(parse_range_part("Status[:]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
+    assert_eq!(parse_range_part("Status[::]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
   }
 }

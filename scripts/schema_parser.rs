@@ -1,8 +1,4 @@
-use std::{
-  collections::BTreeMap,
-  fs,
-  path::Path,
-};
+use std::{collections::BTreeMap, fs, path::Path};
 
 pub fn parse_schema_file(path: &Path) -> BTreeMap<String, Vec<String>> {
   let sql = fs::read_to_string(path).unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e));
