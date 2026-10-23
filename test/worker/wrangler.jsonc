@@ -2,6 +2,9 @@
   "name": "my-gtfs-worker-test",
   "main": "../../worker/build/worker/shim.mjs",
   "compatibility_date": "2026-09-08",
+  "vars": {
+    "WORKER_TEST_NOW": "2026-09-24T00:00:00Z"
+  },
   "d1_databases": [
     {
       "binding": "DB_KTMB",

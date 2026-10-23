@@ -10,6 +10,22 @@ pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Resp
     return Response::error("Method Not Allowed", 405);
   }
 
+  let admin_key = env.secret("WORKER_ADMIN_KEY").map(|s| s.to_string()).or_else(|_| env.var("WORKER_ADMIN_KEY").map(|v| v.to_string())).ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+
+  if let Some(expected_key) = admin_key {
+    let auth_header = req.headers().get("Authorization").ok().flatten();
+    let bearer = auth_header.as_deref().and_then(|h| {
+      let trimmed = h.trim();
+      if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") { Some(trimmed[7..].trim()) } else { None }
+    });
+    let x_admin_key = req.headers().get("X-Admin-Key").ok().flatten();
+    let x_key = x_admin_key.as_deref().map(str::trim);
+
+    if bearer != Some(&expected_key) && x_key != Some(&expected_key) {
+      return Response::error("Unauthorized", 401);
+    }
+  }
+
   let sql = req.text().await?;
   let sql = sql.trim();
   let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();

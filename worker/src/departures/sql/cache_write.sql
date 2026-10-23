@@ -16,4 +16,5 @@ SET
   expires_at = excluded.expires_at,
   payload = excluded.payload
 WHERE
-  departure_cache.expires_at <= excluded.expires_at;
+  departure_cache.feed_revision != excluded.feed_revision
+  OR departure_cache.expires_at <= excluded.expires_at;

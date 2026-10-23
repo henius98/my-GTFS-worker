@@ -61,18 +61,30 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
 
   let mut route_id = None;
   for (key, value) in url.query_pairs() {
-    if key != "route_id" || route_id.is_some() || value.trim().is_empty() || value.len() > 256 {
+    if key == "route_id" {
+      if route_id.is_some() {
+        return json_error(400, "Expected at most one non-empty route_id");
+      }
+      if value.trim().is_empty() {
+        return json_error(400, "route_id query parameter is required");
+      }
+      if value.len() > 256 {
+        return json_error(400, "Expected at most one non-empty route_id");
+      }
+      route_id = Some(value.into_owned());
+    } else {
       return json_error(400, "Expected at most one non-empty route_id");
     }
-    route_id = Some(value.into_owned());
   }
+
+  let Some(route_id) = route_id else {
+    return json_error(400, "route_id query parameter is required");
+  };
 
   let mut cache_url = url.clone();
   cache_url.set_path(&format!("/{}/map", provider.to_ascii_lowercase()));
   cache_url.set_query(None);
-  if let Some(route_id) = &route_id {
-    cache_url.query_pairs_mut().append_pair("route_id", route_id);
-  }
+  cache_url.query_pairs_mut().append_pair("route_id", &route_id);
   let cache_key = cache_url.to_string();
   if let Ok(Some(response)) = Cache::default().get(&cache_key, false).await {
     return Ok(response);
@@ -82,9 +94,9 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     Ok(db) => db,
     Err(_) => return json_error(404, "Map database is unavailable"),
   };
-  let filter = route_id.as_deref().map(JsValue::from).unwrap_or(JsValue::NULL);
+  let filter = JsValue::from(&route_id);
 
-  let route_result = db.prepare("SELECT * FROM routes WHERE (?1 IS NULL OR route_id = ?1) ORDER BY route_id").bind(std::slice::from_ref(&filter))?.all().await?;
+  let route_result = db.prepare("SELECT * FROM routes WHERE route_id = ?1 ORDER BY route_id").bind(std::slice::from_ref(&filter))?.all().await?;
   if !route_result.success() {
     return json_error(503, "Map data is unavailable");
   }
@@ -96,7 +108,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     .into_iter()
     .map(|route| (route.route_id.clone(), route))
     .collect::<HashMap<String, MapRoute>>();
-  if route_id.is_some() && routes.is_empty() {
+  if routes.is_empty() {
     return json_error(404, "Unknown route_id");
   }
 

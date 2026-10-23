@@ -78,7 +78,13 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str) -> Resu
   if req.method() != Method::Get {
     return json_error(405, "Method not allowed");
   }
-  let now = DateTime::from_timestamp_millis(Date::now().as_millis() as i64).ok_or_else(|| worker::Error::RustError("Invalid system time".into()))?;
+  let now = env
+    .var("WORKER_TEST_NOW")
+    .ok()
+    .and_then(|v| DateTime::parse_from_rfc3339(&v.to_string()).ok())
+    .map(|dt| dt.with_timezone(&Utc))
+    .or_else(|| DateTime::from_timestamp_millis(Date::now().as_millis() as i64))
+    .ok_or_else(|| worker::Error::RustError("Invalid system time".into()))?;
   let cache_ttl_seconds = cache::ttl_seconds(env);
   let params = match Parameters::parse(url, now, cache_ttl_seconds) {
     Ok(params) => params,
@@ -88,7 +94,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str) -> Resu
     Ok(db) => db,
     Err(_) => return database::provider_not_found(provider),
   };
-  match calculate(&db, params, now, cache_ttl_seconds).await {
+  match calculate(&db, provider, params, now, cache_ttl_seconds).await {
     Ok(response) => Ok(response),
     Err(error) => {
       worker::console_error!("Departure lookup failed: {}", error);
@@ -97,7 +103,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str) -> Resu
   }
 }
 
-async fn calculate(db: &worker::D1Database, params: Parameters, now: DateTime<Utc>, cache_ttl_seconds: i64) -> Result<Response> {
+async fn calculate(db: &worker::D1Database, provider: &str, params: Parameters, now: DateTime<Utc>, cache_ttl_seconds: i64) -> Result<Response> {
   let until = params.when + Duration::days(schedule::SEARCH_DAYS);
   let mut state = match cache::feed_state(db).await {
     Ok(state) if state.cacheable() => Some(state),
@@ -125,7 +131,7 @@ async fn calculate(db: &worker::D1Database, params: Parameters, now: DateTime<Ut
   let Some(stop) = stop else {
     return json_error(404, "Unknown stop_id");
   };
-  let templates = query::load(db, &params).await?;
+  let templates = query::load(db, provider, &params).await?;
   // Extend coverage by the cache lifetime so a later request still has a full
   // seven-day horizon, including when this stop has very few departures.
   let cache_ttl = Duration::try_seconds(cache_ttl_seconds).ok_or_else(|| worker::Error::RustError("Departure cache lifetime is invalid".into()))?;
@@ -135,6 +141,7 @@ async fn calculate(db: &worker::D1Database, params: Parameters, now: DateTime<Ut
   let mut cache_status = "BYPASS";
   if let Some(state) = &state
     && !templates.is_empty()
+    && (params.when - now).num_minutes().abs() < 5
   {
     match cache::write(db, &params, state, now, cache_ttl_seconds, &entry).await {
       Ok(()) => cache_status = "MISS",

@@ -30,16 +30,16 @@ pub async fn fetch_route(mut req: Request, env: Env, ctx: Context) -> Result<Res
   let mut response = if req.method() == Method::Options {
     let mut response = Response::empty()?.with_status(204);
     response.headers_mut().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")?;
-    response.headers_mut().set("Access-Control-Allow-Headers", "Content-Type")?;
+    response.headers_mut().set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key")?;
     response
   } else {
-    match (segments.next(), segments.next(), segments.next()) {
-      (Some(provider), Some("status"), None) => status::handle(&req, &env, ctx, &url, provider).await,
-      (Some(provider), Some("departures"), None) => departures::handle(&req, &env, &url, provider).await,
-      (Some(provider), Some("map"), None) => map::handle(&req, &env, ctx, &url, provider).await,
-      (Some(provider), Some("sql"), None) => sql::handle(&mut req, &env, provider).await,
-      (Some(provider), Some("data"), Some(table_name)) => data::handle(&env, &url, provider, table_name).await,
-      (Some(""), None, None) | (None, None, None) => Response::ok("Worker is running. Use /<provider>/status to check GTFS import progress."),
+    match (segments.next(), segments.next(), segments.next(), segments.next()) {
+      (Some(provider), Some("status"), None, None) => status::handle(&req, &env, ctx, &url, provider).await,
+      (Some(provider), Some("departures"), None, None) => departures::handle(&req, &env, &url, provider).await,
+      (Some(provider), Some("map"), None, None) => map::handle(&req, &env, ctx, &url, provider).await,
+      (Some(provider), Some("sql"), None, None) => sql::handle(&mut req, &env, provider).await,
+      (Some(provider), Some("data"), Some(table_name), None) => data::handle(&req, &env, &url, provider, table_name).await,
+      (Some(""), None, None, None) | (None, None, None, None) => Response::ok("Worker is running. Use /<provider>/status to check GTFS import progress."),
       _ => Response::error("Not Found", 404),
     }?
   };

@@ -88,6 +88,17 @@ fn older_request_cannot_replace_a_newer_entry() -> CheckResult {
 }
 
 #[test]
+fn new_revision_replaces_entry_even_if_old_entry_had_longer_expiry() -> CheckResult {
+  let db = database()?;
+  db.execute("INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, Status) VALUES ('ktmb', 'stop_times.txt', 'v1', 10, 0)", [])?;
+  write(&db, &json!({"ver":"v1"}), None, 500, "", -1)?;
+  db.execute("UPDATE import_progress SET CRC = 'v2'", [])?;
+  write(&db, &json!({"ver":"v2"}), None, 300, "", -1)?;
+  assert_eq!(read(&db, 100, "", -1)?, Some(json!({"ver":"v2"})));
+  Ok(())
+}
+
+#[test]
 fn revision_changes_when_a_checkpoint_moves_without_a_new_crc() -> CheckResult {
   let db = database()?;
   db.execute("INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, Status) VALUES ('ktmb', 'stop_times.txt', 'same', 10, 0)", [])?;

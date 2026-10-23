@@ -131,6 +131,26 @@ fn main() -> CheckResult {
 
   // 11. Test SQL route requires POST
   require_status(client.get(&sql_url).send()?, StatusCode::METHOD_NOT_ALLOWED)?;
-  println!("✅ SQL method test passed!\nAll tests passed!");
+  println!("✅ SQL method test passed!");
+
+  // 12. Test Data route requires GET
+  require_status(client.post(format!("{BASE_URL}/{provider}/data/{valid_table}")).send()?, StatusCode::METHOD_NOT_ALLOWED)?;
+  println!("✅ Data method test passed!");
+
+  // 13. Test Data route rejects extraneous path segments
+  require_status(get(&client, &format!("/{provider}/data/{valid_table}/extra"))?, StatusCode::NOT_FOUND)?;
+  println!("✅ Data extra segment 404 test passed!");
+
+  // 14. Test invalid filter format returns 400
+  for bad_filter in ["bad", ""] {
+    require_status(get(&client, &format!("/{provider}/data/{valid_table}?filter={bad_filter}"))?, StatusCode::BAD_REQUEST)?;
+  }
+  println!("✅ Invalid filter format tests passed!");
+
+  // 15. Test invalid range format returns 400
+  for bad_range in ["Status[0:1:2]", "Status[08:00:00]", "Status[:]", "Status[::]"] {
+    require_status(get(&client, &format!("/{provider}/data/{valid_table}?range={bad_range}"))?, StatusCode::BAD_REQUEST)?;
+  }
+  println!("✅ Invalid range format tests passed!\nAll tests passed!");
   Ok(())
 }
