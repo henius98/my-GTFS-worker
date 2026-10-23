@@ -9,7 +9,7 @@ pub enum ConfigError {
   #[error("I/O error: {0}")]
   Io(#[from] std::io::Error),
   #[error("TOML parsing error: {0}")]
-  Toml(#[from] toml::de::Error),
+  Toml(#[from] toml_edit::de::Error),
   #[error("invalid {name}={value:?}: {requirement}")]
   InvalidEnvironment { name: &'static str, value: String, requirement: &'static str },
 }
@@ -187,6 +187,6 @@ fn positive_u64_alias(primary: &'static str, legacy: &'static str, default: u64)
 
 pub fn load_config(path: &str) -> Result<ProvidersToml, ConfigError> {
   let providers_toml_str = fs::read_to_string(path)?;
-  let config: ProvidersToml = toml::from_str(&providers_toml_str)?;
+  let config: ProvidersToml = toml_edit::de::from_str(&providers_toml_str)?;
   Ok(config)
 }
