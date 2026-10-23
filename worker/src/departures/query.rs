@@ -1,19 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use worker::wasm_bindgen::JsValue;
 use worker::{D1Database, D1Result, Result};
 
 use super::Parameters;
 use super::schedule::{Calendar, Exception, Service, Template};
+use crate::data::schema;
 
 const QUERY: &str = include_str!("sql/query.sql");
-
-#[derive(Deserialize)]
-struct Column {
-  table_name: String,
-  name: String,
-}
 
 fn decode<T: DeserializeOwned>(result: D1Result) -> Result<Vec<T>> {
   if !result.success() {
@@ -24,19 +19,8 @@ fn decode<T: DeserializeOwned>(result: D1Result) -> Result<Vec<T>> {
   Ok(result.results::<serde_json::Value>()?.into_iter().map(serde_json::from_value).collect::<std::result::Result<Vec<T>, _>>()?)
 }
 
-pub(super) async fn load(db: &D1Database, params: &Parameters) -> Result<Vec<Template>> {
-  let result = db
-    .prepare(
-      "SELECT 'trips' AS table_name, name FROM pragma_table_info('trips') \
-       UNION ALL SELECT 'agency', name FROM pragma_table_info('agency') \
-       UNION ALL SELECT 'frequencies', name FROM pragma_table_info('frequencies') \
-       UNION ALL SELECT 'calendar_dates', name FROM pragma_table_info('calendar_dates') \
-       UNION ALL SELECT 'stop_times', name FROM pragma_table_info('stop_times')",
-    )
-    .all()
-    .await?;
-  let columns: HashSet<_> = decode::<Column>(result)?.into_iter().map(|column| (column.table_name, column.name)).collect();
-  let has = |table: &str, column: &str| columns.contains(&(table.to_owned(), column.to_owned()));
+pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -> Result<Vec<Template>> {
+  let has = |table: &str, column: &str| schema::has_column(provider, table, column);
   let frequencies = has("frequencies", "trip_id");
   let frequency_columns = if frequencies {
     format!(
