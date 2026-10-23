@@ -145,8 +145,9 @@ fn validate_local_migrations(directory: &Path, expected: &Schema) -> CheckResult
     if !has_primary_key && indexes.iter().all(|unique| *unique == 0) {
       return Err(format!("`{table}` has no uniqueness constraint; checkpoint replay would append duplicate rows").into());
     }
-    if indexes.len() > 1 {
-      return Err(format!("`{table}` has {} indexes; write-budget reservation assumes at most one index write per row", indexes.len()).into());
+    let max_allowed_indexes = if table == "stop_times" { 2 } else { 1 };
+    if indexes.len() > max_allowed_indexes {
+      return Err(format!("`{table}` has {} indexes; write-budget reservation assumes at most {} index writes per row", indexes.len(), max_allowed_indexes).into());
     }
     let quoted_columns = actual_columns.iter().map(|column| quote(column)).collect::<Vec<_>>().join(", ");
     let placeholders = vec!["?"; actual_columns.len()].join(", ");

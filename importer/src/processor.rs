@@ -20,9 +20,9 @@ use zip::ZipArchive;
 
 static TEMP_FEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_ARCHIVE_ENTRIES: usize = 256;
-// Every imported table has at most one primary/unique index. D1 bills one row
-// write for the table and one for that index in the worst case.
-const MAX_D1_WRITES_PER_LOGICAL_ROW: u64 = 2;
+// Every imported table has at most two indexes (primary/unique + secondary on stop_times). D1 bills one row
+// write for the table and up to two for indexes in the worst case.
+const MAX_D1_WRITES_PER_LOGICAL_ROW: u64 = 3;
 // The CSV reader buffers ahead. This small allowance lets it find the end of a
 // record before the exact byte-span check below rejects an oversized record.
 const CSV_RECORD_READ_AHEAD_BYTES: u64 = 64 * 1024;

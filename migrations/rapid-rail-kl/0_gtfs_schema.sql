@@ -90,6 +90,8 @@ CREATE TABLE IF NOT EXISTS stop_times (
   PRIMARY KEY (trip_id, stop_sequence)
 );
 
+CREATE INDEX IF NOT EXISTS idx_stop_times_stop_departure ON stop_times (stop_id, departure_time);
+
 CREATE TABLE IF NOT EXISTS agency (
   agency_id TEXT PRIMARY KEY,
   agency_name TEXT,
