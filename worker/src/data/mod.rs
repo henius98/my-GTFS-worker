@@ -34,12 +34,29 @@ pub(crate) fn parse_range_bounds(range_val: &str) -> std::result::Result<RangeBo
     return Ok(RangeBounds { begin: Some(begin), end: None });
   }
 
-  let colon_indices: Vec<usize> = range_val.match_indices(':').map(|(i, _)| i).collect();
-  let (begin, end) = match colon_indices.as_slice() {
-    &[idx] => (&range_val[..idx], &range_val[idx + 1..]),
-    &[_, split_idx, _] => (&range_val[..split_idx], &range_val[split_idx + 1..]),
-    &[_, _, split_idx, _, _] => (&range_val[..split_idx], &range_val[split_idx + 1..]),
-    _ => return Err("invalid range bounds separator"),
+  let (begin, end) = if let Some((b, e)) = range_val.split_once("..") {
+    (b, e)
+  } else {
+    let colon_indices: Vec<usize> = range_val.match_indices(':').map(|(i, _)| i).collect();
+    match colon_indices.as_slice() {
+      &[idx] => (&range_val[..idx], &range_val[idx + 1..]),
+      &[_, split_idx, _] => (&range_val[..split_idx], &range_val[split_idx + 1..]),
+      &[_, idx1, idx2, _] => {
+        let left_1 = &range_val[..idx1];
+        let right_1 = &range_val[idx1 + 1..];
+        let left_2 = &range_val[..idx2];
+        let right_2 = &range_val[idx2 + 1..];
+        if (left_2.len() == 7 || left_2.len() == 8) && (right_2.len() == 4 || right_2.len() == 5) {
+          (left_2, right_2)
+        } else if (left_1.len() == 4 || left_1.len() == 5) && (right_1.len() == 7 || right_1.len() == 8) {
+          (left_1, right_1)
+        } else {
+          return Err("invalid range bounds separator");
+        }
+      }
+      &[_, _, split_idx, _, _] => (&range_val[..split_idx], &range_val[split_idx + 1..]),
+      _ => return Err("invalid range bounds separator"),
+    }
   };
 
   if begin.is_empty() && end.is_empty() {
@@ -123,6 +140,9 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
   let exclude_cols: Option<Vec<String>> = url.query_pairs().find(|(k, _)| k == "exclude").map(|(_, v)| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
 
   if let Some(cols) = include_cols {
+    if cols.is_empty() {
+      return Response::error("Include parameter cannot be empty", 400);
+    }
     for col in &cols {
       if !valid_columns.contains(&col.as_str()) {
         return Response::error(format!("Invalid include column: {}", col), 400);
@@ -130,6 +150,9 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
     }
     selected_columns = cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
   } else if let Some(cols) = exclude_cols {
+    if cols.is_empty() {
+      return Response::error("Exclude parameter cannot be empty", 400);
+    }
     let mut final_cols = Vec::new();
     for &valid_col in valid_columns {
       if !cols.iter().any(|c| c == valid_col) {
@@ -172,12 +195,15 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
 
           if is_instr {
             filter_clauses.push(format!("INSTR(\"{}\", ?{}) > 0", col, filter_clauses.len() + 1));
+          } else if is_like {
+            filter_clauses.push(format!("\"{}\" LIKE ?{} ESCAPE '\\'", col, filter_clauses.len() + 1));
           } else {
             filter_clauses.push(format!("\"{}\" {} ?{}", col, operator, filter_clauses.len() + 1));
           }
 
           if is_like {
-            filter_values.push(format!("%{}%", val));
+            let escaped_val = val.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            filter_values.push(format!("%{}%", escaped_val));
           } else {
             filter_values.push(val.to_string());
           }
@@ -238,7 +264,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
   let order_clause = if sort_clauses.is_empty() { "".to_string() } else { format!("ORDER BY {}", sort_clauses.join(", ")) };
 
   // Execute the paginated query
-  let query = format!("SELECT {} FROM {} {} {} LIMIT ?{} OFFSET ?{}", selected_columns, table_name, where_clause, order_clause, filter_clauses.len() + 1, filter_clauses.len() + 2);
+  let query = format!("SELECT {} FROM \"{}\" {} {} LIMIT ?{} OFFSET ?{}", selected_columns, table_name, where_clause, order_clause, filter_clauses.len() + 1, filter_clauses.len() + 2);
 
   let mut params: Vec<worker::wasm_bindgen::JsValue> = Vec::new();
   for v in filter_values {
@@ -296,10 +322,14 @@ mod tests {
   #[test]
   fn test_parse_range_bounds_valid_cases() {
     assert_eq!(parse_range_bounds("1:10"), Ok(RangeBounds { begin: Some("1"), end: Some("10") }));
+    assert_eq!(parse_range_bounds("1..10"), Ok(RangeBounds { begin: Some("1"), end: Some("10") }));
     assert_eq!(parse_range_bounds(":10"), Ok(RangeBounds { begin: None, end: Some("10") }));
     assert_eq!(parse_range_bounds("5:"), Ok(RangeBounds { begin: Some("5"), end: None }));
     assert_eq!(parse_range_bounds("08:00:10:00"), Ok(RangeBounds { begin: Some("08:00"), end: Some("10:00") }));
     assert_eq!(parse_range_bounds("08:00:00:10:00:00"), Ok(RangeBounds { begin: Some("08:00:00"), end: Some("10:00:00") }));
+    assert_eq!(parse_range_bounds("08:00:00..10:00:00"), Ok(RangeBounds { begin: Some("08:00:00"), end: Some("10:00:00") }));
+    assert_eq!(parse_range_bounds("08:00:00:10:00"), Ok(RangeBounds { begin: Some("08:00:00"), end: Some("10:00") }));
+    assert_eq!(parse_range_bounds("08:00:10:00:00"), Ok(RangeBounds { begin: Some("08:00"), end: Some("10:00:00") }));
     assert_eq!(parse_range_bounds(":10:00:00"), Ok(RangeBounds { begin: None, end: Some("10:00:00") }));
     assert_eq!(parse_range_bounds("08:00:00:"), Ok(RangeBounds { begin: Some("08:00:00"), end: None }));
   }

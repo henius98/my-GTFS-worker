@@ -1,5 +1,26 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
+pub fn split_top_level_comma(s: &str) -> Vec<&str> {
+  let mut parts = Vec::new();
+  let mut start = 0;
+  let mut depth = 0;
+  for (idx, ch) in s.char_indices() {
+    match ch {
+      '(' => depth += 1,
+      ')' => depth = depth.saturating_sub(1),
+      ',' if depth == 0 => {
+        parts.push(&s[start..idx]);
+        start = idx + 1;
+      }
+      _ => {}
+    }
+  }
+  if start < s.len() {
+    parts.push(&s[start..]);
+  }
+  parts
+}
+
 pub fn parse_schema_file(path: &Path) -> BTreeMap<String, Vec<String>> {
   let sql = fs::read_to_string(path).unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e));
   let mut schemas = BTreeMap::new();
@@ -36,25 +57,15 @@ pub fn parse_schema_file(path: &Path) -> BTreeMap<String, Vec<String>> {
             && start < end
           {
             let cols_str = &line[start + 1..end];
-            let mut in_constraint = false;
-            for col_def in cols_str.split(',') {
+            for col_def in split_top_level_comma(cols_str) {
               let col_def = col_def.trim();
               let col_upper = col_def.to_uppercase();
-              if in_constraint {
-                if col_def.contains(')') {
-                  in_constraint = false;
-                }
-                continue;
-              }
               if col_upper.starts_with("PRIMARY KEY")
                 || col_upper.starts_with("FOREIGN KEY")
                 || col_upper.starts_with("UNIQUE")
                 || col_upper.starts_with("CHECK")
                 || col_upper.starts_with("CONSTRAINT")
               {
-                if col_def.contains('(') && !col_def.contains(')') {
-                  in_constraint = true;
-                }
                 continue;
               }
               if let Some(col_name) = col_def.split_whitespace().next()
@@ -90,4 +101,27 @@ pub fn parse_schema_file(path: &Path) -> BTreeMap<String, Vec<String>> {
     }
   }
   schemas
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_split_top_level_comma_nested_parentheses() {
+    let input = "Id INTEGER PRIMARY KEY, Level TINYINT NOT NULL CHECK (Level IN (0, 1, 2, 3, 4, 5)), Message TEXT NOT NULL";
+    let parts = split_top_level_comma(input);
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0].trim(), "Id INTEGER PRIMARY KEY");
+    assert_eq!(parts[1].trim(), "Level TINYINT NOT NULL CHECK (Level IN (0, 1, 2, 3, 4, 5))");
+    assert_eq!(parts[2].trim(), "Message TEXT NOT NULL");
+  }
+
+  #[test]
+  fn test_split_top_level_comma_composite_keys() {
+    let input = "service_id TEXT, date INTEGER, exception_type INTEGER, PRIMARY KEY (service_id, date)";
+    let parts = split_top_level_comma(input);
+    assert_eq!(parts.len(), 4);
+    assert_eq!(parts[3].trim(), "PRIMARY KEY (service_id, date)");
+  }
 }

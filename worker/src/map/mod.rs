@@ -113,7 +113,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   }
 
   let mut paths: BTreeMap<(String, String), Vec<[f64; 2]>> = BTreeMap::new();
-  let has_shapes = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='shapes'").first::<String>(Some("name")).await?.is_some();
+  let has_shapes = crate::data::schema::has_column(provider, "shapes", "shape_id");
   if has_shapes {
     let shape_result = db
       .prepare(
@@ -137,7 +137,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   }
 
   let mut segments = Vec::new();
-  if !has_shapes {
+  if paths.is_empty() {
     let segment_result = db
       .prepare(
         "WITH consecutive AS ( \

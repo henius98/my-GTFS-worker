@@ -265,12 +265,12 @@ pub(crate) fn next_departures(templates: &[Template], when: DateTime<Utc>, until
       // The next candidate after Saturday is Sunday, not Monday.
       ctx = ctx.next_day(timezone)?;
     }
-    departures.sort_by(|a, b| {
-      (a.estimated_departure_at, &a.trip_id, a.service_date, a.trip_start_secs, a.stop_sequence).cmp(&(b.estimated_departure_at, &b.trip_id, b.service_date, b.trip_start_secs, b.stop_sequence))
-    });
-    departures.dedup_by(|a, b| a.trip_id == b.trip_id && a.service_date == b.service_date && a.trip_start_secs == b.trip_start_secs && a.stop_sequence == b.stop_sequence);
-    departures.truncate(limit);
   }
+  departures.sort_by(|a, b| {
+    (a.estimated_departure_at, &a.trip_id, a.service_date, a.trip_start_secs, a.stop_sequence).cmp(&(b.estimated_departure_at, &b.trip_id, b.service_date, b.trip_start_secs, b.stop_sequence))
+  });
+  departures.dedup_by(|a, b| a.trip_id == b.trip_id && a.service_date == b.service_date && a.trip_start_secs == b.trip_start_secs && a.stop_sequence == b.stop_sequence);
+  departures.truncate(limit);
   Ok(departures)
 }
 

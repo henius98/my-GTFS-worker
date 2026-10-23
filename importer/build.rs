@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 #[path = "../scripts/schema_parser.rs"]
 mod schema_parser;
-use schema_parser::parse_schema_file;
+use schema_parser::{parse_schema_file, split_top_level_comma};
 
 fn migration_sort_key(path: &Path) -> (u64, String) {
   let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
@@ -66,17 +66,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       let Some((table, body)) = definition.split_once('(') else {
         continue;
       };
+      let body = body.trim();
+      let body_inner = body.strip_suffix(')').unwrap_or(body).trim();
       let mut keys = Vec::new();
-      if let Some((_, primary)) = body.split_once("PRIMARY KEY (") {
-        if let Some((columns, _)) = primary.split_once(')') {
-          keys.extend(columns.split(',').map(str::trim));
-        }
-      } else {
-        for line in body.lines() {
-          if line.contains("PRIMARY KEY")
-            && let Some(column) = line.split_whitespace().next()
-          {
-            keys.push(column);
+      if let Some(pos) = body.to_uppercase().find("PRIMARY KEY") {
+        let after_pk = body[pos + "PRIMARY KEY".len()..].trim_start();
+        if let Some(after_paren) = after_pk.strip_prefix('(') {
+          if let Some((columns, _)) = after_paren.split_once(')') {
+            keys.extend(columns.split(',').map(str::trim));
+          }
+        } else {
+          for part in split_top_level_comma(body_inner) {
+            let part = part.trim();
+            if part.to_uppercase().contains("PRIMARY KEY")
+              && let Some(column) = part.split_whitespace().next()
+            {
+              keys.push(column);
+            }
           }
         }
       }

@@ -1126,6 +1126,7 @@ mod tests {
     assert!(!update.contains("\"stop_sequence\""));
     assert!(positional_insert_sql("stop_times", keys, keys).ends_with("DO NOTHING"));
     assert_eq!(primary_keys("mybas-johor", "areas"), &["area_id"]);
+    assert_eq!(primary_keys("ktmb", "trips"), &["trip_id"]);
     assert!(primary_keys("mybas-johor", "fare_leg_rules").is_empty());
   }
 

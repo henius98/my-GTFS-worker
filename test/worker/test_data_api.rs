@@ -151,6 +151,12 @@ fn main() -> CheckResult {
   for bad_range in ["Status[0:1:2]", "Status[08:00:00]", "Status[:]", "Status[::]"] {
     require_status(get(&client, &format!("/{provider}/data/{valid_table}?range={bad_range}"))?, StatusCode::BAD_REQUEST)?;
   }
-  println!("✅ Invalid range format tests passed!\nAll tests passed!");
+  println!("✅ Invalid range format tests passed!");
+
+  // 16. Test empty include and exclude return 400
+  for bad_selection in ["include=", "include=   ", "exclude=", "exclude=   "] {
+    require_status(get(&client, &format!("/{provider}/data/{valid_table}?{bad_selection}"))?, StatusCode::BAD_REQUEST)?;
+  }
+  println!("✅ Empty include/exclude 400 tests passed!\nAll tests passed!");
   Ok(())
 }
