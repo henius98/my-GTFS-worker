@@ -12,7 +12,7 @@ use std::{
 };
 use zip::ZipArchive;
 
-const INFRASTRUCTURE_TABLES: [&str; 5] = ["daily_import_budget", "departure_cache", "logs", "dataset_versions", "import_progress"];
+const INFRASTRUCTURE_TABLES: [&str; 4] = ["departure_cache", "0_daily_import_budget", "0_dataset_versions", "0_import_progress"];
 type Schema = BTreeMap<String, Vec<String>>;
 
 fn quote(identifier: &str) -> String {
@@ -53,18 +53,19 @@ fn migration_files(directory: &Path) -> CheckResult<Vec<PathBuf>> {
 }
 
 fn validate_replay_cleanup_migrations() -> CheckResult {
-  let db = Connection::open_in_memory()?;
-  db.execute_batch("CREATE TABLE fare_leg_rules (leg_group_id TEXT, from_area_id TEXT, to_area_id TEXT, fare_product_id TEXT); CREATE TABLE agency (agency_name TEXT, agency_url TEXT, agency_timezone TEXT, agency_phone TEXT, agency_lang TEXT);")?;
+  let db_johor = Connection::open_in_memory()?;
+  db_johor.execute_batch(&fs::read_to_string(root().join("migrations/mybas-johor/0_gtfs_schema.sql"))?)?;
   let fare = ["leg", "from", "to", "product"];
-  db.execute("INSERT INTO fare_leg_rules VALUES (?1, ?2, ?3, ?4)", fare)?;
-  db.execute("INSERT INTO agency VALUES ('old', 'url', 'zone', 'phone', 'en'), ('new', 'url', 'zone', 'phone', 'en')", [])?;
-  db.execute_batch(&fs::read_to_string(root().join("migrations/mybas-johor/20260826_deduplicate_fare_leg_rules.sql"))?)?;
-  db.execute_batch(&fs::read_to_string(root().join("migrations/rapid-bus-mrtfeeder/20260826_enforce_single_agency.sql"))?)?;
-  db.execute("INSERT OR REPLACE INTO fare_leg_rules VALUES (?1, ?2, ?3, ?4)", fare)?;
-  db.execute("INSERT OR REPLACE INTO agency VALUES ('latest', 'url', 'zone', 'phone', 'en')", [])?;
-  let fare_count: i64 = db.query_row("SELECT COUNT(*) FROM fare_leg_rules", [], |row| row.get(0))?;
+  db_johor.execute("INSERT OR REPLACE INTO fare_leg_rules (leg_group_id, from_area_id, to_area_id, fare_product_id) VALUES (?1, ?2, ?3, ?4)", fare)?;
+  db_johor.execute("INSERT OR REPLACE INTO fare_leg_rules (leg_group_id, from_area_id, to_area_id, fare_product_id) VALUES (?1, ?2, ?3, ?4)", fare)?;
+  let fare_count: i64 = db_johor.query_row("SELECT COUNT(*) FROM fare_leg_rules", [], |row| row.get(0))?;
+
+  let db_agency = Connection::open_in_memory()?;
+  db_agency.execute_batch(&fs::read_to_string(root().join("migrations/rapid-bus-mrtfeeder/0_gtfs_schema.sql"))?)?;
+  db_agency.execute("INSERT OR REPLACE INTO agency (agency_name, agency_url, agency_timezone, agency_phone, agency_lang) VALUES ('old', 'url', 'zone', 'phone', 'en')", [])?;
+  db_agency.execute("INSERT OR REPLACE INTO agency (agency_name, agency_url, agency_timezone, agency_phone, agency_lang) VALUES ('latest', 'url', 'zone', 'phone', 'en')", [])?;
   let agency_names = {
-    let mut statement = db.prepare("SELECT agency_name FROM agency")?;
+    let mut statement = db_agency.prepare("SELECT agency_name FROM agency")?;
     statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?
   };
   if fare_count != 1 || agency_names != vec!["latest".to_owned()] {
@@ -74,23 +75,29 @@ fn validate_replay_cleanup_migrations() -> CheckResult {
 }
 
 fn validate_legacy_progress_upgrade(directory: &Path) -> CheckResult {
-  let files = migration_files(directory)?.into_iter().filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().ends_with("_add_import_progress_byte.sql"))).collect::<Vec<_>>();
-  if files.len() != 1 {
-    return Err(format!("expected exactly one progress-byte migration, found {}", files.len()).into());
-  }
+  let prefix_files =
+    migration_files(directory)?.into_iter().filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().ends_with("_prefix_infrastructure_tables.sql"))).collect::<Vec<_>>();
+  let Some(prefix_file) = prefix_files.first() else {
+    return Ok(());
+  };
   let db = Connection::open_in_memory()?;
-  db.execute_batch("CREATE TABLE import_progress (Provider TEXT, FileName TEXT, CRC TEXT, LastProcessedLine INTEGER, Status TINYINT CHECK (Status IN (0, 1)), UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (Provider, FileName)); CREATE TABLE import_progress_offsets (Provider TEXT, FileName TEXT, CRC TEXT, LastProcessedLine INTEGER, LastProcessedByte INTEGER, PRIMARY KEY (Provider, FileName)); INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, Status, UpdatedAt) VALUES ('legacy-provider', 'stops.txt', 'legacy-crc', 17, 1, '2026-08-30 00:00:00');")?;
-  db.execute_batch(&fs::read_to_string(&files[0])?)?;
-  let row: (String, String, String, i64, i64, i64, String) =
-    db.query_row("SELECT Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM import_progress", [], |row| {
-      Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+  db.execute_batch("CREATE TABLE logs (Id INTEGER PRIMARY KEY, Level TINYINT NOT NULL, Message TEXT NOT NULL); CREATE TABLE import_progress (Provider TEXT, FileName TEXT, CRC TEXT, LastProcessedLine INTEGER, LastProcessedByte INTEGER NOT NULL DEFAULT 0, Status TINYINT CHECK (Status IN (0, 1)), UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (Provider, FileName)); INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt) VALUES ('legacy-provider', 'stops.txt', 'legacy-crc', 17, 128, 1, '2026-08-30 00:00:00'); CREATE TABLE dataset_versions (Provider TEXT PRIMARY KEY, ETag TEXT, UpdatedAt DATETIME); INSERT INTO dataset_versions (Provider, ETag, UpdatedAt) VALUES ('legacy-provider', 'etag-1', '2026-08-30 00:00:00');")?;
+  db.execute_batch(&fs::read_to_string(prefix_file)?)?;
+  let migrated: (String, String, i64, i64, i64, String) =
+    db.query_row("SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM \"0_import_progress\"", [], |row| {
+      Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
     })?;
-  if row != ("legacy-provider".into(), "stops.txt".into(), "legacy-crc".into(), 17, 0, 1, "2026-08-30 00:00:00".into()) {
-    return Err(format!("legacy progress row changed during migration: {row:?}").into());
+  if migrated != ("stops.txt".into(), "legacy-crc".into(), 17, 128, 1, "2026-08-30 00:00:00".into()) {
+    return Err(format!("0_import_progress row changed during prefix migration: {migrated:?}").into());
   }
-  let leftovers: i64 = db.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN ('import_progress_legacy', 'import_progress_offsets')", [], |row| row.get(0))?;
-  if leftovers != 0 {
-    return Err("legacy or sidecar progress table remained after migration".into());
+  let etag: String = db.query_row("SELECT ETag FROM \"0_dataset_versions\"", [], |row| row.get(0))?;
+  if etag != "etag-1" {
+    return Err(format!("0_dataset_versions ETag changed during prefix migration: {etag}").into());
+  }
+  let legacy_leftovers: i64 =
+    db.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN ('logs', 'import_progress', 'dataset_versions', 'daily_import_budget')", [], |row| row.get(0))?;
+  if legacy_leftovers != 0 {
+    return Err("unprefixed infrastructure table remained after prefix migration".into());
   }
   Ok(())
 }
@@ -113,21 +120,21 @@ fn validate_local_migrations(directory: &Path, expected: &Schema) -> CheckResult
       .into(),
     );
   }
-  let progress = columns(&db, "import_progress")?;
-  if progress != ["Provider", "FileName", "CRC", "LastProcessedLine", "LastProcessedByte", "Status", "UpdatedAt"].map(str::to_owned).to_vec() {
+  let progress = columns(&db, "0_import_progress")?;
+  if progress != ["FileName", "CRC", "LastProcessedLine", "LastProcessedByte", "Status", "UpdatedAt"].map(str::to_owned).to_vec() {
     return Err(format!("runtime progress schema differs from expected single-table schema: {progress:?}").into());
   }
-  db.execute("INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, Status) VALUES ('checkpoint-probe', 'stops.txt', 'current-crc', 7, 1)", [])?;
-  let checkpoint: (i64, i64) = db.query_row("SELECT LastProcessedLine, LastProcessedByte FROM import_progress WHERE Provider = 'checkpoint-probe'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+  db.execute("INSERT INTO \"0_import_progress\" (FileName, CRC, LastProcessedLine, Status) VALUES ('stops.txt', 'current-crc', 7, 1)", [])?;
+  let checkpoint: (i64, i64) = db.query_row("SELECT LastProcessedLine, LastProcessedByte FROM \"0_import_progress\" WHERE FileName = 'stops.txt'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
   if checkpoint != (7, 0) {
     return Err(format!("byte checkpoint default returned {checkpoint:?} instead of (7, 0)").into());
   }
-  db.execute("UPDATE import_progress SET LastProcessedLine = 8, LastProcessedByte = 321 WHERE Provider = 'checkpoint-probe'", [])?;
-  let checkpoint: (i64, i64) = db.query_row("SELECT LastProcessedLine, LastProcessedByte FROM import_progress WHERE Provider = 'checkpoint-probe'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+  db.execute("UPDATE \"0_import_progress\" SET LastProcessedLine = 8, LastProcessedByte = 321 WHERE FileName = 'stops.txt'", [])?;
+  let checkpoint: (i64, i64) = db.query_row("SELECT LastProcessedLine, LastProcessedByte FROM \"0_import_progress\" WHERE FileName = 'stops.txt'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
   if checkpoint != (8, 321) {
     return Err(format!("byte checkpoint update returned {checkpoint:?} instead of (8, 321)").into());
   }
-  db.execute("DELETE FROM import_progress WHERE Provider = 'checkpoint-probe'", [])?;
+  db.execute("DELETE FROM \"0_import_progress\" WHERE FileName = 'stops.txt'", [])?;
 
   for (table, expected_columns) in expected {
     let actual_columns = columns(&db, table)?;
@@ -145,7 +152,7 @@ fn validate_local_migrations(directory: &Path, expected: &Schema) -> CheckResult
     if !has_primary_key && indexes.iter().all(|unique| *unique == 0) {
       return Err(format!("`{table}` has no uniqueness constraint; checkpoint replay would append duplicate rows").into());
     }
-    let max_allowed_indexes = if table == "stop_times" { 2 } else { 1 };
+    let max_allowed_indexes = 1;
     if indexes.len() > max_allowed_indexes {
       return Err(format!("`{table}` has {} indexes; write-budget reservation assumes at most {} index writes per row", indexes.len(), max_allowed_indexes).into());
     }

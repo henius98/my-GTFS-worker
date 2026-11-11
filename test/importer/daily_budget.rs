@@ -43,15 +43,17 @@ impl Budget {
     let day = Arc::new(Mutex::new("2026-09-12".to_owned()));
     let db = Self::connect(&path, &day)?;
     let source = source()?;
-    let migration = fs::read_to_string(root().join("migrations/ktmb/20260912_add_daily_import_budget.sql"))?;
+    let migration = fs::read_to_string(root().join("migrations/ktmb/0_gtfs_schema.sql"))?;
     db.execute_batch(&migration)?;
+    let rename_migration = fs::read_to_string(root().join("migrations/ktmb/20261028_prefix_infrastructure_tables.sql"))?;
+    db.execute_batch(&rename_migration)?;
     Ok(Self {
       _directory: directory,
       db,
       path,
       day,
       acquire_sql: sql_after(&source, "WITH allowance")?,
-      release_sql: sql_after(&source, "UPDATE daily_import_budget")?,
+      release_sql: sql_after(&source, "UPDATE \"0_daily_import_budget\"")?,
       migration,
       limit: number(&source, "DAILY_WRITE_LIMIT")?,
       overhead: number(&source, "METADATA_WRITE_RESERVE")? + number(&source, "LEDGER_WRITE_RESERVE")?,
@@ -89,7 +91,7 @@ impl Budget {
   }
 
   fn reserved(&self) -> CheckResult<i64> {
-    Ok(self.db.query_row("SELECT Reserved FROM daily_import_budget WHERE Id = 1", [], |row| row.get(0))?)
+    Ok(self.db.query_row("SELECT Reserved FROM \"0_daily_import_budget\" WHERE Id = 1", [], |row| row.get(0))?)
   }
 }
 

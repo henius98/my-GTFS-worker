@@ -140,21 +140,25 @@ test("reuses cached departures and recalculates waits", async () => {
   assert.equal(body.departures[0].wait_seconds, 9 * 60 + 59);
 });
 
-test("bypasses cached results while a feed import is in progress", async () => {
+test("invalidates and recaches departures when feed progress changes", async () => {
   const first = await request(`?stop_id=S&at=${at}`);
   assert.equal(first.headers.get("X-Departure-Cache"), "MISS");
   const { DB_KTMB: db } = await worker.getEnv();
   await db
     .prepare(
-      "INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, Status) VALUES (?, ?, ?, ?, ?)"
+      "INSERT INTO \"0_import_progress\" (FileName, CRC, LastProcessedLine, Status) VALUES (?, ?, ?, ?)"
     )
-    .bind("ktmb", "trips.txt", "changed", 1, 1)
+    .bind("trips.txt", "changed", 1, 1)
     .run();
 
   const second = await request(`?stop_id=S&at=${at}`);
   assert.equal(second.status, 200);
-  assert.equal(second.headers.get("X-Departure-Cache"), "BYPASS");
+  assert.equal(second.headers.get("X-Departure-Cache"), "MISS");
   assert.equal((await second.json()).departures[0].trip_id, "early");
+
+  const secondCached = await request(`?stop_id=S&at=${at}`);
+  assert.equal(secondCached.status, 200);
+  assert.equal(secondCached.headers.get("X-Departure-Cache"), "HIT");
 });
 
 test("reports unknown stops and unbound providers", async () => {

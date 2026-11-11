@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use worker::wasm_bindgen::JsValue;
 use worker::{D1Database, D1Result, Result};
 
 use super::Parameters;
-use super::schedule::{Calendar, Exception, Service, Template};
+use super::schedule::{Calendar, Exception, ParsedService, Template};
 use crate::data::schema;
 
 const QUERY: &str = include_str!("sql/query.sql");
@@ -31,8 +32,24 @@ pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -
   } else {
     "NULL AS first_departure_time, NULL AS start_time, NULL AS end_time, NULL AS headway_secs, NULL AS frequency_trip_id, NULL AS exact_times".into()
   };
+  let stop_headsign = has("stop_times", "stop_headsign");
+  let trip_headsign = has("trips", "trip_headsign");
+  let headsign = match (stop_headsign, trip_headsign) {
+    (true, true) => "COALESCE(NULLIF(st.stop_headsign, ''), t.trip_headsign)",
+    (true, false) => "st.stop_headsign",
+    (false, true) => "t.trip_headsign",
+    (false, false) => "NULL",
+  };
+  let route_columns = format!(
+    "{}, {}, {}, {}",
+    if has("routes", "route_short_name") { "r.route_short_name" } else { "NULL AS route_short_name" },
+    if has("routes", "route_long_name") { "r.route_long_name" } else { "NULL AS route_long_name" },
+    if has("routes", "route_color") { "r.route_color" } else { "NULL AS route_color" },
+    if has("routes", "route_text_color") { "r.route_text_color" } else { "NULL AS route_text_color" },
+  );
   let sql = QUERY
-    .replace("__HEADSIGN__", if has("trips", "trip_headsign") { "t.trip_headsign" } else { "NULL" })
+    .replace("__ROUTE_COLUMNS__", &route_columns)
+    .replace("__HEADSIGN__", headsign)
     .replace("__FREQUENCY_COLUMNS__", &frequency_columns)
     .replace("__FREQUENCY_JOIN__", if frequencies { "LEFT JOIN frequencies f ON f.trip_id = t.trip_id" } else { "" })
     .replace(
@@ -54,19 +71,46 @@ pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -
     return Ok(templates);
   }
   let service_ids = serde_json::to_string(&templates.iter().map(|template| &template.service_id).collect::<HashSet<_>>())?;
-  let result = db.prepare("SELECT * FROM calendar WHERE service_id IN (SELECT value FROM json_each(?1))").bind(&[service_ids.clone().into()])?.all().await?;
-  let mut services: HashMap<String, Service> = HashMap::new();
-  for calendar in decode::<Calendar>(result)? {
-    services.entry(calendar.service_id.clone()).or_default().calendars.push(calendar);
+  let (calendars_result, exceptions_result) = if has("calendar_dates", "service_id") {
+    let mut results = db
+      .batch(vec![
+        db.prepare("SELECT * FROM calendar WHERE service_id IN (SELECT value FROM json_each(?1))").bind(&[service_ids.clone().into()])?,
+        db.prepare("SELECT * FROM calendar_dates WHERE service_id IN (SELECT value FROM json_each(?1))").bind(&[service_ids.into()])?,
+      ])
+      .await?;
+    let exceptions = results.pop().ok_or_else(|| worker::Error::RustError("Missing calendar_dates result".into()))?;
+    let calendars = results.pop().ok_or_else(|| worker::Error::RustError("Missing calendar result".into()))?;
+    (calendars, Some(exceptions))
+  } else {
+    let calendars = db.prepare("SELECT * FROM calendar WHERE service_id IN (SELECT value FROM json_each(?1))").bind(&[service_ids.into()])?.all().await?;
+    (calendars, None)
+  };
+  let calendars: Vec<Calendar> = decode(calendars_result)?;
+  let exceptions: Vec<Exception> = match exceptions_result {
+    Some(res) => decode(res)?,
+    None => Vec::new(),
+  };
+  let mut calendars_by_service: HashMap<String, Vec<Calendar>> = HashMap::new();
+  for calendar in calendars {
+    calendars_by_service.entry(calendar.service_id.clone()).or_default().push(calendar);
   }
-  if has("calendar_dates", "service_id") {
-    let result = db.prepare("SELECT * FROM calendar_dates WHERE service_id IN (SELECT value FROM json_each(?1))").bind(&[service_ids.into()])?.all().await?;
-    for exception in decode::<Exception>(result)? {
-      services.entry(exception.service_id.clone()).or_default().exceptions.push(exception);
+  let mut exceptions_by_service: HashMap<String, Vec<Exception>> = HashMap::new();
+  for exception in exceptions {
+    exceptions_by_service.entry(exception.service_id.clone()).or_default().push(exception);
+  }
+  let mut services: HashMap<String, Arc<ParsedService>> = HashMap::new();
+  for template in &templates {
+    if services.contains_key(&template.service_id) {
+      continue;
+    }
+    let c = calendars_by_service.get(&template.service_id).map(|v| v.as_slice()).unwrap_or(&[]);
+    let e = exceptions_by_service.get(&template.service_id).map(|v| v.as_slice()).unwrap_or(&[]);
+    if let Some(parsed) = ParsedService::build(c, e).map_err(|message| worker::Error::RustError(message.into()))? {
+      services.insert(template.service_id.clone(), Arc::new(parsed));
     }
   }
   for template in &mut templates {
-    template.service = services.get(&template.service_id).cloned().unwrap_or_default();
+    template.service = services.get(&template.service_id).cloned();
   }
   Ok(templates)
 }

@@ -14,7 +14,7 @@
 -- caller falls back to "Asia/Kuala_Lumpur".
 --
 -- Performance note:
--- Query plan relies on stop_times(stop_id, departure_time) index for range scan.
+-- Query plan relies on stop_times(stop_id, trip_id, stop_sequence) primary key index for stop_id lookup.
 -- Filters on route_id/direction_id apply during or after index lookup.
 --
 -- Parameters:
@@ -25,6 +25,7 @@
 SELECT
   st.trip_id,
   t.route_id,
+  __ROUTE_COLUMNS__,
   t.service_id,
   __HEADSIGN__ AS trip_headsign,
   t.direction_id,

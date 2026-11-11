@@ -1,6 +1,9 @@
 use serde::Deserialize;
 use std::{fs, path::PathBuf};
 
+#[path = "../../scripts/schema_parser.rs"]
+pub mod schema_parser;
+
 pub type CheckResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Deserialize)]
@@ -41,4 +44,10 @@ pub fn benchmark_options(default_rows: usize, default_iterations: usize) -> Chec
     }
   }
   Ok((rows, iterations))
+}
+
+pub fn median(mut samples: Vec<f64>) -> f64 {
+  samples.sort_by(f64::total_cmp);
+  let middle = samples.len() / 2;
+  if samples.len().is_multiple_of(2) { (samples[middle - 1] + samples[middle]) / 2.0 } else { samples[middle] }
 }

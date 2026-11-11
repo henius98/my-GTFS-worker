@@ -17,15 +17,11 @@ pub enum ConfigError {
 #[derive(Deserialize, Debug, Clone)]
 pub struct ProviderConfig {
   pub name: String,
-  #[serde(default = "default")]
+  #[serde(default)]
   pub is_active: bool,
   pub static_url: String,
   pub static_provider: String,
   pub database_id: String,
-}
-
-fn default() -> bool {
-  false
 }
 
 #[derive(Deserialize, Debug)]
@@ -108,13 +104,7 @@ impl RuntimeConfig {
     let query_statement_batch_size = bounded_usize("QUERY_STATEMENT_BATCH_SIZE", 1_000, 10_000)?;
     let d1_statements_per_request = bounded_usize("D1_STATEMENTS_PER_REQUEST", 4, 16)?;
     let max_d1_rows_written_per_workflow = positive_u64("MAX_D1_ROWS_WRITTEN_PER_WORKFLOW", crate::d1::DAILY_WRITE_LIMIT)?;
-    // if max_d1_rows_written_per_workflow > 100_000 {
-    //   return Err(ConfigError::InvalidEnvironment {
-    //     name: "MAX_D1_ROWS_WRITTEN_PER_WORKFLOW",
-    //     value: max_d1_rows_written_per_workflow.to_string(),
-    //     requirement: "must not exceed the D1 Free daily write allowance of 100,000 rows",
-    //   });
-    // }
+    // Enforced below against crate::d1::DAILY_WRITE_LIMIT and minimum statement-group + reserve capacity.
     let maximum_group_rows = u64::try_from(query_statement_batch_size).unwrap_or(u64::MAX).saturating_mul(u64::try_from(d1_statements_per_request).unwrap_or(u64::MAX));
     if max_d1_rows_written_per_workflow > crate::d1::DAILY_WRITE_LIMIT
       || maximum_group_rows.saturating_mul(2).saturating_add(crate::d1::METADATA_WRITE_RESERVE + crate::d1::LEDGER_WRITE_RESERVE) > max_d1_rows_written_per_workflow
@@ -134,7 +124,7 @@ impl RuntimeConfig {
       query_statement_batch_size,
       d1_statements_per_request,
       max_d1_rows_written_per_workflow,
-      max_rows_per_workflow: positive_u64_alias("MAX_ROWS_PER_WORKFLOW", "MAX_ROWS_PER_RUN", 1_750_000)?,
+      max_rows_per_workflow: positive_u64("MAX_ROWS_PER_WORKFLOW", 1_750_000)?,
       max_feed_download_bytes,
       max_uncompressed_feed_bytes,
       max_csv_record_bytes,
@@ -172,17 +162,6 @@ fn positive_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
     return Err(ConfigError::InvalidEnvironment { name, value, requirement: "must be greater than zero" });
   }
   Ok(parsed)
-}
-
-fn positive_u64_alias(primary: &'static str, legacy: &'static str, default: u64) -> Result<u64, ConfigError> {
-  if environment_value(primary).is_some() {
-    return positive_u64(primary, default);
-  }
-  if environment_value(legacy).is_some() {
-    println!("Configuration {legacy} is deprecated; use {primary} instead.");
-    return positive_u64(legacy, default);
-  }
-  Ok(default)
 }
 
 pub fn load_config(path: &str) -> Result<ProvidersToml, ConfigError> {

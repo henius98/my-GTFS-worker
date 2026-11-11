@@ -1,12 +1,10 @@
 SELECT
-  JSON_GROUP_ARRAY(JSON_ARRAY(Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt)) AS revision,
-  COALESCE(MAX(Status IS NOT 0), 0) AS importing
+  JSON_GROUP_ARRAY(JSON_ARRAY(FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt)) AS revision
 FROM
   (
-    SELECT Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt
+    SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt
     FROM
-      import_progress
+      "0_import_progress"
     ORDER BY
-      Provider,
       FileName
   )

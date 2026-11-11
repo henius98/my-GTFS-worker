@@ -20,13 +20,6 @@ fn parse_ttl_seconds(value: Option<&str>) -> i64 {
 #[derive(Deserialize)]
 pub(super) struct FeedState {
   revision: String,
-  importing: u8,
-}
-
-impl FeedState {
-  pub fn cacheable(&self) -> bool {
-    self.importing == 0
-  }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -161,5 +154,27 @@ mod tests {
     assert!(entry.select(when, entry.until + Duration::seconds(1), 5).is_none());
     let empty = cached_entry(0);
     assert!(empty.select(empty.from + Duration::seconds(30), empty.from + Duration::days(7) + Duration::seconds(30), 5).unwrap().is_empty());
+  }
+
+  #[test]
+  fn route_metadata_survives_cache_deserialization() {
+    let from: DateTime<Utc> = "2026-09-24T00:00:00Z".parse().unwrap();
+    let at = from + Duration::seconds(10);
+    let departure: Departure = serde_json::from_value(serde_json::json!({
+      "trip_id": "trip-1", "route_id": "R", "route_short_name": "KJL", "route_long_name": "Kelana Jaya",
+      "route_color": "E51B24", "route_text_color": "FFFFFF", "service_id": "daily",
+      "trip_headsign": "Gombak", "direction_id": 0, "stop_sequence": 2,
+      "service_date": "2026-09-24", "agency_timezone": "Asia/Kuala_Lumpur",
+      "headway_secs": null, "trip_start_secs": null, "estimate_method": "gtfs_schedule",
+      "departure_secs": 28810, "service_departure_time": "08:00:10",
+      "estimated_arrival_at": at, "estimated_departure_at": at, "wait_seconds": 10
+    }))
+    .unwrap();
+    let entry = Entry { stop: Stop { stop_id: "S".into(), stop_name: None }, from, until: from + Duration::days(7), departures: vec![departure] };
+    let json = serde_json::to_string(&entry).unwrap();
+    let restored: Entry = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.departures[0].route_short_name.as_deref(), Some("KJL"));
+    assert_eq!(restored.departures[0].route_color.as_deref(), Some("E51B24"));
+    assert_eq!(restored.departures[0].trip_headsign.as_deref(), Some("Gombak"));
   }
 }

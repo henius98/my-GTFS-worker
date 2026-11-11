@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -9,7 +9,6 @@ use crate::database;
 
 #[derive(Deserialize)]
 struct MapRoute {
-  route_id: String,
   route_short_name: Option<String>,
   route_long_name: Option<String>,
   route_color: Option<String>,
@@ -96,21 +95,13 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   };
   let filter = JsValue::from(&route_id);
 
-  let route_result = db.prepare("SELECT * FROM routes WHERE route_id = ?1 ORDER BY route_id").bind(std::slice::from_ref(&filter))?.all().await?;
+  let route_result = db.prepare("SELECT route_short_name, route_long_name, route_color FROM routes WHERE route_id = ?1 LIMIT 1").bind(std::slice::from_ref(&filter))?.all().await?;
   if !route_result.success() {
     return json_error(503, "Map data is unavailable");
   }
-  let routes = route_result
-    .results::<Value>()?
-    .into_iter()
-    .map(serde_json::from_value)
-    .collect::<std::result::Result<Vec<MapRoute>, _>>()?
-    .into_iter()
-    .map(|route| (route.route_id.clone(), route))
-    .collect::<HashMap<String, MapRoute>>();
-  if routes.is_empty() {
+  let Some(route) = route_result.results::<Value>()?.into_iter().next().map(serde_json::from_value::<MapRoute>).transpose()? else {
     return json_error(404, "Unknown route_id");
-  }
+  };
 
   let mut paths: BTreeMap<(String, String), Vec<[f64; 2]>> = BTreeMap::new();
   let has_shapes = crate::data::schema::has_column(provider, "shapes", "shape_id");
@@ -118,7 +109,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     let shape_result = db
       .prepare(
         "SELECT trip_shapes.route_id, trip_shapes.shape_id, shapes.shape_pt_lat AS lat, shapes.shape_pt_lon AS lng \
-         FROM (SELECT DISTINCT route_id, shape_id FROM trips WHERE shape_id IS NOT NULL AND (?1 IS NULL OR route_id = ?1)) AS trip_shapes \
+         FROM (SELECT DISTINCT route_id, shape_id FROM trips WHERE shape_id IS NOT NULL AND route_id = ?1) AS trip_shapes \
          JOIN shapes ON shapes.shape_id = trip_shapes.shape_id \
          ORDER BY trip_shapes.route_id, trip_shapes.shape_id, shapes.shape_pt_sequence",
       )
@@ -144,7 +135,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
            SELECT trips.route_id, stop_times.stop_id AS to_stop_id, \
                   LAG(stop_times.stop_id) OVER (PARTITION BY trips.trip_id ORDER BY stop_times.stop_sequence) AS from_stop_id \
            FROM trips JOIN stop_times ON stop_times.trip_id = trips.trip_id \
-           WHERE (?1 IS NULL OR trips.route_id = ?1) \
+           WHERE trips.route_id = ?1 \
          ) \
          SELECT DISTINCT consecutive.route_id, consecutive.from_stop_id, consecutive.to_stop_id, \
                 from_stop.stop_lat AS from_lat, from_stop.stop_lon AS from_lng, \
@@ -169,7 +160,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
       "SELECT DISTINCT trips.route_id, stops.stop_id, stops.stop_name, stops.stop_lat AS lat, stops.stop_lon AS lng \
        FROM trips JOIN stop_times ON stop_times.trip_id = trips.trip_id \
        JOIN stops ON stops.stop_id = stop_times.stop_id \
-       WHERE (?1 IS NULL OR trips.route_id = ?1) \
+       WHERE trips.route_id = ?1 \
        ORDER BY trips.route_id, stops.stop_id",
     )
     .bind(&[filter])?
@@ -185,7 +176,6 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     if points.len() < 2 {
       continue;
     }
-    let route = routes.get(&route_id);
     features.push(json!({
       "type": "Feature",
       "geometry": { "type": "LineString", "coordinates": points },
@@ -194,15 +184,14 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
         "route_id": route_id,
         "shape_id": shape_id,
         "geometry_source": "shape",
-        "route_short_name": route.and_then(|route| route.route_short_name.as_deref()),
-        "route_long_name": route.and_then(|route| route.route_long_name.as_deref()),
-        "route_color": route.and_then(|route| route.route_color.as_deref()),
+        "route_short_name": route.route_short_name.as_deref(),
+        "route_long_name": route.route_long_name.as_deref(),
+        "route_color": route.route_color.as_deref(),
       },
     }));
   }
   for segment in segments {
     if let (Some(from), Some(to)) = (coordinates(segment.from_lat, segment.from_lng), coordinates(segment.to_lat, segment.to_lng)) {
-      let route = routes.get(&segment.route_id);
       features.push(json!({
         "type": "Feature",
         "geometry": { "type": "LineString", "coordinates": [from, to] },
@@ -212,9 +201,9 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
           "from_stop_id": segment.from_stop_id,
           "to_stop_id": segment.to_stop_id,
           "geometry_source": "stop_sequence",
-          "route_short_name": route.and_then(|route| route.route_short_name.as_deref()),
-          "route_long_name": route.and_then(|route| route.route_long_name.as_deref()),
-          "route_color": route.and_then(|route| route.route_color.as_deref()),
+          "route_short_name": route.route_short_name.as_deref(),
+          "route_long_name": route.route_long_name.as_deref(),
+          "route_color": route.route_color.as_deref(),
         },
       }));
     }

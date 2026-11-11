@@ -12,7 +12,7 @@ pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Resp
 
   let admin_key = env.secret("WORKER_ADMIN_KEY").map(|s| s.to_string()).or_else(|_| env.var("WORKER_ADMIN_KEY").map(|v| v.to_string())).ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
 
-  let is_test = env.var("WORKER_TEST_NOW").is_ok() || env.var("WORKER_ALLOW_ANONYMOUS_SQL").map(|v| v.to_string()).as_deref() == Ok("true");
+  let is_test = env.var("WORKER_TEST_NOW").is_ok() || env.var("WORKER_ALLOW_ANONYMOUS_SQL").is_ok_and(|v| v.to_string() == "true");
 
   match admin_key {
     Some(expected_key) => {
@@ -40,10 +40,11 @@ pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Resp
   if sql.is_empty() {
     return Response::error("SQL query is required", 400);
   }
+  let sql_without_strings = strip_sql_strings(sql);
   if !sql.split_whitespace().next().is_some_and(|keyword| keyword.eq_ignore_ascii_case("SELECT") || keyword.eq_ignore_ascii_case("WITH"))
-    || sql.contains(';')
-    || sql.contains("--")
-    || sql.contains("/*")
+    || sql_without_strings.contains(';')
+    || sql_without_strings.contains("--")
+    || sql_without_strings.contains("/*")
   {
     return Response::error("Only one SELECT query without comments is allowed", 400);
   }
@@ -71,4 +72,61 @@ pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Resp
   let mut response = Response::ok(body)?;
   response.headers_mut().set("Content-Type", "application/json")?;
   Ok(response)
+}
+
+fn strip_sql_strings(s: &str) -> String {
+  let mut result = String::new();
+  let mut in_string = false;
+  let mut chars = s.chars().peekable();
+  while let Some(ch) = chars.next() {
+    match ch {
+      '\'' if !in_string => {
+        in_string = true;
+        result.push(' ');
+      }
+      '\'' if in_string => {
+        if chars.peek() == Some(&'\'') {
+          chars.next();
+          result.push(' ');
+          result.push(' ');
+        } else {
+          in_string = false;
+          result.push(' ');
+        }
+      }
+      _ if in_string => result.push(' '),
+      _ => result.push(ch),
+    }
+  }
+  result
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_strip_sql_strings_replaces_literals_with_whitespace() {
+    let sql = "SELECT * FROM routes WHERE desc = 'Express -- Non-stop; /* test */'";
+    let stripped = strip_sql_strings(sql);
+    assert!(!stripped.contains("--"));
+    assert!(!stripped.contains(';'));
+    assert!(!stripped.contains("/*"));
+    assert!(stripped.starts_with("SELECT * FROM routes WHERE desc = "));
+  }
+
+  #[test]
+  fn test_strip_sql_strings_escaped_quotes() {
+    let sql = "SELECT * FROM routes WHERE desc = 'it''s a -- test'";
+    let stripped = strip_sql_strings(sql);
+    assert!(!stripped.contains("--"));
+  }
+
+  #[test]
+  fn test_delimiters_outside_string_literals_detected() {
+    let sql = "SELECT * FROM routes WHERE desc = 'safe'; DROP TABLE routes; --";
+    let stripped = strip_sql_strings(sql);
+    assert!(stripped.contains(';'));
+    assert!(stripped.contains("--"));
+  }
 }

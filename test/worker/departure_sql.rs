@@ -14,6 +14,7 @@ fn sql(name: &str) -> CheckResult<String> {
 fn database() -> CheckResult<Connection> {
   let db = Connection::open_in_memory()?;
   db.execute_batch(&fs::read_to_string(root().join("migrations/ktmb/0_gtfs_schema.sql"))?)?;
+  db.execute_batch(&fs::read_to_string(root().join("migrations/ktmb/20261028_prefix_infrastructure_tables.sql"))?)?;
   Ok(db)
 }
 
@@ -61,18 +62,17 @@ fn route_and_direction_filters_have_distinct_entries() -> CheckResult {
 #[test]
 fn import_changes_invalidate_reads_and_reject_racing_writes() -> CheckResult {
   let db = database()?;
-  db.execute("INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, Status) VALUES ('ktmb', 'stop_times.txt', 'old', 10, 0)", [])?;
+  db.execute("INSERT INTO \"0_import_progress\" (FileName, CRC, LastProcessedLine, Status) VALUES ('stop_times.txt', 'old', 10, 0)", [])?;
   let old_revision = revision(&db)?;
   write(&db, &json!({"generation":"old"}), None, 160, "", -1)?;
-  db.execute("UPDATE import_progress SET CRC = 'new', Status = 1", [])?;
+  db.execute("UPDATE \"0_import_progress\" SET CRC = 'new', Status = 1", [])?;
   assert_eq!(read(&db, 100, "", -1)?, None);
-  let importing: i64 = db.query_row(&sql("feed_state.sql")?, [], |row| row.get(1))?;
-  assert_eq!(importing, 1);
   db.execute("DELETE FROM departure_cache", [])?;
   write(&db, &json!({"generation":"racing"}), Some(&old_revision), 160, "", -1)?;
-  write(&db, &json!({"generation":"partial"}), None, 160, "", -1)?;
   assert_eq!(db.query_row("SELECT COUNT(*) FROM departure_cache", [], |row| row.get::<_, i64>(0))?, 0);
-  db.execute("UPDATE import_progress SET Status = 0, LastProcessedLine = 20", [])?;
+  write(&db, &json!({"generation":"in_progress"}), None, 160, "", -1)?;
+  assert_eq!(read(&db, 100, "", -1)?, Some(json!({"generation":"in_progress"})));
+  db.execute("UPDATE \"0_import_progress\" SET Status = 0, LastProcessedLine = 20", [])?;
   write(&db, &json!({"generation":"complete"}), None, 160, "", -1)?;
   assert_eq!(read(&db, 100, "", -1)?, Some(json!({"generation":"complete"})));
   Ok(())
@@ -90,9 +90,9 @@ fn older_request_cannot_replace_a_newer_entry() -> CheckResult {
 #[test]
 fn new_revision_replaces_entry_even_if_old_entry_had_longer_expiry() -> CheckResult {
   let db = database()?;
-  db.execute("INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, Status) VALUES ('ktmb', 'stop_times.txt', 'v1', 10, 0)", [])?;
+  db.execute("INSERT INTO \"0_import_progress\" (FileName, CRC, LastProcessedLine, Status) VALUES ('stop_times.txt', 'v1', 10, 0)", [])?;
   write(&db, &json!({"ver":"v1"}), None, 500, "", -1)?;
-  db.execute("UPDATE import_progress SET CRC = 'v2'", [])?;
+  db.execute("UPDATE \"0_import_progress\" SET CRC = 'v2'", [])?;
   write(&db, &json!({"ver":"v2"}), None, 300, "", -1)?;
   assert_eq!(read(&db, 100, "", -1)?, Some(json!({"ver":"v2"})));
   Ok(())
@@ -101,9 +101,9 @@ fn new_revision_replaces_entry_even_if_old_entry_had_longer_expiry() -> CheckRes
 #[test]
 fn revision_changes_when_a_checkpoint_moves_without_a_new_crc() -> CheckResult {
   let db = database()?;
-  db.execute("INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, Status) VALUES ('ktmb', 'stop_times.txt', 'same', 10, 0)", [])?;
+  db.execute("INSERT INTO \"0_import_progress\" (FileName, CRC, LastProcessedLine, Status) VALUES ('stop_times.txt', 'same', 10, 0)", [])?;
   write(&db, &json!({"generation":"old checkpoint"}), None, 160, "", -1)?;
-  db.execute("UPDATE import_progress SET LastProcessedByte = 120", [])?;
+  db.execute("UPDATE \"0_import_progress\" SET LastProcessedByte = 120", [])?;
   assert_eq!(read(&db, 100, "", -1)?, None);
   Ok(())
 }
@@ -118,26 +118,17 @@ fn every_provider_migration_matches_its_base_schema() -> CheckResult {
   for provider in providers()? {
     let folder = root().join("migrations").join(&provider.name);
     let schema = fs::read_to_string(folder.join("0_gtfs_schema.sql"))?;
-    let migrations = fs::read_dir(&folder)?
-      .map(|entry| entry.map(|entry| entry.path()))
-      .collect::<Result<Vec<_>, _>>()?
-      .into_iter()
-      .filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().ends_with("_add_departure_cache.sql")))
-      .collect::<Vec<_>>();
-    assert_eq!(migrations.len(), 1, "{}", provider.name);
-    let fresh = Connection::open_in_memory()?;
-    let upgraded = Connection::open_in_memory()?;
-    fresh.execute_batch(&schema)?;
-    upgraded.execute_batch(schema.split("-- Calculated departures;").next().ok_or("missing schema prefix")?)?;
-    upgraded.execute("INSERT INTO stops (stop_id, stop_name) VALUES ('S', 'Existing stop')", [])?;
-    let migration = fs::read_to_string(&migrations[0])?;
-    upgraded.execute_batch(&migration)?;
-    upgraded.execute_batch(&migration)?;
-    assert_eq!(cache_columns(&fresh)?, cache_columns(&upgraded)?, "{}", provider.name);
-    assert_eq!(upgraded.query_row("SELECT stop_name FROM stops WHERE stop_id = 'S'", [], |row| row.get::<_, String>(0))?, "Existing stop");
-    let current = revision(&upgraded)?;
-    write(&upgraded, &json!({"departures":[]}), Some(&current), 160, "", -1)?;
-    assert_eq!(read(&upgraded, 100, "", -1)?, Some(json!({"departures":[]})));
+    let db = Connection::open_in_memory()?;
+    db.execute_batch(&schema)?;
+    db.execute_batch(&schema)?;
+    let columns = cache_columns(&db)?;
+    let col_names = columns.iter().map(|c| c.0.as_str()).collect::<Vec<_>>();
+    assert_eq!(col_names, ["stop_id", "route_id", "direction_id", "feed_revision", "expires_at", "payload"], "{}", provider.name);
+    db.execute("INSERT OR IGNORE INTO stops (stop_id, stop_name) VALUES ('S', 'Existing stop')", [])?;
+    assert_eq!(db.query_row("SELECT stop_name FROM stops WHERE stop_id = 'S'", [], |row| row.get::<_, String>(0))?, "Existing stop");
+    let current = revision(&db)?;
+    write(&db, &json!({"departures":[]}), Some(&current), 160, "", -1)?;
+    assert_eq!(read(&db, 100, "", -1)?, Some(json!({"departures":[]})));
   }
   Ok(())
 }

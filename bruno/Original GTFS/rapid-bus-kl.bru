@@ -1,0 +1,101 @@
+meta {
+  name: rapid-bus-kl original GTFS
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{staticBaseUrl}}/prasarana
+  body: none
+  auth: none
+}
+
+params:query {
+  category: rapid-bus-kl
+}
+
+headers {
+  ~If-None-Match: 
+}
+
+script:post-response {
+  if (typeof res.getDataBuffer !== 'function') {
+    console.log(" Enable Bruno Developer Mode (click the shield icon at top-right -> Developer Mode) to unzip binary GTFS archives.");
+    return;
+  }
+
+  const zlib = require('zlib');
+  const fs = require('fs');
+  const path = require('path');
+
+  const raw = res.getDataBuffer();
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+  if (!buf || buf.length < 30 || buf.readUInt32LE(0) !== 0x04034b50) {
+    console.log("No valid ZIP archive received (status: " + res.status + ")");
+    return;
+  }
+
+  let eocdOffset = -1;
+  for (let i = buf.length - 22; i >= 0; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) {
+      eocdOffset = i;
+      break;
+    }
+  }
+
+  if (eocdOffset === -1) {
+    console.log("Invalid ZIP archive: End of Central Directory not found");
+    return;
+  }
+
+  const outDir = path.join(bru.cwd(), 'Original GTFS', 'extracted', 'rapid-bus-kl');
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const cdOffset = buf.readUInt32LE(eocdOffset + 16);
+  const totalEntries = buf.readUInt16LE(eocdOffset + 10);
+  let offset = cdOffset;
+  let extractedCount = 0;
+
+  for (let i = 0; i < totalEntries && offset + 46 <= buf.length; i++) {
+    if (buf.readUInt32LE(offset) !== 0x02014b50) break;
+    const method = buf.readUInt16LE(offset + 10);
+    const compSize = buf.readUInt32LE(offset + 20);
+    const nameLen = buf.readUInt16LE(offset + 28);
+    const extraLen = buf.readUInt16LE(offset + 30);
+    const commentLen = buf.readUInt16LE(offset + 32);
+    const localOffset = buf.readUInt32LE(offset + 42);
+    const name = buf.toString('utf8', offset + 46, offset + 46 + nameLen);
+
+    if (localOffset + 30 <= buf.length && buf.readUInt32LE(localOffset) === 0x04034b50) {
+      const localNameLen = buf.readUInt16LE(localOffset + 26);
+      const localExtraLen = buf.readUInt16LE(localOffset + 28);
+      const dataStart = localOffset + 30 + localNameLen + localExtraLen;
+      const compData = buf.subarray(dataStart, dataStart + compSize);
+      if ((name.endsWith('.txt') || name.endsWith('.csv')) && !name.startsWith('__MACOSX')) {
+        let content;
+        if (method === 0) {
+          content = compData;
+        } else if (method === 8) {
+          content = zlib.inflateRawSync(compData);
+        }
+        if (content !== undefined) {
+          const safeName = path.basename(name).replace(/\.txt$/i, '.csv');
+          fs.writeFileSync(path.join(outDir, safeName), content);
+          extractedCount++;
+        }
+      }
+    }
+    offset += 46 + nameLen + extraLen + commentLen;
+  }
+
+  console.log("Extracted " + extractedCount + " files to " + outDir);
+}
+
+docs {
+  Generated from providers.toml by scripts/generate-bruno.py.
+  Regenerate with: python3 scripts/generate-bruno.py
+  Downloads the original GTFS static ZIP archive from data.gov.my.
+  Requires Bruno Developer Mode (click the shield icon at top-right -> Developer Mode).
+  The post-response script extracts all .csv files to bruno/Original GTFS/extracted/rapid-bus-kl/.
+  Set optional If-None-Match header with an ETag to check for feed updates (returns 304 if unchanged).
+}

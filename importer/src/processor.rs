@@ -20,9 +20,9 @@ use zip::ZipArchive;
 
 static TEMP_FEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_ARCHIVE_ENTRIES: usize = 256;
-// Every imported table has at most two indexes (primary/unique + secondary on stop_times). D1 bills one row
-// write for the table and up to two for indexes in the worst case.
-const MAX_D1_WRITES_PER_LOGICAL_ROW: u64 = 3;
+// Every imported table has at most one primary/unique index. D1 bills one row
+// write for the table and up to one for that index in the worst case.
+const MAX_D1_WRITES_PER_LOGICAL_ROW: u64 = 2;
 // The CSV reader buffers ahead. This small allowance lets it find the end of a
 // record before the exact byte-span check below rejects an oversized record.
 const CSV_RECORD_READ_AHEAD_BYTES: u64 = 64 * 1024;
@@ -235,6 +235,57 @@ pub fn parse_provider_schemas(provider_name: &str) -> Option<&'static [(&'static
 
 pub fn get_provider_schema_sql(provider_name: &str) -> Option<&'static [&'static str]> {
   include!(concat!(env!("OUT_DIR"), "/schema_sql.rs"))
+}
+
+pub fn provider_maintenance_queries(provider_name: &str) -> Vec<&'static str> {
+  match provider_name {
+    "rapid-bus-penang" => vec![
+      "DELETE FROM stop_times WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
+      "DELETE FROM trips WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
+      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
+      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
+    ],
+    "rapid-bus-mrtfeeder" => vec![
+      "DELETE FROM stop_times WHERE trip_id IN (SELECT trip_id FROM trips WHERE service_id IN (SELECT service_id FROM (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id UNION ALL SELECT service_id, MAX(date) AS max_end FROM calendar_dates WHERE exception_type = 1 GROUP BY service_id) GROUP BY service_id HAVING MAX(max_end) < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER)))",
+      "DELETE FROM trips WHERE service_id IN (SELECT service_id FROM (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id UNION ALL SELECT service_id, MAX(date) AS max_end FROM calendar_dates WHERE exception_type = 1 GROUP BY service_id) GROUP BY service_id HAVING MAX(max_end) < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
+      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
+      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
+      "DELETE FROM calendar_dates WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
+    ],
+    "ktmb" => vec![
+      "INSERT OR IGNORE INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES ('37200', 'LARKIN / TAMPOI HALTE', 1.5050, 103.7400)",
+      "DELETE FROM stop_times WHERE stop_sequence < 100 AND trip_id IN (SELECT trip_id FROM stop_times WHERE stop_sequence >= 100)",
+      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
+      "DELETE FROM stop_times WHERE trip_id IN (SELECT trip_id FROM trips WHERE service_id IN (SELECT service_id FROM (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id UNION ALL SELECT service_id, MAX(date) AS max_end FROM calendar_dates WHERE exception_type = 1 GROUP BY service_id) GROUP BY service_id HAVING MAX(max_end) < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER)))",
+      "DELETE FROM trips WHERE service_id IN (SELECT service_id FROM (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id UNION ALL SELECT service_id, MAX(date) AS max_end FROM calendar_dates WHERE exception_type = 1 GROUP BY service_id) GROUP BY service_id HAVING MAX(max_end) < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
+      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
+      "DELETE FROM calendar_dates WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
+    ],
+    "mybas-johor" => vec![
+      "DELETE FROM fare_leg_rules WHERE fare_product_id NOT IN (SELECT fare_product_id FROM fare_products)",
+      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
+      "DELETE FROM stop_times WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
+      "DELETE FROM trips WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
+      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
+    ],
+    "rapid-bus-kl" => vec![
+      "DELETE FROM frequencies WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
+      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
+      "DELETE FROM stop_times WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
+      "DELETE FROM trips WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
+      "DELETE FROM frequencies WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM trips)",
+      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
+    ],
+    "rapid-rail-kl" => vec![
+      "DELETE FROM frequencies WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
+      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
+      "DELETE FROM stop_times WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
+      "DELETE FROM trips WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
+      "DELETE FROM frequencies WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM trips)",
+      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
+    ],
+    _ => Vec::new(),
+  }
 }
 
 fn get_resume_state(row: Option<&serde_json::Value>, csv_file: &str, file_crc: &str, provider_name: &str) -> Option<Checkpoint> {
@@ -715,7 +766,7 @@ impl ProviderProcessor {
     };
 
     if upload.had_error {
-      self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, &self.provider.name, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
+      self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
       if let Err(error) = extraction {
         return Err(error);
       }
@@ -723,7 +774,7 @@ impl ProviderProcessor {
     }
 
     if upload.write_budget_exhausted {
-      self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, &self.provider.name, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
+      self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
       match extraction {
         Ok(_) | Err(ProcessorError::UploaderClosed) => {}
         Err(error) => return Err(error),
@@ -734,12 +785,12 @@ impl ProviderProcessor {
     let extraction = match extraction {
       Ok(extraction) => extraction,
       Err(error) => {
-        self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, &self.provider.name, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
+        self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
         return Err(error);
       }
     };
     if !producer_checkpoint_is_committed(extraction.checkpoint, upload.committed_through) {
-      self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, &self.provider.name, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
+      self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
       return Err(ProcessorError::D1(D1Error::ApiError(format!(
         "CSV producer reached row {} at byte {}, but only row {} at byte {} was committed",
         extraction.checkpoint.line, extraction.checkpoint.byte, upload.committed_through.line, upload.committed_through.byte,
@@ -751,7 +802,6 @@ impl ProviderProcessor {
       .update_file_progress(
         progress_reservation,
         &self.provider.database_id,
-        &self.provider.name,
         csv_file,
         extraction.checkpoint.line,
         extraction.checkpoint.byte,
@@ -784,7 +834,7 @@ fn discover_supported_files(
     let Some(table_name) = base_name.strip_suffix(".txt") else {
       continue;
     };
-    if matches!(table_name, "daily_import_budget" | "departure_cache") {
+    if matches!(table_name, "departure_cache" | "0_daily_import_budget" | "0_import_progress" | "0_dataset_versions") {
       continue;
     }
     let Some(db_columns) = schemas.iter().find(|(schema_table, _)| *schema_table == table_name).map(|(_, columns)| *columns) else {
@@ -835,7 +885,7 @@ pub async fn prepare_provider(
   let maximum_uncompressed_bytes = runtime.max_uncompressed_feed_bytes;
   let discovered = tokio::task::spawn_blocking(move || discover_supported_files(&scan_feed, &provider_name, schemas, maximum_uncompressed_bytes)).await??;
 
-  let progress_rows = d1_client.get_all_files_progress(&provider.database_id, &provider.name).await?;
+  let progress_rows = d1_client.get_all_files_progress(&provider.database_id).await?;
   let mut files = Vec::with_capacity(discovered.len());
   for file in discovered {
     let row = progress_rows.iter().find(|row| row.get("FileName").and_then(serde_json::Value::as_str) == Some(file.csv_file.as_str()));
@@ -847,14 +897,14 @@ pub async fn prepare_provider(
 
   if files.is_empty() {
     if !download.remote_etag.is_empty() {
-      d1_client.set_dataset_version(&provider.database_id, &provider.name, &download.remote_etag).await?;
+      d1_client.set_dataset_version(&provider.database_id, &download.remote_etag).await?;
     }
     println!("[{}] No files require import.", provider.name);
     return Ok(None);
   }
 
   let progress = files.iter().map(|file| FileProgressInit { file: &file.csv_file, crc: &file.crc, line: file.checkpoint.line, byte: file.checkpoint.byte }).collect::<Vec<_>>();
-  d1_client.init_files_progress(&provider.database_id, &provider.name, &progress).await?;
+  d1_client.init_files_progress(&provider.database_id, &progress).await?;
 
   Ok(Some(PreparedProvider { provider, download, files }))
 }
@@ -914,8 +964,15 @@ pub async fn process_prepared_provider(
   }
 
   remaining_files.sort_by(|left, right| left.csv_file.cmp(&right.csv_file));
-  if remaining_files.is_empty() && !download.remote_etag.is_empty() {
-    d1_client.set_dataset_version(&provider.database_id, &provider.name, &download.remote_etag).await?;
+  if remaining_files.is_empty() {
+    let maintenance_sqls = provider_maintenance_queries(&provider.name);
+    if !maintenance_sqls.is_empty() {
+      println!("[{}] All files imported. Running post-ingest data maintenance...", provider.name);
+      d1_client.execute_maintenance_statements(&provider.database_id, &maintenance_sqls).await?;
+    }
+    if !download.remote_etag.is_empty() {
+      d1_client.set_dataset_version(&provider.database_id, &download.remote_etag).await?;
+    }
   }
 
   let rows_processed = processor.rows_processed_this_run.load(Ordering::Relaxed);
@@ -942,7 +999,7 @@ async fn create_temporary_feed(storage: Arc<TempFeedStorage>) -> Result<(tokio::
 
 async fn download_feed(d1_client: &D1Client, provider: &ProviderConfig, maximum_bytes: u64, storage: Arc<TempFeedStorage>) -> Result<Option<DownloadedFeed>, ProcessorError> {
   let target_url = format!("{}{}", provider.static_url, provider.static_provider);
-  let previous_etag = d1_client.get_dataset_version(&provider.database_id, &provider.name).await?.unwrap_or_default();
+  let previous_etag = d1_client.get_dataset_version(&provider.database_id).await?.unwrap_or_default();
 
   println!("[{}] Fetching GTFS zip from {}", provider.name, target_url);
   let mut request = d1_client.client.get(&target_url);
@@ -952,7 +1009,7 @@ async fn download_feed(d1_client: &D1Client, provider: &ProviderConfig, maximum_
   let mut response = request.send().await?;
 
   if response.status() == StatusCode::NOT_MODIFIED {
-    let (total, incomplete) = d1_client.get_file_progress_summary(&provider.database_id, &provider.name).await?;
+    let (total, incomplete) = d1_client.get_file_progress_summary(&provider.database_id).await?;
     if total != 0 && incomplete == 0 {
       println!("[{}] Feed unchanged and all {} files are complete. Skipping.", provider.name, total);
       return Ok(None);
@@ -1118,10 +1175,11 @@ mod tests {
   #[test]
   fn upserts_preserve_primary_keys_and_skip_key_only_conflicts() {
     let keys = primary_keys("ktmb", "stop_times");
-    assert_eq!(keys, &["trip_id", "stop_sequence"]);
-    let sql = positional_insert_sql("stop_times", &["trip_id", "stop_sequence", "arrival_time"], keys);
+    assert_eq!(keys, &["stop_id", "trip_id", "stop_sequence"]);
+    let sql = positional_insert_sql("stop_times", &["stop_id", "trip_id", "stop_sequence", "arrival_time"], keys);
     let update = sql.split_once("DO UPDATE SET").map(|(_, update)| update).unwrap_or_default();
     assert!(update.contains("\"arrival_time\" = excluded.\"arrival_time\""));
+    assert!(!update.contains("\"stop_id\""));
     assert!(!update.contains("\"trip_id\""));
     assert!(!update.contains("\"stop_sequence\""));
     assert!(positional_insert_sql("stop_times", keys, keys).ends_with("DO NOTHING"));
@@ -1347,5 +1405,18 @@ database_id = "old-id"
     assert!(content.contains("database_id = \"old-id\""));
     drop(temporary);
     Ok(())
+  }
+
+  #[test]
+  fn provider_maintenance_queries_are_non_empty_for_known_providers() {
+    let providers = ["mybas-johor", "ktmb", "rapid-bus-mrtfeeder", "rapid-rail-kl", "rapid-bus-kl", "rapid-bus-penang"];
+    for provider in providers {
+      let queries = provider_maintenance_queries(provider);
+      assert!(!queries.is_empty(), "queries for {provider} should not be empty");
+      for query in queries {
+        assert!(query.starts_with("DELETE") || query.starts_with("INSERT"), "unexpected query in {provider}: {query}");
+      }
+    }
+    assert!(provider_maintenance_queries("unknown-provider").is_empty());
   }
 }

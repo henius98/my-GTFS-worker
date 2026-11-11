@@ -2,7 +2,7 @@
 //! SQLite JSON1 exercises the same JSON functions used by D1. Timings cover
 //! local SQL execution only, not Cloudflare network latency.
 
-use gtfs_checks::{CheckResult, benchmark_options};
+use gtfs_checks::{CheckResult, benchmark_options, median};
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value};
 use std::time::Instant;
@@ -17,12 +17,6 @@ fn rows(count: usize) -> Vec<Vec<String>> {
       vec![format!("route-{}", index % 50), (index % 2).to_string(), format!("trip-{}", index / 40), timestamp.clone(), timestamp, format!("stop-{}", index % 2000), (index % 100).to_string()]
     })
     .collect()
-}
-
-fn median(mut samples: Vec<f64>) -> f64 {
-  samples.sort_by(f64::total_cmp);
-  let middle = samples.len() / 2;
-  if samples.len().is_multiple_of(2) { (samples[middle - 1] + samples[middle]) / 2.0 } else { samples[middle] }
 }
 
 fn benchmark(db: &Connection, sql: &str, payload: &str, iterations: usize) -> CheckResult<f64> {
@@ -67,7 +61,7 @@ fn main() -> CheckResult {
   let positional_sql = format!("INSERT INTO stop_times ({quoted_columns}) SELECT {positional_selects} FROM json_each(?) WHERE TRUE{upsert}");
 
   let db = Connection::open_in_memory()?;
-  db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; CREATE TABLE stop_times (route_id TEXT, direction_id INTEGER, trip_id TEXT, arrival_time TEXT, departure_time TEXT, stop_id TEXT, stop_sequence INTEGER, PRIMARY KEY (trip_id, stop_sequence));")?;
+  db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; CREATE TABLE stop_times (route_id TEXT, direction_id INTEGER, trip_id TEXT, arrival_time TEXT, departure_time TEXT, stop_id TEXT, stop_sequence INTEGER, PRIMARY KEY (stop_id, trip_id, stop_sequence));")?;
   db.execute(&object_sql, params![object_payload])?;
   let object_result = inserted_rows(&db, &quoted_columns)?;
   db.execute("DELETE FROM stop_times", [])?;

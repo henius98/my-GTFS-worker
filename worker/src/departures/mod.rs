@@ -6,7 +6,6 @@ use chrono::{DateTime, Duration, Utc};
 use schedule::{Departure, next_departures};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
 use worker::{Date, Env, Method, Request, Response, Result, Url};
 
 use crate::database;
@@ -23,36 +22,47 @@ struct Parameters {
 
 impl Parameters {
   fn parse(url: &Url, now: DateTime<Utc>, cache_ttl_seconds: i64) -> std::result::Result<Self, &'static str> {
-    let mut values = HashMap::new();
+    let mut stop_id_raw = None;
+    let mut route_id_raw = None;
+    let mut direction_id_raw = None;
+    let mut limit_raw = None;
+    let mut at_raw = None;
+
     for (key, value) in url.query_pairs() {
-      if !matches!(key.as_ref(), "stop_id" | "route_id" | "direction_id" | "limit" | "at") {
-        return Err("Unknown query parameter");
-      }
-      if values.insert(key.into_owned(), value.into_owned()).is_some() {
+      let slot = match key.as_ref() {
+        "stop_id" => &mut stop_id_raw,
+        "route_id" => &mut route_id_raw,
+        "direction_id" => &mut direction_id_raw,
+        "limit" => &mut limit_raw,
+        "at" => &mut at_raw,
+        _ => return Err("Unknown query parameter"),
+      };
+      if slot.replace(value.into_owned()).is_some() {
         return Err("Duplicate query parameter");
       }
     }
-    let stop_id = values.remove("stop_id").ok_or("stop_id is required")?;
-    let route_id = values.remove("route_id");
-    for id in std::iter::once(&stop_id).chain(route_id.iter()) {
+    let stop_id = stop_id_raw.ok_or("stop_id is required")?;
+    let route_id = route_id_raw.map(|s| s.trim().to_owned());
+    for id in std::iter::once(&stop_id).chain(route_id.as_ref()) {
       if id.trim().is_empty() || id.len() > 256 {
         return Err("Identifiers must contain 1 to 256 bytes");
       }
     }
-    let direction_id = match values.remove("direction_id").as_deref() {
+    let stop_id = stop_id.trim().to_owned();
+    let direction_id = match direction_id_raw.as_deref() {
       None => None,
       Some("0") => Some(0),
       Some("1") => Some(1),
       _ => return Err("direction_id must be 0 or 1"),
     };
-    let limit = match values.remove("limit") {
+    let limit = match limit_raw {
       Some(value) if value.bytes().all(|b| b.is_ascii_digit()) => value.parse().ok(),
       Some(_) => None,
       None => Some(5),
     }
     .filter(|n| (1..=MAX_LIMIT).contains(n))
     .ok_or("limit must be between 1 and 100")?;
-    let when = match values.remove("at") {
+    let when = match at_raw {
       Some(value) => DateTime::parse_from_rfc3339(&value).map_err(|_| "at must be RFC3339 with a timezone, e.g. 2026-09-23T08:00:00Z")?.with_timezone(&Utc),
       None => now,
     };
@@ -106,8 +116,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str) -> Resu
 async fn calculate(db: &worker::D1Database, provider: &str, params: Parameters, now: DateTime<Utc>, cache_ttl_seconds: i64) -> Result<Response> {
   let until = params.when + Duration::days(schedule::SEARCH_DAYS);
   let mut state = match cache::feed_state(db).await {
-    Ok(state) if state.cacheable() => Some(state),
-    Ok(_) => None,
+    Ok(state) => Some(state),
     Err(error) => {
       worker::console_error!("Departure cache import state unavailable: {}", error);
       None

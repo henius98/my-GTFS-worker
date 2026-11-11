@@ -4,7 +4,7 @@ pub fn for_provider(env: &Env, provider: &str) -> Result<D1Database> {
   env.d1(&binding_name(provider))
 }
 
-pub fn binding_name(provider: &str) -> String {
+fn binding_name(provider: &str) -> String {
   format!("DB_{}", provider.to_uppercase().replace("-", "_"))
 }
 

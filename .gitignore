@@ -4,3 +4,5 @@ node_modules/
 .wrangler/
 .env
 __pycache__/
+backups/
+bruno/Original GTFS/extracted/

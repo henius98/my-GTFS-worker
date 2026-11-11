@@ -3,20 +3,16 @@
 -- ============================================================================
 -- Infrastructure Tables
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS logs (Id INTEGER PRIMARY KEY, Level TINYINT NOT NULL CHECK (Level IN (0, 1, 2, 3, 4, 5)), Message TEXT NOT NULL);
-
-CREATE TABLE IF NOT EXISTS import_progress (
-  Provider TEXT,
-  FileName TEXT,
+CREATE TABLE IF NOT EXISTS "0_import_progress" (
+  FileName TEXT PRIMARY KEY,
   CRC TEXT,
   LastProcessedLine INTEGER,
   LastProcessedByte INTEGER NOT NULL DEFAULT 0 CHECK (LastProcessedByte >= 0),
   Status TINYINT CHECK (Status IN (0, 1)), -- 0 = COMPLETED, 1 = IN_PROGRESS
-  UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (Provider, FileName)
+  UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS dataset_versions (Provider TEXT PRIMARY KEY, ETag TEXT, UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS "0_dataset_versions" (ETag TEXT, UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP);
 
 -- ============================================================================
 -- GTFS Tables (rapid-bus-mrtfeeder)
@@ -28,6 +24,9 @@ CREATE TABLE IF NOT EXISTS trips (
   trip_headsign TEXT,
   direction_id INTEGER,
   shape_id TEXT
+  -- FOREIGN KEY (route_id) REFERENCES routes(route_id),
+  -- FOREIGN KEY (service_id) REFERENCES calendar(service_id),
+  -- FOREIGN KEY (shape_id) REFERENCES shapes(shape_id)
 );
 
 CREATE TABLE IF NOT EXISTS calendar (
@@ -41,10 +40,17 @@ CREATE TABLE IF NOT EXISTS calendar (
   sunday BOOLEAN,
   start_date INTEGER,
   end_date INTEGER,
-  PRIMARY KEY (service_id, start_date, end_date)
+  PRIMARY KEY (service_id, start_date)
 );
 
-CREATE TABLE IF NOT EXISTS routes (route_id TEXT PRIMARY KEY, agency_id TEXT, route_short_name TEXT, route_long_name TEXT, route_type INTEGER);
+CREATE TABLE IF NOT EXISTS routes (
+  route_id TEXT PRIMARY KEY,
+  agency_id TEXT,
+  route_short_name TEXT,
+  route_long_name TEXT,
+  route_type INTEGER
+  -- FOREIGN KEY (agency_id) REFERENCES agency(agency_id)
+);
 
 CREATE TABLE IF NOT EXISTS shapes (
   shape_id TEXT,
@@ -65,17 +71,23 @@ CREATE TABLE IF NOT EXISTS stop_times (
   stop_sequence INTEGER,
   stop_headsign TEXT,
   shape_dist_traveled REAL,
-  PRIMARY KEY (trip_id, stop_sequence)
+  PRIMARY KEY (stop_id, trip_id, stop_sequence)
+  -- FOREIGN KEY (trip_id) REFERENCES trips(trip_id),
+  -- FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_stop_times_stop_departure ON stop_times (stop_id, departure_time);
 
 CREATE TABLE IF NOT EXISTS agency (agency_name TEXT, agency_url TEXT, agency_timezone TEXT, agency_phone TEXT, agency_lang TEXT);
 
 -- This provider publishes exactly one agency and does not provide agency_id.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_agency_single_row ON agency ((1));
 
-CREATE TABLE IF NOT EXISTS calendar_dates (service_id TEXT, date INTEGER, exception_type INTEGER, PRIMARY KEY (service_id, date));
+CREATE TABLE IF NOT EXISTS calendar_dates (
+  service_id TEXT,
+  date INTEGER,
+  exception_type INTEGER,
+  PRIMARY KEY (service_id, date)
+  -- FOREIGN KEY (service_id) REFERENCES calendar(service_id)
+);
 
 -- Calculated departures; empty route_id and direction_id -1 mean no filter.
 CREATE TABLE IF NOT EXISTS departure_cache (
@@ -86,4 +98,5 @@ CREATE TABLE IF NOT EXISTS departure_cache (
   expires_at INTEGER NOT NULL,
   payload TEXT NOT NULL,
   PRIMARY KEY (stop_id, route_id, direction_id)
+  -- FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
 );

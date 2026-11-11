@@ -46,7 +46,7 @@ fn main() -> CheckResult {
   }
   println!("Server is up!\n--- Running Integration Tests ---");
   let provider = "ktmb";
-  let valid_table = "import_progress";
+  let valid_table = "0_import_progress";
   let invalid_table = "this_table_does_not_exist";
 
   // 1. Test Valid Table
@@ -63,9 +63,9 @@ fn main() -> CheckResult {
   println!("✅ Invalid table test passed!");
 
   // 3. Test Include Column Selection
-  let data = get_json(&client, &format!("/{provider}/data/{valid_table}?include=Provider,Status&limit=2"))?;
+  let data = get_json(&client, &format!("/{provider}/data/{valid_table}?include=CRC,Status&limit=2"))?;
   for row in data_rows(&data, "include")? {
-    if row.get("Provider").is_none() || row.get("Status").is_none() || row.get("FileName").is_some() {
+    if row.get("CRC").is_none() || row.get("Status").is_none() || row.get("FileName").is_some() {
       return Err("include selection mismatch".into());
     }
   }
@@ -74,7 +74,7 @@ fn main() -> CheckResult {
   // 4. Test Exclude Column Selection
   let data = get_json(&client, &format!("/{provider}/data/{valid_table}?exclude=FileName&limit=2"))?;
   for row in data_rows(&data, "exclude")? {
-    if row.get("Provider").is_none() || row.get("FileName").is_some() {
+    if row.get("CRC").is_none() || row.get("FileName").is_some() {
       return Err("exclude selection mismatch".into());
     }
   }
@@ -124,7 +124,7 @@ fn main() -> CheckResult {
   println!("✅ Raw SQL selection test passed!");
 
   // 10. Test SQL route rejects writes and multiple statements
-  for sql in ["PRAGMA table_info(import_progress)", "SELECT 1; SELECT 2"] {
+  for sql in ["PRAGMA table_info(\"0_import_progress\")", "SELECT 1; SELECT 2"] {
     require_status(client.post(&sql_url).body(sql).send()?, StatusCode::BAD_REQUEST)?;
   }
   println!("✅ Invalid SQL tests passed!");
@@ -148,15 +148,79 @@ fn main() -> CheckResult {
   println!("✅ Invalid filter format tests passed!");
 
   // 15. Test invalid range format returns 400
-  for bad_range in ["Status[0:1:2]", "Status[08:00:00]", "Status[:]", "Status[::]"] {
+  for bad_range in [
+    "Status[0:1:2]",
+    "Status[08:00:00]",
+    "Status[:]",
+    "Status[::]",
+    "Status[:5:]",
+    "Status[..5..]",
+    "Status[5....]",
+    "Status[1..5..10]",
+    "Status[:5..10]",
+    "Status[5..10:]",
+    "Status[1...10]",
+    "Status[...]",
+  ] {
     require_status(get(&client, &format!("/{provider}/data/{valid_table}?range={bad_range}"))?, StatusCode::BAD_REQUEST)?;
   }
   println!("✅ Invalid range format tests passed!");
 
-  // 16. Test empty include and exclude return 400
+  // 16. Test conflicting include and exclude return 400
+  require_status(get(&client, &format!("/{provider}/data/{valid_table}?include=CRC&exclude=Status"))?, StatusCode::BAD_REQUEST)?;
+  println!("✅ Conflicting include/exclude 400 test passed!");
+
+  // 17. Test empty include and exclude return 400
   for bad_selection in ["include=", "include=   ", "exclude=", "exclude=   "] {
     require_status(get(&client, &format!("/{provider}/data/{valid_table}?{bad_selection}"))?, StatusCode::BAD_REQUEST)?;
   }
-  println!("✅ Empty include/exclude 400 tests passed!\nAll tests passed!");
+  println!("✅ Empty include/exclude 400 tests passed!");
+
+  // 18. Test case-insensitive table and column selection
+  let data = get_json(&client, &format!("/{provider}/data/0_IMPORT_PROGRESS?include=crc,status&limit=2"))?;
+  for row in data_rows(&data, "case-insensitive table and include")? {
+    if row.get("CRC").is_none() || row.get("Status").is_none() || row.get("FileName").is_some() {
+      return Err("case-insensitive include selection mismatch".into());
+    }
+  }
+
+  // Test case-insensitive exclude
+  let data = get_json(&client, &format!("/{provider}/data/{valid_table}?exclude=filename&limit=2"))?;
+  for row in data_rows(&data, "case-insensitive exclude")? {
+    if row.get("CRC").is_none() || row.get("FileName").is_some() {
+      return Err("case-insensitive exclude selection mismatch".into());
+    }
+  }
+
+  // Test case-insensitive sort
+  let data = get_json(&client, &format!("/{provider}/data/{valid_table}?sort=-status"))?;
+  let rows = data_rows(&data, "case-insensitive sort")?;
+  if rows.windows(2).any(|pair| pair[0]["Status"].as_i64().unwrap_or(i64::MIN) < pair[1]["Status"].as_i64().unwrap_or(i64::MIN)) {
+    return Err("case-insensitive sort order mismatch".into());
+  }
+
+  // Test contains (INSTR)
+  let data = get_json(&client, &format!("/{provider}/data/{valid_table}?contains=.zi@FileName"))?;
+  for row in data_rows(&data, "contains")? {
+    if !row["FileName"].as_str().unwrap_or_default().contains(".zi") {
+      return Err("contains filtering mismatch".into());
+    }
+  }
+
+  // Test Cache-Control header
+  let resp = get(&client, &format!("/{provider}/data/{valid_table}?limit=1"))?;
+  if resp.headers().get("Cache-Control").and_then(|v| v.to_str().ok()) != Some("public, max-age=60") {
+    return Err("missing or incorrect Cache-Control header on data endpoint".into());
+  }
+
+  // 19. Test malformed limit and offset return 400
+  require_status(get(&client, &format!("/{provider}/data/{valid_table}?limit=abc"))?, StatusCode::BAD_REQUEST)?;
+  require_status(get(&client, &format!("/{provider}/data/{valid_table}?offset=-1"))?, StatusCode::BAD_REQUEST)?;
+
+  // 20. Test duplicate query parameters return 400
+  require_status(get(&client, &format!("/{provider}/data/{valid_table}?include=CRC&include=Status"))?, StatusCode::BAD_REQUEST)?;
+  require_status(get(&client, &format!("/{provider}/data/{valid_table}?exclude=FileName&exclude=Status"))?, StatusCode::BAD_REQUEST)?;
+
+  println!("✅ Case-insensitive table and column selection tests passed!\nAll tests passed!");
   Ok(())
 }

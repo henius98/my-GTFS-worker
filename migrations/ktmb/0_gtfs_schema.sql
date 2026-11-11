@@ -3,36 +3,35 @@
 -- ============================================================================
 -- Infrastructure Tables
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS daily_import_budget (Id INTEGER PRIMARY KEY CHECK (Id = 1), DAY TEXT NOT NULL, Reserved INTEGER NOT NULL CHECK (Reserved >= 0));
+CREATE TABLE IF NOT EXISTS "0_daily_import_budget" (Id INTEGER PRIMARY KEY CHECK (Id = 1), DAY TEXT NOT NULL, Reserved INTEGER NOT NULL CHECK (Reserved >= 0));
 
 INSERT OR IGNORE INTO
-  daily_import_budget (Id, DAY, Reserved)
+  "0_daily_import_budget" (Id, DAY, Reserved)
 VALUES
   (1, '', 0);
 
-CREATE TABLE IF NOT EXISTS logs (
-  Id INTEGER PRIMARY KEY, -- timestamp + random number
-  Level TINYINT NOT NULL CHECK (Level IN (0, 1, 2, 3, 4, 5)),
-  Message TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS import_progress (
-  Provider TEXT,
-  FileName TEXT,
+CREATE TABLE IF NOT EXISTS "0_import_progress" (
+  FileName TEXT PRIMARY KEY,
   CRC TEXT,
   LastProcessedLine INTEGER,
   LastProcessedByte INTEGER NOT NULL DEFAULT 0 CHECK (LastProcessedByte >= 0),
   Status TINYINT CHECK (Status IN (0, 1)), -- 0 = COMPLETED, 1 = IN_PROGRESS
-  UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (Provider, FileName)
+  UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS dataset_versions (Provider TEXT PRIMARY KEY, ETag TEXT, UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS "0_dataset_versions" (ETag TEXT, UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP);
 
 -- ============================================================================
 -- GTFS Tables (ktmb)
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS trips (route_id TEXT, service_id TEXT, trip_id VARCHAR(20) PRIMARY KEY, direction_id INTEGER);
+CREATE TABLE IF NOT EXISTS trips (
+  route_id TEXT,
+  service_id TEXT,
+  trip_id VARCHAR(20) PRIMARY KEY,
+  direction_id INTEGER
+  -- FOREIGN KEY (route_id) REFERENCES routes(route_id),
+  -- FOREIGN KEY (service_id) REFERENCES calendar(service_id)
+);
 
 CREATE TABLE IF NOT EXISTS calendar (
   service_id TEXT,
@@ -45,10 +44,16 @@ CREATE TABLE IF NOT EXISTS calendar (
   sunday BOOLEAN,
   start_date INTEGER,
   end_date INTEGER,
-  PRIMARY KEY (service_id, start_date, end_date)
+  PRIMARY KEY (service_id, start_date)
 );
 
-CREATE TABLE IF NOT EXISTS calendar_dates (service_id TEXT, date INTEGER, exception_type INTEGER, PRIMARY KEY (service_id, date));
+CREATE TABLE IF NOT EXISTS calendar_dates (
+  service_id TEXT,
+  date INTEGER,
+  exception_type INTEGER,
+  PRIMARY KEY (service_id, date)
+  -- FOREIGN KEY (service_id) REFERENCES calendar(service_id)
+);
 
 CREATE TABLE IF NOT EXISTS routes (
   agency_id TEXT,
@@ -60,6 +65,7 @@ CREATE TABLE IF NOT EXISTS routes (
   route_url TEXT,
   route_color TEXT,
   route_text_color TEXT
+  -- FOREIGN KEY (agency_id) REFERENCES agency(agency_id)
 );
 
 CREATE TABLE IF NOT EXISTS stops (stop_id TEXT PRIMARY KEY, stop_name TEXT, stop_lat REAL, stop_lon REAL);
@@ -71,10 +77,10 @@ CREATE TABLE IF NOT EXISTS stop_times (
   stop_id TEXT,
   stop_sequence INTEGER,
   shape_dist_traveled REAL,
-  PRIMARY KEY (trip_id, stop_sequence)
+  PRIMARY KEY (stop_id, trip_id, stop_sequence)
+  -- FOREIGN KEY (trip_id) REFERENCES trips(trip_id),
+  -- FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_stop_times_stop_departure ON stop_times (stop_id, departure_time);
 
 CREATE TABLE IF NOT EXISTS agency (
   agency_id TEXT PRIMARY KEY,
@@ -94,4 +100,5 @@ CREATE TABLE IF NOT EXISTS departure_cache (
   expires_at INTEGER NOT NULL,
   payload TEXT NOT NULL,
   PRIMARY KEY (stop_id, route_id, direction_id)
+  -- FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
 );

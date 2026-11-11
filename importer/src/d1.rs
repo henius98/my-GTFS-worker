@@ -232,7 +232,7 @@ impl D1Client {
       return Err(D1Error::ApiError("Workflow budget is too small for metadata and ledger writes".into()));
     }
     let query = D1Query {
-      sql: "WITH allowance AS MATERIALIZED (SELECT MIN(?, ? - (CASE WHEN Day = date('now') THEN Reserved ELSE 0 END)) AS Granted FROM daily_import_budget WHERE Id = 1) UPDATE daily_import_budget SET Day = date('now'), Reserved = (CASE WHEN Day = date('now') THEN Reserved ELSE 0 END) + (SELECT Granted FROM allowance) WHERE Id = 1 AND date('now') = ? AND (SELECT Granted FROM allowance) > ? RETURNING (SELECT Granted FROM allowance) AS Granted",
+      sql: "WITH allowance AS MATERIALIZED (SELECT MIN(?, ? - (CASE WHEN Day = date('now') THEN Reserved ELSE 0 END)) AS Granted FROM \"0_daily_import_budget\" WHERE Id = 1) UPDATE \"0_daily_import_budget\" SET Day = date('now'), Reserved = (CASE WHEN Day = date('now') THEN Reserved ELSE 0 END) + (SELECT Granted FROM allowance) WHERE Id = 1 AND date('now') = ? AND (SELECT Granted FROM allowance) > ? RETURNING (SELECT Granted FROM allowance) AS Granted",
       params: vec![requested.into(), DAILY_WRITE_LIMIT.into(), day.clone().into(), (METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE).into()],
     };
     let (results, _) = self.execute_query_body(database_id, &query, 0).await?;
@@ -257,7 +257,7 @@ impl D1Client {
     };
     let unused = self.write_budget.state().remaining + self.metadata_budget.state().remaining;
     let query =
-      D1Query { sql: "UPDATE daily_import_budget SET Reserved = Reserved - ? WHERE Id = 1 AND Day = ? AND Reserved >= ?", params: vec![unused.into(), lease.day.clone().into(), unused.into()] };
+      D1Query { sql: "UPDATE \"0_daily_import_budget\" SET Reserved = Reserved - ? WHERE Id = 1 AND Day = ? AND Reserved >= ?", params: vec![unused.into(), lease.day.clone().into(), unused.into()] };
     // Never retry this subtraction: a lost response leaves a conservative lease.
     self.execute_query_body(&lease.database_id, &query, 0).await?;
     Ok(())
@@ -400,30 +400,39 @@ impl D1Client {
     self.rows_written.fetch_add(rows_written, Ordering::Relaxed);
   }
 
-  pub async fn get_dataset_version(&self, db_id: &str, provider_name: &str) -> Result<Option<String>, D1Error> {
-    let res = self.query(db_id, D1Query { sql: "SELECT ETag FROM dataset_versions WHERE Provider = ?", params: vec![serde_json::Value::String(provider_name.to_owned())] }).await?;
-    Ok(res.first().and_then(|result| result.results.first()).and_then(|row| row.get("ETag")).and_then(serde_json::Value::as_str).map(str::to_owned))
-  }
-
-  pub async fn set_dataset_version(&self, db_id: &str, provider: &str, etag: &str) -> Result<(), D1Error> {
-    self.query(
-            db_id,
-            D1Query {
-                sql: "INSERT INTO dataset_versions (Provider, ETag, UpdatedAt) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(Provider) DO UPDATE SET ETag = excluded.ETag, UpdatedAt = CURRENT_TIMESTAMP WHERE dataset_versions.ETag IS NOT excluded.ETag",
-                params: vec![serde_json::Value::String(provider.to_owned()), serde_json::Value::String(etag.to_owned())],
-            },
-        )
-        .await?;
-    Ok(())
-  }
-
-  pub async fn get_file_progress_summary(&self, db_id: &str, provider_name: &str) -> Result<(u64, u64), D1Error> {
+  pub async fn get_dataset_version(&self, db_id: &str) -> Result<Option<String>, D1Error> {
     let res = self
       .query(
         db_id,
         D1Query {
-          sql: "SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN Status != 0 THEN 1 ELSE 0 END), 0) AS incomplete FROM import_progress WHERE Provider = ?",
-          params: vec![serde_json::Value::String(provider_name.to_owned())],
+          sql: "SELECT ETag FROM \"0_dataset_versions\" ORDER BY rowid DESC LIMIT 1",
+          params: Vec::new(),
+        },
+      )
+      .await?;
+    Ok(res.first().and_then(|result| result.results.first()).and_then(|row| row.get("ETag")).and_then(serde_json::Value::as_str).map(str::to_owned))
+  }
+
+  pub async fn set_dataset_version(&self, db_id: &str, etag: &str) -> Result<(), D1Error> {
+    self
+      .query(
+        db_id,
+        D1Query {
+          sql: "INSERT INTO \"0_dataset_versions\" (ETag, UpdatedAt) VALUES (?, CURRENT_TIMESTAMP)",
+          params: vec![serde_json::Value::String(etag.to_owned())],
+        },
+      )
+      .await?;
+    Ok(())
+  }
+
+  pub async fn get_file_progress_summary(&self, db_id: &str) -> Result<(u64, u64), D1Error> {
+    let res = self
+      .query(
+        db_id,
+        D1Query {
+          sql: "SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN Status != 0 THEN 1 ELSE 0 END), 0) AS incomplete FROM \"0_import_progress\"",
+          params: Vec::new(),
         },
       )
       .await?;
@@ -433,26 +442,25 @@ impl D1Client {
     Ok((total, incomplete))
   }
 
-  pub async fn get_all_files_progress(&self, db_id: &str, provider_name: &str) -> Result<Vec<serde_json::Value>, D1Error> {
+  pub async fn get_all_files_progress(&self, db_id: &str) -> Result<Vec<serde_json::Value>, D1Error> {
     let res = self
       .query(
         db_id,
         D1Query {
-          sql: "SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status FROM import_progress WHERE Provider = ?",
-          params: vec![serde_json::Value::String(provider_name.to_owned())],
+          sql: "SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status FROM \"0_import_progress\"",
+          params: Vec::new(),
         },
       )
       .await?;
     Ok(res.into_iter().next().map(|result| result.results).unwrap_or_default())
   }
 
-  pub async fn init_files_progress(&self, db_id: &str, provider: &str, files: &[FileProgressInit<'_>]) -> Result<(), D1Error> {
+  pub async fn init_files_progress(&self, db_id: &str, files: &[FileProgressInit<'_>]) -> Result<(), D1Error> {
     let queries = files
       .iter()
       .map(|file| D1Query {
-        sql: "INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt) VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP) ON CONFLICT(Provider, FileName) DO UPDATE SET CRC = excluded.CRC, LastProcessedLine = excluded.LastProcessedLine, LastProcessedByte = excluded.LastProcessedByte, Status = 1, UpdatedAt = CURRENT_TIMESTAMP WHERE import_progress.CRC IS NOT excluded.CRC OR import_progress.LastProcessedLine IS NOT excluded.LastProcessedLine OR import_progress.LastProcessedByte IS NOT excluded.LastProcessedByte OR import_progress.Status IS NOT 1",
+        sql: "INSERT INTO \"0_import_progress\" (FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt) VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP) ON CONFLICT(FileName) DO UPDATE SET CRC = excluded.CRC, LastProcessedLine = excluded.LastProcessedLine, LastProcessedByte = excluded.LastProcessedByte, Status = 1, UpdatedAt = CURRENT_TIMESTAMP WHERE \"0_import_progress\".CRC IS NOT excluded.CRC OR \"0_import_progress\".LastProcessedLine IS NOT excluded.LastProcessedLine OR \"0_import_progress\".LastProcessedByte IS NOT excluded.LastProcessedByte OR \"0_import_progress\".Status IS NOT 1",
         params: vec![
-          serde_json::Value::String(provider.to_owned()),
           serde_json::Value::String(file.file.to_owned()),
           serde_json::Value::String(file.crc.to_owned()),
           serde_json::Value::Number(file.line.into()),
@@ -465,16 +473,15 @@ impl D1Client {
   }
 
   #[allow(clippy::too_many_arguments)]
-  pub async fn update_file_progress(&self, reservation: D1WriteReservation, db_id: &str, provider: &str, file: &str, line: u64, byte: u64, status: i64) -> Result<(), D1Error> {
+  pub async fn update_file_progress(&self, reservation: D1WriteReservation, db_id: &str, file: &str, line: u64, byte: u64, status: i64) -> Result<(), D1Error> {
     self.reserved_metadata_batch(
             db_id,
             &[D1Query {
-                sql: "UPDATE import_progress SET LastProcessedLine = ?, LastProcessedByte = ?, Status = ?, UpdatedAt = CURRENT_TIMESTAMP WHERE Provider = ? AND FileName = ? AND (LastProcessedLine IS NOT ? OR LastProcessedByte IS NOT ? OR Status IS NOT ?)",
+                sql: "UPDATE \"0_import_progress\" SET LastProcessedLine = ?, LastProcessedByte = ?, Status = ?, UpdatedAt = CURRENT_TIMESTAMP WHERE FileName = ? AND (LastProcessedLine IS NOT ? OR LastProcessedByte IS NOT ? OR Status IS NOT ?)",
                 params: vec![
                     serde_json::Value::Number(line.into()),
                     serde_json::Value::Number(byte.into()),
                     serde_json::Value::Number(status.into()),
-                    serde_json::Value::String(provider.to_owned()),
                     serde_json::Value::String(file.to_owned()),
                     serde_json::Value::Number(line.into()),
                     serde_json::Value::Number(byte.into()),
@@ -549,6 +556,14 @@ impl D1Client {
     // Keep retries disabled because an ambiguous DDL response is not
     // necessarily safe to replay.
     self.metadata_batch(db_id, &queries, queries.len() as u64 * 4).await?;
+    Ok(())
+  }
+
+  pub async fn execute_maintenance_statements(&self, db_id: &str, statements: &[&str]) -> Result<(), D1Error> {
+    for sql in statements {
+      let query = D1Query { sql, params: Vec::new() };
+      self.execute_query_body(db_id, &query, MAX_QUERY_RETRIES).await?;
+    }
     Ok(())
   }
 

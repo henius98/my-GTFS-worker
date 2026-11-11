@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 #[path = "../scripts/schema_parser.rs"]
 mod schema_parser;
-use schema_parser::{parse_schema_file, split_top_level_comma};
+use schema_parser::{parse_primary_keys_str, parse_schema_str};
 
 fn migration_sort_key(path: &Path) -> (u64, String) {
   let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
@@ -15,114 +15,62 @@ fn migration_sort_key(path: &Path) -> (u64, String) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
   println!("cargo:rerun-if-changed=../migrations");
   println!("cargo:rerun-if-changed=../scripts/schema_parser.rs");
-  let out_dir = env::var("OUT_DIR")?;
-  let dest_path = PathBuf::from(&out_dir).join("schemas.rs");
-
-  let mut generated_code = String::new();
-  generated_code.push_str("match provider_name {\n");
+  let out_dir = PathBuf::from(env::var("OUT_DIR")?);
 
   let migrations_dir = PathBuf::from("../migrations");
   let mut provider_dirs = if migrations_dir.exists() { fs::read_dir(&migrations_dir)?.map(|entry| entry.map(|entry| entry.path())).collect::<Result<Vec<_>, _>>()? } else { Vec::new() };
   provider_dirs.retain(|path| path.is_dir());
   provider_dirs.sort();
 
-  for path in &provider_dirs {
-    if let Some(provider_name) = path.file_name().and_then(|name| name.to_str()) {
-      let schema_path = path.join("0_gtfs_schema.sql");
-      if schema_path.exists() {
-        let parsed = parse_schema_file(&schema_path);
-        generated_code.push_str(&format!("    \"{}\" => Some(&[\n", provider_name));
-        for (table, cols) in parsed {
-          generated_code.push_str(&format!("        (\"{}\", &[\n", table));
-          for col in cols {
-            generated_code.push_str(&format!("            \"{}\",\n", col));
-          }
-          generated_code.push_str("        ]),\n");
-        }
-        generated_code.push_str("    ]),\n");
-      }
-    }
-  }
-
-  generated_code.push_str("    _ => None,\n");
-  generated_code.push_str("}\n");
-
-  fs::write(&dest_path, generated_code)?;
-
+  let mut generated_code = String::from("match provider_name {\n");
   let mut keys_code = String::from("match (provider_name, table_name) {\n");
+  let mut sql_code = String::from("match provider_name {\n");
+
   for path in &provider_dirs {
     let Some(provider_name) = path.file_name().and_then(|name| name.to_str()) else {
       continue;
     };
     let schema_path = path.join("0_gtfs_schema.sql");
-    if !schema_path.exists() {
-      continue;
-    }
-    let sql = fs::read_to_string(schema_path)?;
-    for statement in sql.split(';') {
-      let Some((_, definition)) = statement.split_once("CREATE TABLE IF NOT EXISTS ") else {
-        continue;
-      };
-      let Some((table, body)) = definition.split_once('(') else {
-        continue;
-      };
-      let body = body.trim();
-      let body_inner = body.strip_suffix(')').unwrap_or(body).trim();
-      let mut keys = Vec::new();
-      if let Some(pos) = body.to_uppercase().find("PRIMARY KEY") {
-        let after_pk = body[pos + "PRIMARY KEY".len()..].trim_start();
-        if let Some(after_paren) = after_pk.strip_prefix('(') {
-          if let Some((columns, _)) = after_paren.split_once(')') {
-            keys.extend(columns.split(',').map(str::trim));
-          }
-        } else {
-          for part in split_top_level_comma(body_inner) {
-            let part = part.trim();
-            if part.to_uppercase().contains("PRIMARY KEY")
-              && let Some(column) = part.split_whitespace().next()
-            {
-              keys.push(column);
-            }
-          }
+    if schema_path.exists() {
+      let sql = fs::read_to_string(&schema_path)?;
+      generated_code.push_str(&format!("    \"{}\" => Some(&[\n", provider_name));
+      for (table, cols) in parse_schema_str(&sql) {
+        generated_code.push_str(&format!("        (\"{}\", &[\n", table.to_ascii_lowercase()));
+        for col in cols {
+          generated_code.push_str(&format!("            \"{}\",\n", col));
         }
+        generated_code.push_str("        ]),\n");
       }
-      keys_code.push_str(&format!("    ({provider_name:?}, {:?}) => &{keys:?},\n", table.trim()));
+      generated_code.push_str("    ]),\n");
+
+      for (table_name, keys) in parse_primary_keys_str(&sql) {
+        let lower = table_name.to_ascii_lowercase();
+        keys_code.push_str(&format!("    ({provider_name:?}, {lower:?}) => &{keys:?},\n"));
+      }
+    }
+
+    let mut sql_files = fs::read_dir(path)?
+      .filter_map(|entry| entry.ok().map(|e| e.path()))
+      .filter(|sql_path| sql_path.is_file() && sql_path.extension().is_some_and(|extension| extension == "sql"))
+      .collect::<Vec<_>>();
+    sql_files.sort_by_cached_key(|path| migration_sort_key(path));
+
+    if !sql_files.is_empty() {
+      sql_code.push_str(&format!("    \"{}\" => Some(&[\n", provider_name));
+      for sql_path in sql_files {
+        let sql = fs::read_to_string(&sql_path)?;
+        sql_code.push_str(&format!("        r#\"{}\"#,\n", sql));
+      }
+      sql_code.push_str("    ]),\n");
     }
   }
+
+  generated_code.push_str("    _ => None,\n}\n");
   keys_code.push_str("    _ => &[],\n}\n");
-  fs::write(PathBuf::from(&out_dir).join("primary_keys.rs"), keys_code)?;
+  sql_code.push_str("    _ => None,\n}\n");
 
-  // Generate schema_sql.rs to embed the full SQL content for D1 database rotation
-  let sql_dest_path = PathBuf::from(&out_dir).join("schema_sql.rs");
-  let mut sql_code = String::new();
-  sql_code.push_str("match provider_name {\n");
-
-  for path in &provider_dirs {
-    if let Some(provider_name) = path.file_name().and_then(|name| name.to_str()) {
-      let mut sql_files = Vec::new();
-      for entry in fs::read_dir(path)? {
-        let sql_path = entry?.path();
-        if sql_path.is_file() && sql_path.extension().is_some_and(|extension| extension == "sql") {
-          sql_files.push(sql_path);
-        }
-      }
-
-      sql_files.sort_by_cached_key(|path| migration_sort_key(path));
-
-      if !sql_files.is_empty() {
-        sql_code.push_str(&format!("    \"{}\" => Some(&[\n", provider_name));
-        for schema_path in sql_files {
-          let sql = fs::read_to_string(&schema_path)?;
-          sql_code.push_str(&format!("        r#\"{}\"#,\n", sql));
-        }
-        sql_code.push_str("    ]),\n");
-      }
-    }
-  }
-
-  sql_code.push_str("    _ => None,\n");
-  sql_code.push_str("}\n");
-
-  fs::write(&sql_dest_path, sql_code)?;
+  fs::write(out_dir.join("schemas.rs"), generated_code)?;
+  fs::write(out_dir.join("primary_keys.rs"), keys_code)?;
+  fs::write(out_dir.join("schema_sql.rs"), sql_code)?;
   Ok(())
 }

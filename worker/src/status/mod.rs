@@ -6,7 +6,6 @@ use crate::database;
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct ImportProgress {
-  provider: Option<String>,
   file_name: Option<String>,
   #[serde(rename = "CRC")]
   crc: Option<String>,
@@ -38,7 +37,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   };
 
   // Fetch detailed import progress
-  let progress_results = match d1.prepare("SELECT Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM import_progress").all().await {
+  let progress_results = match d1.prepare("SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM \"0_import_progress\"").all().await {
     Ok(res) => res,
     Err(e) => return Response::error(format!("Database error: {}", e), 500),
   };

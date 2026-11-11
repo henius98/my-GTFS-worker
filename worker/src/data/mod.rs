@@ -19,22 +19,44 @@ pub(crate) struct RangeFilter<'a> {
   pub bounds: RangeBounds<'a>,
 }
 
+fn is_valid_range_time(s: &str) -> bool {
+  let colon_count = s.chars().filter(|&c| c == ':').count();
+  match colon_count {
+    1 => (s.len() == 4 || s.len() == 5) && s.split(':').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+    2 => (s.len() == 7 || s.len() == 8) && s.split(':').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+    _ => false,
+  }
+}
+
 pub(crate) fn parse_range_bounds(range_val: &str) -> std::result::Result<RangeBounds<'_>, &'static str> {
+  if range_val.contains("...") {
+    return Err("invalid range bounds separator");
+  }
+
   if let Some(end) = range_val.strip_prefix(':') {
-    if end.is_empty() || end.starts_with(':') {
+    if end.is_empty() || end.starts_with(':') || end.ends_with(':') || end.contains("..") {
+      return Err("empty or malformed open-start range");
+    }
+    if end.contains(':') && !is_valid_range_time(end) {
       return Err("empty or malformed open-start range");
     }
     return Ok(RangeBounds { begin: None, end: Some(end) });
   }
 
   if let Some(begin) = range_val.strip_suffix(':') {
-    if begin.is_empty() || begin.ends_with(':') {
+    if begin.is_empty() || begin.starts_with(':') || begin.ends_with(':') || begin.contains("..") {
+      return Err("empty or malformed open-end range");
+    }
+    if begin.contains(':') && !is_valid_range_time(begin) {
       return Err("empty or malformed open-end range");
     }
     return Ok(RangeBounds { begin: Some(begin), end: None });
   }
 
   let (begin, end) = if let Some((b, e)) = range_val.split_once("..") {
+    if b.contains("..") || e.contains("..") || b.starts_with(':') || b.ends_with(':') || e.starts_with(':') || e.ends_with(':') {
+      return Err("invalid range bounds");
+    }
     (b, e)
   } else {
     let colon_indices: Vec<usize> = range_val.match_indices(':').map(|(i, _)| i).collect();
@@ -59,8 +81,12 @@ pub(crate) fn parse_range_bounds(range_val: &str) -> std::result::Result<RangeBo
     }
   };
 
-  if begin.is_empty() && end.is_empty() {
-    return Err("empty range bounds");
+  if (begin.is_empty() && end.is_empty()) || begin.starts_with(':') || begin.ends_with(':') || end.starts_with(':') || end.ends_with(':') {
+    return Err("empty or malformed range bounds");
+  }
+
+  if (!begin.is_empty() && begin.contains(':') && !is_valid_range_time(begin)) || (!end.is_empty() && end.contains(':') && !is_valid_range_time(end)) {
+    return Err("invalid range bounds time format");
   }
 
   Ok(RangeBounds { begin: if begin.is_empty() { None } else { Some(begin) }, end: if end.is_empty() { None } else { Some(end) } })
@@ -118,11 +144,31 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
   if req.method() != Method::Get {
     return Response::error("Method Not Allowed", 405);
   }
-  let limit: u32 = url.query_pairs().find(|(k, _)| k == "limit").and_then(|(_, v)| v.parse::<u32>().ok()).map(|v| v.min(super::max_rows(env))).unwrap_or_else(|| super::max_rows(env)); // Enforce the configured maximum limit
-  let offset: u32 = url.query_pairs().find(|(k, _)| k == "offset").and_then(|(_, v)| v.parse::<u32>().ok()).unwrap_or(0);
 
-  let binding_name = database::binding_name(provider);
-  let d1 = match env.d1(&binding_name) {
+  let mut seen_keys = std::collections::HashSet::new();
+  for (k, _) in url.query_pairs() {
+    if !seen_keys.insert(k.to_string()) {
+      return Response::error(format!("Duplicate query parameter: {}", k), 400);
+    }
+  }
+
+  let limit: u32 = match url.query_pairs().find(|(k, _)| k == "limit") {
+    Some((_, v)) => match v.parse::<u32>() {
+      Ok(val) => val.min(super::max_rows(env)), // Enforce the configured maximum limit
+      Err(_) => return Response::error("Invalid limit parameter", 400),
+    },
+    None => super::max_rows(env), // Enforce the configured maximum limit
+  };
+
+  let offset: u32 = match url.query_pairs().find(|(k, _)| k == "offset") {
+    Some((_, v)) => match v.parse::<u32>() {
+      Ok(val) => val,
+      Err(_) => return Response::error("Invalid offset parameter", 400),
+    },
+    None => 0,
+  };
+
+  let d1 = match database::for_provider(env, provider) {
     Ok(db) => db,
     Err(_) => return database::provider_not_found(provider),
   };
@@ -133,35 +179,39 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
   };
 
   // Parse 'include' and 'exclude' from url
-  let mut selected_columns = "*".to_string();
-
   let include_cols: Option<Vec<String>> = url.query_pairs().find(|(k, _)| k == "include").map(|(_, v)| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
-
   let exclude_cols: Option<Vec<String>> = url.query_pairs().find(|(k, _)| k == "exclude").map(|(_, v)| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+  if include_cols.is_some() && exclude_cols.is_some() {
+    return Response::error("Cannot specify both include and exclude parameters", 400);
+  }
+
+  let mut selected_columns = "*".to_string();
 
   if let Some(cols) = include_cols {
     if cols.is_empty() {
       return Response::error("Include parameter cannot be empty", 400);
     }
+    let mut canonical_cols = Vec::new();
     for col in &cols {
-      if !valid_columns.contains(&col.as_str()) {
+      let Some(&canonical) = valid_columns.iter().find(|vc| vc.eq_ignore_ascii_case(col)) else {
         return Response::error(format!("Invalid include column: {}", col), 400);
-      }
+      };
+      canonical_cols.push(format!("\"{}\"", canonical));
     }
-    selected_columns = cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
+    selected_columns = canonical_cols.join(", ");
   } else if let Some(cols) = exclude_cols {
     if cols.is_empty() {
       return Response::error("Exclude parameter cannot be empty", 400);
     }
-    let mut final_cols = Vec::new();
-    for &valid_col in valid_columns {
-      if !cols.iter().any(|c| c == valid_col) {
-        final_cols.push(valid_col.to_string());
+    for col in &cols {
+      if !valid_columns.iter().any(|vc| vc.eq_ignore_ascii_case(col)) {
+        return Response::error(format!("Invalid exclude column: {}", col), 400);
       }
     }
-    for col in &cols {
-      if !valid_columns.contains(&col.as_str()) {
-        return Response::error(format!("Invalid exclude column: {}", col), 400);
+    let mut final_cols = Vec::new();
+    for &valid_col in valid_columns {
+      if !cols.iter().any(|c| c.eq_ignore_ascii_case(valid_col)) {
+        final_cols.push(valid_col);
       }
     }
     if final_cols.is_empty() {
@@ -189,16 +239,16 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
             return Response::error(format!("Invalid {} format. Expected val@col", k), 400);
           };
           let col = col.trim();
-          if col.is_empty() || !valid_columns.contains(&col) {
+          let Some(&canonical_col) = valid_columns.iter().find(|vc| vc.eq_ignore_ascii_case(col)) else {
             return Response::error(format!("Invalid filter column: {}", col), 400);
-          }
+          };
 
           if is_instr {
-            filter_clauses.push(format!("INSTR(\"{}\", ?{}) > 0", col, filter_clauses.len() + 1));
+            filter_clauses.push(format!("INSTR(\"{}\", ?{}) > 0", canonical_col, filter_clauses.len() + 1));
           } else if is_like {
-            filter_clauses.push(format!("\"{}\" LIKE ?{} ESCAPE '\\'", col, filter_clauses.len() + 1));
+            filter_clauses.push(format!("\"{}\" LIKE ?{} ESCAPE '\\'", canonical_col, filter_clauses.len() + 1));
           } else {
-            filter_clauses.push(format!("\"{}\" {} ?{}", col, operator, filter_clauses.len() + 1));
+            filter_clauses.push(format!("\"{}\" {} ?{}", canonical_col, operator, filter_clauses.len() + 1));
           }
 
           if is_like {
@@ -219,16 +269,16 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
             Err(err) => return Response::error(err, 400),
           };
 
-          if !valid_columns.contains(&range_filter.column) {
+          let Some(&canonical_col) = valid_columns.iter().find(|vc| vc.eq_ignore_ascii_case(range_filter.column)) else {
             return Response::error(format!("Invalid range column: {}", range_filter.column), 400);
-          }
+          };
 
           if let Some(begin) = range_filter.bounds.begin {
-            filter_clauses.push(format!("\"{}\" >= ?{}", range_filter.column, filter_clauses.len() + 1));
+            filter_clauses.push(format!("\"{}\" >= ?{}", canonical_col, filter_clauses.len() + 1));
             filter_values.push(begin.to_string());
           }
           if let Some(end) = range_filter.bounds.end {
-            filter_clauses.push(format!("\"{}\" <= ?{}", range_filter.column, filter_clauses.len() + 1));
+            filter_clauses.push(format!("\"{}\" <= ?{}", canonical_col, filter_clauses.len() + 1));
             filter_values.push(end.to_string());
           }
         }
@@ -238,6 +288,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
   }
 
   let mut sort_clauses = Vec::new();
+  let mut seen_sort_cols = std::collections::HashSet::new();
   if let Some((_, v)) = url.query_pairs().find(|(k, _)| k == "sort") {
     let cols: Vec<&str> = v.split(',').collect();
     for col in cols {
@@ -245,16 +296,16 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
       if col.is_empty() {
         continue;
       }
-      if let Some(col_name) = col.strip_prefix('-') {
-        if !valid_columns.contains(&col_name) {
-          return Response::error(format!("Invalid sort column: {}", col_name), 400);
+      let (col_name, is_desc) = if let Some(stripped) = col.strip_prefix('-') { (stripped, true) } else { (col, false) };
+      let Some(&canonical_col) = valid_columns.iter().find(|vc| vc.eq_ignore_ascii_case(col_name)) else {
+        return Response::error(format!("Invalid sort column: {}", col_name), 400);
+      };
+      if seen_sort_cols.insert(canonical_col.to_ascii_lowercase()) {
+        if is_desc {
+          sort_clauses.push(format!("\"{}\" DESC", canonical_col));
+        } else {
+          sort_clauses.push(format!("\"{}\" ASC", canonical_col));
         }
-        sort_clauses.push(format!("\"{}\" DESC", col_name));
-      } else {
-        if !valid_columns.contains(&col) {
-          return Response::error(format!("Invalid sort column: {}", col), 400);
-        }
-        sort_clauses.push(format!("\"{}\" ASC", col));
       }
     }
   }
@@ -264,7 +315,8 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
   let order_clause = if sort_clauses.is_empty() { "".to_string() } else { format!("ORDER BY {}", sort_clauses.join(", ")) };
 
   // Execute the paginated query
-  let query = format!("SELECT {} FROM \"{}\" {} {} LIMIT ?{} OFFSET ?{}", selected_columns, table_name, where_clause, order_clause, filter_clauses.len() + 1, filter_clauses.len() + 2);
+  let normalized_table_name = table_name.to_ascii_lowercase();
+  let query = format!("SELECT {} FROM \"{}\" {} {} LIMIT ?{} OFFSET ?{}", selected_columns, normalized_table_name, where_clause, order_clause, filter_clauses.len() + 1, filter_clauses.len() + 2);
 
   let mut params: Vec<worker::wasm_bindgen::JsValue> = Vec::new();
   for v in filter_values {
@@ -303,6 +355,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
   };
   let mut response = Response::ok(body)?;
   response.headers_mut().set("Content-Type", "application/json")?;
+  response.headers_mut().set("Cache-Control", "public, max-age=60")?;
   Ok(response)
 }
 
@@ -340,6 +393,16 @@ mod tests {
     assert!(parse_range_bounds("::").is_err());
     assert!(parse_range_bounds("0:1:2").is_err());
     assert!(parse_range_bounds("08:00:00").is_err());
+    assert!(parse_range_bounds(":5:").is_err());
+    assert!(parse_range_bounds("..5..").is_err());
+    assert!(parse_range_bounds("1..5..10").is_err());
+    assert!(parse_range_bounds("5....").is_err());
+    assert!(parse_range_bounds(":5..10").is_err());
+    assert!(parse_range_bounds("5..10:").is_err());
+    assert!(parse_range_bounds("1...10").is_err());
+    assert!(parse_range_bounds("...").is_err());
+    assert!(parse_range_bounds("1...").is_err());
+    assert!(parse_range_bounds("...10").is_err());
   }
 
   #[test]
@@ -353,5 +416,12 @@ mod tests {
     assert_eq!(parse_range_part("Status[08:00:00]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
     assert_eq!(parse_range_part("Status[:]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
     assert_eq!(parse_range_part("Status[::]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
+    assert_eq!(parse_range_part("Status[:5:]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
+    assert_eq!(parse_range_part("Status[..5..]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
+    assert_eq!(parse_range_part("Status[5....]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
+    assert_eq!(parse_range_part("Status[:5..10]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
+    assert_eq!(parse_range_part("Status[5..10:]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
+    assert_eq!(parse_range_part("Status[1...10]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
+    assert_eq!(parse_range_part("Status[...]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
   }
 }
