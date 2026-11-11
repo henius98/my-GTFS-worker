@@ -401,41 +401,18 @@ impl D1Client {
   }
 
   pub async fn get_dataset_version(&self, db_id: &str) -> Result<Option<String>, D1Error> {
-    let res = self
-      .query(
-        db_id,
-        D1Query {
-          sql: "SELECT ETag FROM \"0_dataset_versions\" ORDER BY rowid DESC LIMIT 1",
-          params: Vec::new(),
-        },
-      )
-      .await?;
+    let res = self.query(db_id, D1Query { sql: "SELECT ETag FROM \"0_dataset_versions\" ORDER BY rowid DESC LIMIT 1", params: Vec::new() }).await?;
     Ok(res.first().and_then(|result| result.results.first()).and_then(|row| row.get("ETag")).and_then(serde_json::Value::as_str).map(str::to_owned))
   }
 
   pub async fn set_dataset_version(&self, db_id: &str, etag: &str) -> Result<(), D1Error> {
-    self
-      .query(
-        db_id,
-        D1Query {
-          sql: "INSERT INTO \"0_dataset_versions\" (ETag, UpdatedAt) VALUES (?, CURRENT_TIMESTAMP)",
-          params: vec![serde_json::Value::String(etag.to_owned())],
-        },
-      )
-      .await?;
+    self.query(db_id, D1Query { sql: "INSERT INTO \"0_dataset_versions\" (ETag, UpdatedAt) VALUES (?, CURRENT_TIMESTAMP)", params: vec![serde_json::Value::String(etag.to_owned())] }).await?;
     Ok(())
   }
 
   pub async fn get_file_progress_summary(&self, db_id: &str) -> Result<(u64, u64), D1Error> {
-    let res = self
-      .query(
-        db_id,
-        D1Query {
-          sql: "SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN Status != 0 THEN 1 ELSE 0 END), 0) AS incomplete FROM \"0_import_progress\"",
-          params: Vec::new(),
-        },
-      )
-      .await?;
+    let res =
+      self.query(db_id, D1Query { sql: "SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN Status != 0 THEN 1 ELSE 0 END), 0) AS incomplete FROM \"0_import_progress\"", params: Vec::new() }).await?;
     let row = res.first().and_then(|result| result.results.first());
     let total = row.and_then(|value| value.get("total")).and_then(serde_json::Value::as_u64).unwrap_or(0);
     let incomplete = row.and_then(|value| value.get("incomplete")).and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -443,15 +420,7 @@ impl D1Client {
   }
 
   pub async fn get_all_files_progress(&self, db_id: &str) -> Result<Vec<serde_json::Value>, D1Error> {
-    let res = self
-      .query(
-        db_id,
-        D1Query {
-          sql: "SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status FROM \"0_import_progress\"",
-          params: Vec::new(),
-        },
-      )
-      .await?;
+    let res = self.query(db_id, D1Query { sql: "SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status FROM \"0_import_progress\"", params: Vec::new() }).await?;
     Ok(res.into_iter().next().map(|result| result.results).unwrap_or_default())
   }
 

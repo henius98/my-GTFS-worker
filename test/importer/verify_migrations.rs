@@ -83,10 +83,9 @@ fn validate_legacy_progress_upgrade(directory: &Path) -> CheckResult {
   let db = Connection::open_in_memory()?;
   db.execute_batch("CREATE TABLE logs (Id INTEGER PRIMARY KEY, Level TINYINT NOT NULL, Message TEXT NOT NULL); CREATE TABLE import_progress (Provider TEXT, FileName TEXT, CRC TEXT, LastProcessedLine INTEGER, LastProcessedByte INTEGER NOT NULL DEFAULT 0, Status TINYINT CHECK (Status IN (0, 1)), UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (Provider, FileName)); INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt) VALUES ('legacy-provider', 'stops.txt', 'legacy-crc', 17, 128, 1, '2026-08-30 00:00:00'); CREATE TABLE dataset_versions (Provider TEXT PRIMARY KEY, ETag TEXT, UpdatedAt DATETIME); INSERT INTO dataset_versions (Provider, ETag, UpdatedAt) VALUES ('legacy-provider', 'etag-1', '2026-08-30 00:00:00');")?;
   db.execute_batch(&fs::read_to_string(prefix_file)?)?;
-  let migrated: (String, String, i64, i64, i64, String) =
-    db.query_row("SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM \"0_import_progress\"", [], |row| {
-      Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
-    })?;
+  let migrated: (String, String, i64, i64, i64, String) = db.query_row("SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM \"0_import_progress\"", [], |row| {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+  })?;
   if migrated != ("stops.txt".into(), "legacy-crc".into(), 17, 128, 1, "2026-08-30 00:00:00".into()) {
     return Err(format!("0_import_progress row changed during prefix migration: {migrated:?}").into());
   }

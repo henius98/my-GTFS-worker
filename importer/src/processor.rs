@@ -799,14 +799,7 @@ impl ProviderProcessor {
 
     self
       .d1_client
-      .update_file_progress(
-        progress_reservation,
-        &self.provider.database_id,
-        csv_file,
-        extraction.checkpoint.line,
-        extraction.checkpoint.byte,
-        if extraction.file_done { 0 } else { 1 },
-      )
+      .update_file_progress(progress_reservation, &self.provider.database_id, csv_file, extraction.checkpoint.line, extraction.checkpoint.byte, if extraction.file_done { 0 } else { 1 })
       .await?;
     Ok(extraction)
   }

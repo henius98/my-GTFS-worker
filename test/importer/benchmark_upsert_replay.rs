@@ -6,13 +6,14 @@ use gtfs_checks::{CheckResult, benchmark_options, median};
 use rusqlite::{Connection, params};
 use std::time::Instant;
 
-const REPLACE_SQL: &str =
-  "INSERT OR REPLACE INTO stop_times (stop_id, trip_id, stop_sequence, arrival_time) SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]') FROM json_each(?)";
+const REPLACE_SQL: &str = "INSERT OR REPLACE INTO stop_times (stop_id, trip_id, stop_sequence, arrival_time) SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]') FROM json_each(?)";
 const CONDITIONAL_SQL: &str = "INSERT INTO stop_times (stop_id, trip_id, stop_sequence, arrival_time) SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]') FROM json_each(?) WHERE TRUE ON CONFLICT DO UPDATE SET stop_id = excluded.stop_id, trip_id = excluded.trip_id, stop_sequence = excluded.stop_sequence, arrival_time = excluded.arrival_time WHERE stop_times.stop_id IS NOT excluded.stop_id OR stop_times.trip_id IS NOT excluded.trip_id OR stop_times.stop_sequence IS NOT excluded.stop_sequence OR stop_times.arrival_time IS NOT excluded.arrival_time";
 
 fn benchmark(sql: &str, payload: &str, iterations: usize) -> CheckResult<(f64, Vec<u64>, i64)> {
   let db = Connection::open_in_memory()?;
-  db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; CREATE TABLE stop_times (stop_id TEXT, trip_id TEXT, stop_sequence INTEGER, arrival_time TEXT, PRIMARY KEY (stop_id, trip_id, stop_sequence));")?;
+  db.execute_batch(
+    "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; CREATE TABLE stop_times (stop_id TEXT, trip_id TEXT, stop_sequence INTEGER, arrival_time TEXT, PRIMARY KEY (stop_id, trip_id, stop_sequence));",
+  )?;
   db.execute(REPLACE_SQL, params![payload])?;
   for _ in 0..3 {
     db.execute(sql, params![payload])?;
@@ -32,7 +33,9 @@ fn benchmark(sql: &str, payload: &str, iterations: usize) -> CheckResult<(f64, V
 
 fn main() -> CheckResult {
   let (rows, iterations) = benchmark_options(50_000, 9)?;
-  let payload = serde_json::to_string(&(0..rows).map(|index| [format!("stop-{}", index % 2000), format!("trip-{}", index / 40), (index % 40).to_string(), format!("{:02}:00:00", index % 24)]).collect::<Vec<_>>())?;
+  let payload = serde_json::to_string(
+    &(0..rows).map(|index| [format!("stop-{}", index % 2000), format!("trip-{}", index / 40), (index % 40).to_string(), format!("{:02}:00:00", index % 24)]).collect::<Vec<_>>(),
+  )?;
   let (replace_ms, replace_changes, replace_rows) = benchmark(REPLACE_SQL, &payload, iterations)?;
   let (conditional_ms, conditional_changes, conditional_rows) = benchmark(CONDITIONAL_SQL, &payload, iterations)?;
   println!("rows={rows} iterations={iterations}");

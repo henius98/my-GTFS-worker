@@ -94,12 +94,7 @@ impl ParsedService {
     let (Some(calendar_start), Some(calendar_end)) = (dates.iter().min().copied(), dates.iter().max().copied()) else {
       return Ok(None);
     };
-    Ok(Some(Self {
-      calendars: parsed_calendars,
-      exceptions: parsed_exceptions,
-      calendar_start,
-      calendar_end,
-    }))
+    Ok(Some(Self { calendars: parsed_calendars, exceptions: parsed_exceptions, calendar_start, calendar_end }))
   }
 }
 
@@ -232,8 +227,7 @@ fn sort_and_dedup_candidates(candidates: &mut Vec<Candidate>, prepared: &[Prepar
   candidates.sort_by(|a, b| {
     let ta = &prepared[a.template_idx].template;
     let tb = &prepared[b.template_idx].template;
-    (a.estimated_departure_at, &ta.trip_id, a.service_date, a.trip_start_secs, ta.stop_sequence)
-      .cmp(&(b.estimated_departure_at, &tb.trip_id, b.service_date, b.trip_start_secs, tb.stop_sequence))
+    (a.estimated_departure_at, &ta.trip_id, a.service_date, a.trip_start_secs, ta.stop_sequence).cmp(&(b.estimated_departure_at, &tb.trip_id, b.service_date, b.trip_start_secs, tb.stop_sequence))
   });
   candidates.dedup_by(|a, b| {
     let ta = &prepared[a.template_idx].template;
@@ -304,20 +298,7 @@ pub(crate) fn next_departures(templates: &[Template], when: DateTime<Utc>, until
     if earliest > latest {
       continue;
     }
-    prepared.push(PreparedTemplate {
-      template: t,
-      timezone,
-      timezone_name,
-      start,
-      end,
-      headway,
-      first_departure,
-      departure_offset,
-      arrival_offset,
-      earliest,
-      latest,
-      parsed_service,
-    });
+    prepared.push(PreparedTemplate { template: t, timezone, timezone_name, start, end, headway, first_departure, departure_offset, arrival_offset, earliest, latest, parsed_service });
   }
 
   if prepared.is_empty() {
@@ -339,9 +320,7 @@ pub(crate) fn next_departures(templates: &[Template], when: DateTime<Utc>, until
       }
       let active = match p.parsed_service.exceptions.get(&current_date) {
         Some(kind) => *kind == 1,
-        None => p.parsed_service.calendars.iter().any(|calendar| {
-          current_date >= calendar.start_date && current_date <= calendar.end_date && calendar.active(current_date)
-        }),
+        None => p.parsed_service.calendars.iter().any(|calendar| current_date >= calendar.start_date && current_date <= calendar.end_date && calendar.active(current_date)),
       };
       if !active {
         continue;
@@ -696,10 +675,7 @@ mod tests {
   fn calendar_dates_cancel_and_add_service_outside_calendar_ranges() {
     let mut cal = default_calendar();
     cal.end_date = 20260827;
-    let exceptions = vec![
-      Exception { service_id: "weekday-id".into(), date: 20260827, exception_type: 2 },
-      Exception { service_id: "weekday-id".into(), date: 20260829, exception_type: 1 },
-    ];
+    let exceptions = vec![Exception { service_id: "weekday-id".into(), date: 20260827, exception_type: 2 }, Exception { service_id: "weekday-id".into(), date: 20260829, exception_type: 1 }];
     let mut t = scheduled_template();
     t.service = ParsedService::build(&[cal], &exceptions).unwrap().map(Arc::new);
     let rows = next_departures(&[t.clone()], dt("2026-08-27T06:00:00+08:00"), 5).unwrap();
