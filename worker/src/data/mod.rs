@@ -28,6 +28,20 @@ fn is_valid_range_time(s: &str) -> bool {
   }
 }
 
+fn parse_range_time_secs(s: &str) -> Option<u32> {
+  let mut parts = s.split(':');
+  let hours: u32 = parts.next()?.parse().ok()?;
+  let minutes: u32 = parts.next()?.parse().ok()?;
+  let seconds: u32 = match parts.next() {
+    Some(sec) => sec.parse().ok()?,
+    None => 0,
+  };
+  if parts.next().is_some() {
+    return None;
+  }
+  hours.checked_mul(3600)?.checked_add(minutes * 60 + seconds)
+}
+
 pub(crate) fn parse_range_bounds(range_val: &str) -> std::result::Result<RangeBounds<'_>, &'static str> {
   if range_val.contains("...") {
     return Err("invalid range bounds separator");
@@ -68,12 +82,17 @@ pub(crate) fn parse_range_bounds(range_val: &str) -> std::result::Result<RangeBo
         let right_1 = &range_val[idx1 + 1..];
         let left_2 = &range_val[..idx2];
         let right_2 = &range_val[idx2 + 1..];
-        if (left_2.len() == 7 || left_2.len() == 8) && (right_2.len() == 4 || right_2.len() == 5) {
-          (left_2, right_2)
-        } else if (left_1.len() == 4 || left_1.len() == 5) && (right_1.len() == 7 || right_1.len() == 8) {
-          (left_1, right_1)
-        } else {
-          return Err("invalid range bounds separator");
+        let valid_1 = is_valid_range_time(left_1) && is_valid_range_time(right_1);
+        let valid_2 = is_valid_range_time(left_2) && is_valid_range_time(right_2);
+        match (valid_1, valid_2) {
+          (true, true) => {
+            let ordered_1 = parse_range_time_secs(left_1).zip(parse_range_time_secs(right_1)).is_some_and(|(a, b)| a <= b);
+            let ordered_2 = parse_range_time_secs(left_2).zip(parse_range_time_secs(right_2)).is_some_and(|(a, b)| a <= b);
+            if ordered_1 && !ordered_2 { (left_1, right_1) } else { (left_2, right_2) }
+          }
+          (false, true) => (left_2, right_2),
+          (true, false) => (left_1, right_1),
+          (false, false) => return Err("invalid range bounds separator"),
         }
       }
       [_, _, split_idx, _, _] => (&range_val[..split_idx], &range_val[split_idx + 1..]),

@@ -537,7 +537,7 @@ mod tests {
     let t = template_with_service(cal, vec![]);
     let rows = next_departures(&[t.clone(), t.clone()], dt("2026-08-27T06:00:00+08:00"), 20).unwrap();
     assert_eq!(rows.len(), 6);
-    assert!(next_departures(&[t.clone()], dt("2026-08-28T06:00:00+08:00"), 5).unwrap().is_empty());
+    assert!(next_departures(std::slice::from_ref(&t), dt("2026-08-28T06:00:00+08:00"), 5).unwrap().is_empty());
     assert!(next_departures(&[t], dt("2026-08-19T06:00:00+08:00"), 5).unwrap().is_empty());
   }
 
@@ -547,7 +547,7 @@ mod tests {
     cal.start_date = 20260903;
     cal.end_date = 20260903;
     let t = template_with_service(cal, vec![]);
-    assert!(next_departures(&[t.clone()], dt("2026-08-27T06:10:00+08:00"), 5).unwrap().is_empty());
+    assert!(next_departures(std::slice::from_ref(&t), dt("2026-08-27T06:10:00+08:00"), 5).unwrap().is_empty());
     assert_eq!(next_departures(&[t], dt("2026-08-27T06:10:00.001+08:00"), 5).unwrap().len(), 1);
     let rows = next_departures(&[template()], dt("2026-08-27T06:10:00.001+08:00"), 1).unwrap();
     assert_eq!(rows[0].service_departure_time, "06:20:00");

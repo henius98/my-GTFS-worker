@@ -11,7 +11,6 @@ The application is a Cargo Workspace containing two distinct environments:
 
 ## 2. Eval-Driven Development (EDD)
 
-- Direct bash testing is restricted due to strict global rules ("Never run terminal commands for compiling...").
 - To verify logic, all Rust refactoring must pass an LLM-as-a-Judge code-verification stage before merging.
 - Any manual compilation validation must be flagged to the human user for out-of-band execution.
 

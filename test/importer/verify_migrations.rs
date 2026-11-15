@@ -80,7 +80,7 @@ fn validate_legacy_progress_upgrade(directory: &Path) -> CheckResult {
     return Ok(());
   };
   let db = Connection::open_in_memory()?;
-  db.execute_batch("CREATE TABLE logs (Id INTEGER PRIMARY KEY, Level TINYINT NOT NULL, Message TEXT NOT NULL); CREATE TABLE import_progress (Provider TEXT, FileName TEXT, CRC TEXT, LastProcessedLine INTEGER, LastProcessedByte INTEGER NOT NULL DEFAULT 0, Status TINYINT CHECK (Status IN (0, 1)), UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (Provider, FileName)); INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt) VALUES ('legacy-provider', 'stops.txt', 'legacy-crc', 17, 128, 1, '2026-08-30 00:00:00'); CREATE TABLE dataset_versions (Provider TEXT PRIMARY KEY, ETag TEXT, UpdatedAt DATETIME); INSERT INTO dataset_versions (Provider, ETag, UpdatedAt) VALUES ('legacy-provider', 'etag-1', '2026-08-30 00:00:00');")?;
+  db.execute_batch("CREATE TABLE agency (agency_name TEXT, agency_url TEXT, agency_timezone TEXT, agency_phone TEXT, agency_lang TEXT); CREATE TABLE logs (Id INTEGER PRIMARY KEY, Level TINYINT NOT NULL, Message TEXT NOT NULL); CREATE TABLE import_progress (Provider TEXT, FileName TEXT, CRC TEXT, LastProcessedLine INTEGER, LastProcessedByte INTEGER NOT NULL DEFAULT 0, Status TINYINT CHECK (Status IN (0, 1)), UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (Provider, FileName)); INSERT INTO import_progress (Provider, FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt) VALUES ('legacy-provider', 'stops.txt', 'legacy-crc', 17, 128, 1, '2026-08-30 00:00:00'); CREATE TABLE dataset_versions (Provider TEXT PRIMARY KEY, ETag TEXT, UpdatedAt DATETIME); INSERT INTO dataset_versions (Provider, ETag, UpdatedAt) VALUES ('legacy-provider', 'etag-1', '2026-08-30 00:00:00');")?;
   db.execute_batch(&fs::read_to_string(prefix_file)?)?;
   let migrated: (String, String, i64, i64, i64, String) = db.query_row("SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM \"0_import_progress\"", [], |row| {
     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
@@ -159,13 +159,17 @@ fn validate_local_migrations(provider_name: &str, directory: &Path, expected: &S
     let assignments = actual_columns.iter().map(|column| format!("{} = excluded.{}", quote_identifier(column), quote_identifier(column))).collect::<Vec<_>>().join(", ");
     let changed = actual_columns.iter().map(|column| format!("{}.{} IS NOT excluded.{}", quote_identifier(table), quote_identifier(column), quote_identifier(column))).collect::<Vec<_>>().join(" OR ");
     let sql = format!("INSERT INTO {} ({quoted_columns}) VALUES ({placeholders}) ON CONFLICT DO UPDATE SET {assignments} WHERE {changed}", quote_identifier(table));
+    let count_sql = format!("SELECT COUNT(*) FROM {}", quote_identifier(table));
+    let initial_count: i64 = db.query_row(&count_sql, [], |row| row.get(0))?;
+    db.execute_batch("SAVEPOINT replay_probe")?;
     let probe = (0..actual_columns.len()).map(|index| format!("replay-probe-{index}")).collect::<Vec<_>>();
     db.execute(&sql, params_from_iter(probe.iter()))?;
     let before = db.total_changes();
     db.execute(&sql, params_from_iter(probe.iter()))?;
     let replay_writes = db.total_changes() - before;
-    let replay_count: i64 = db.query_row(&format!("SELECT COUNT(*) FROM {}", quote_identifier(table)), [], |row| row.get(0))?;
-    db.execute(&format!("DELETE FROM {}", quote_identifier(table)), [])?;
+    let after_count: i64 = db.query_row(&count_sql, [], |row| row.get(0))?;
+    let replay_count = after_count - initial_count;
+    db.execute_batch("ROLLBACK TO replay_probe; RELEASE replay_probe;")?;
     if replay_count != 1 || replay_writes != 0 {
       return Err(format!("`{table}` retained {replay_count} rows after identical UPSERT and reported {replay_writes} unnecessary writes").into());
     }

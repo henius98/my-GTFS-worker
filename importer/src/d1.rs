@@ -224,9 +224,12 @@ pub struct RecordedQuery {
 }
 
 #[cfg(test)]
+pub type InMemoryQueryOutcome = Result<(Vec<D1Result>, bool), D1Error>;
+
+#[cfg(test)]
 #[derive(Default)]
 pub struct InMemoryTransport {
-  responses: Mutex<VecDeque<Result<(Vec<D1Result>, bool), D1Error>>>,
+  responses: Mutex<VecDeque<InMemoryQueryOutcome>>,
   recorded: Mutex<Vec<RecordedQuery>>,
   database_info: Mutex<Option<D1DatabaseInfo>>,
   database_count: AtomicU64,
@@ -248,7 +251,7 @@ impl InMemoryTransport {
     self.push_outcome(Ok((results, true)));
   }
 
-  pub fn push_outcome(&self, outcome: Result<(Vec<D1Result>, bool), D1Error>) {
+  pub fn push_outcome(&self, outcome: InMemoryQueryOutcome) {
     let mut guard = match self.responses.lock() {
       Ok(guard) => guard,
       Err(poisoned) => poisoned.into_inner(),
@@ -279,7 +282,7 @@ impl InMemoryTransport {
     }
   }
 
-  fn record(&self, db_id: &str, queries: &[D1Query<'_>]) -> Result<(Vec<D1Result>, bool), D1Error> {
+  fn record(&self, db_id: &str, queries: &[D1Query<'_>]) -> InMemoryQueryOutcome {
     {
       let mut recorded = match self.recorded.lock() {
         Ok(guard) => guard,

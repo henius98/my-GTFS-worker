@@ -1616,8 +1616,7 @@ mod tests {
 
     let client = D1Client::with_in_memory(transport.clone(), 2, 10, 1);
     let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10);
-    let columns = ["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"];
-    let outcome = processor.process_csv_file(feed, "stop_times.txt", "stop_times", &columns, Checkpoint::default()).await?;
+    let outcome = processor.process_csv_file(feed, "stop_times.txt", "stop_times", &["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"], Checkpoint::default()).await?;
 
     assert!(!outcome.file_done);
     assert!(outcome.write_budget_exhausted);
