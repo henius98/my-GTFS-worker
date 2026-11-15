@@ -1,5 +1,6 @@
+use importer::processor::{read_bounded_record, read_zip_csv_headers, resume_zip_csv_at_byte_offset};
 use std::hint::black_box;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::time::{Duration, Instant};
 use zip::ZipArchive;
 
@@ -7,6 +8,7 @@ const TOTAL_ROWS: usize = 250_000;
 const RESUME_ROWS: usize = 225_000;
 const TARGET_ROWS: usize = 1_000;
 const MEASURED_RUNS: usize = 9;
+const MAX_RECORD_BYTES: u64 = 512 * 1024;
 
 fn build_archive() -> Result<(Vec<u8>, u64), Box<dyn std::error::Error>> {
   let mut csv = Vec::with_capacity(TOTAL_ROWS * 48);
@@ -54,24 +56,12 @@ fn legacy_line_resume(archive_bytes: &[u8]) -> Result<usize, Box<dyn std::error:
 
 fn byte_offset_resume(archive_bytes: &[u8], resume_byte: u64) -> Result<usize, Box<dyn std::error::Error>> {
   let mut archive = ZipArchive::new(Cursor::new(archive_bytes))?;
-  {
-    let file = archive.by_name("stops.txt")?;
-    let mut header_reader = csv::ReaderBuilder::new().has_headers(true).flexible(true).from_reader(file);
-    let _ = header_reader.headers()?;
-  }
-
-  let file = archive.by_name("stops.txt")?;
-  let mut prefix = file.take(resume_byte);
-  let skipped = std::io::copy(&mut prefix, &mut std::io::sink())?;
-  if skipped != resume_byte {
-    return Err("byte resume reached EOF before its checkpoint".into());
-  }
-  let file = prefix.into_inner();
-  let mut reader = csv::ReaderBuilder::new().has_headers(false).flexible(true).from_reader(file);
+  let (_, header_end) = read_zip_csv_headers(&mut archive, "stops.txt", MAX_RECORD_BYTES)?;
+  let (mut reader, _) = resume_zip_csv_at_byte_offset(&mut archive, "stops.txt", header_end, resume_byte, MAX_RECORD_BYTES)?;
   let mut record = csv::StringRecord::new();
   let mut checksum = 0_usize;
   for _ in 0..TARGET_ROWS {
-    if !reader.read_record(&mut record)? {
+    if !read_bounded_record(&mut reader, &mut record, MAX_RECORD_BYTES)? {
       return Err("byte resume reached EOF in its target range".into());
     }
     checksum = checksum.saturating_add(record.as_slice().len());

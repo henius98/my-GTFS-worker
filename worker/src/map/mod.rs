@@ -53,31 +53,31 @@ fn json_error(status: u16, message: &str) -> Result<Response> {
   Ok(Response::from_json(&json!({ "error": message }))?.with_status(status))
 }
 
+fn parse_route_id(url: &Url) -> std::result::Result<String, (u16, &'static str)> {
+  let mut route_id = None;
+  for (key, value) in url.query_pairs() {
+    if key != "route_id" || route_id.is_some() {
+      return Err((400, "Expected at most one non-empty route_id"));
+    }
+    if value.trim().is_empty() {
+      return Err((400, "route_id query parameter is required"));
+    }
+    if value.len() > 256 {
+      return Err((400, "Expected at most one non-empty route_id"));
+    }
+    route_id = Some(value.into_owned());
+  }
+  route_id.ok_or((400, "route_id query parameter is required"))
+}
+
 pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider: &str) -> Result<Response> {
   if req.method() != Method::Get {
     return json_error(405, "Method not allowed");
   }
 
-  let mut route_id = None;
-  for (key, value) in url.query_pairs() {
-    if key == "route_id" {
-      if route_id.is_some() {
-        return json_error(400, "Expected at most one non-empty route_id");
-      }
-      if value.trim().is_empty() {
-        return json_error(400, "route_id query parameter is required");
-      }
-      if value.len() > 256 {
-        return json_error(400, "Expected at most one non-empty route_id");
-      }
-      route_id = Some(value.into_owned());
-    } else {
-      return json_error(400, "Expected at most one non-empty route_id");
-    }
-  }
-
-  let Some(route_id) = route_id else {
-    return json_error(400, "route_id query parameter is required");
+  let route_id = match parse_route_id(url) {
+    Ok(route_id) => route_id,
+    Err((status, message)) => return json_error(status, message),
   };
 
   let mut cache_url = url.clone();
@@ -230,4 +230,33 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     let _ = Cache::default().put(cache_key, cached_response).await;
   });
   Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn coordinates_validates_bounds_and_finiteness() {
+    assert_eq!(coordinates(Some(3.1), Some(101.7)), Some([101.7, 3.1]));
+    assert_eq!(coordinates(Some(-90.0), Some(180.0)), Some([180.0, -90.0]));
+    for (lat, lng) in [(None, Some(101.7)), (Some(90.1), Some(101.7)), (Some(3.1), Some(-180.1)), (Some(f64::NAN), Some(101.7)), (Some(3.1), Some(f64::INFINITY))] {
+      assert_eq!(coordinates(lat, lng), None);
+    }
+  }
+
+  #[test]
+  fn parse_route_id_validates_query_parameters() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(parse_route_id(&Url::parse("https://example.com/ktmb/map?route_id=KJL")?), Ok("KJL".to_owned()));
+    for query in ["", "?route_id=", "?route_id=%20%20"] {
+      let url = Url::parse(&format!("https://example.com/ktmb/map{query}"))?;
+      assert_eq!(parse_route_id(&url), Err((400, "route_id query parameter is required")), "{query}");
+    }
+    let long = "x".repeat(257);
+    for query in ["?other=1", "?route_id=A&route_id=B", &format!("?route_id={long}")] {
+      let url = Url::parse(&format!("https://example.com/ktmb/map{query}"))?;
+      assert_eq!(parse_route_id(&url), Err((400, "Expected at most one non-empty route_id")), "{query}");
+    }
+    Ok(())
+  }
 }

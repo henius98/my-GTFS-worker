@@ -173,15 +173,15 @@ pub(crate) struct Departure {
   trip_id: String,
   route_id: String,
   #[serde(default)]
-  route_short_name: Option<String>,
+  pub(super) route_short_name: Option<String>,
   #[serde(default)]
-  route_long_name: Option<String>,
+  pub(super) route_long_name: Option<String>,
   #[serde(default)]
-  route_color: Option<String>,
+  pub(super) route_color: Option<String>,
   #[serde(default)]
-  route_text_color: Option<String>,
+  pub(super) route_text_color: Option<String>,
   service_id: String,
-  trip_headsign: Option<String>,
+  pub(super) trip_headsign: Option<String>,
   direction_id: Option<u8>,
   stop_sequence: u32,
   service_date: NaiveDate,
@@ -462,9 +462,7 @@ mod tests {
         "trip_headsign": "Gombak", "direction_id": 0, "stop_sequence": 10,
         "arrival_time": "6:09:42", "departure_time": "6:10:00", "first_departure_time": "6:00:00",
         "start_time": "6:00:00", "end_time": "7:00:00", "headway_secs": 600, "frequency_trip_id": "opaque-trip",
-        "agency_timezone": "Asia/Kuala_Lumpur", "monday": 1, "tuesday": 1,
-        "wednesday": 1, "thursday": 1, "friday": 1, "saturday": 1, "sunday": 1,
-        "start_date": 20260101, "end_date": 20261231
+        "agency_timezone": "Asia/Kuala_Lumpur"
     });
     let mut template: Template = serde_json::from_value(value).unwrap();
     template.service = ParsedService::build(&[cal], &exceptions).unwrap().map(Arc::new);
@@ -572,32 +570,26 @@ mod tests {
   #[test]
   fn rejects_invalid_feed_instead_of_inventing_departures() {
     let now = dt("2026-08-27T06:00:00+08:00");
-    let mut variants = Vec::new();
-    let mut t = template();
-    t.headway_secs = Some(0);
-    variants.push(t);
-    let mut t = template();
-    t.end_time = t.start_time.clone();
-    variants.push(t);
-    let mut t = template();
-    t.start_time = Some("nonsense".into());
-    variants.push(t);
-    let mut t = template();
-    t.agency_timezone = Some("Invalid/Timezone".into());
-    variants.push(t);
-    for t in variants {
+    let invalid_templates: [fn(&mut Template); 6] = [
+      |t| t.headway_secs = Some(0),
+      |t| t.end_time = t.start_time.clone(),
+      |t| t.start_time = Some("nonsense".into()),
+      |t| t.agency_timezone = Some("Invalid/Timezone".into()),
+      |t| t.direction_id = Some(2),
+      |t| t.exact_times = Some(2),
+    ];
+    for mutate in invalid_templates {
+      let mut t = template();
+      mutate(&mut t);
       assert!(next_departures(&[t], now, 5).is_err());
     }
 
-    let mut cal = default_calendar();
-    cal.end_date = 20260230;
-    assert!(ParsedService::build(&[cal], &[]).is_err());
-    let mut cal = default_calendar();
-    cal.end_date = 20250101;
-    assert!(ParsedService::build(&[cal], &[]).is_err());
-    let mut cal = default_calendar();
-    cal.thursday = 2;
-    assert!(ParsedService::build(&[cal], &[]).is_err());
+    let invalid_calendars: [fn(&mut Calendar); 3] = [|cal| cal.end_date = 20260230, |cal| cal.end_date = 20250101, |cal| cal.thursday = 2];
+    for mutate in invalid_calendars {
+      let mut cal = default_calendar();
+      mutate(&mut cal);
+      assert!(ParsedService::build(&[cal], &[]).is_err());
+    }
   }
 
   #[test]
@@ -712,15 +704,23 @@ mod tests {
 
   #[test]
   fn falls_back_to_asia_kuala_lumpur_when_timezone_missing_or_empty() {
-    let mut t_none = template();
-    t_none.agency_timezone = None;
-    let rows = next_departures(&[t_none], dt("2026-08-27T06:00:00+08:00"), 1).unwrap();
-    assert_eq!(rows[0].agency_timezone, "Asia/Kuala_Lumpur");
+    for timezone in [None, Some("   ".into())] {
+      let mut t = template();
+      t.agency_timezone = timezone;
+      let rows = next_departures(&[t], dt("2026-08-27T06:00:00+08:00"), 1).unwrap();
+      assert_eq!(rows[0].agency_timezone, "Asia/Kuala_Lumpur");
+    }
+  }
 
-    let mut t_empty = template();
-    t_empty.agency_timezone = Some("   ".into());
-    let rows = next_departures(&[t_empty], dt("2026-08-27T06:00:00+08:00"), 1).unwrap();
-    assert_eq!(rows[0].agency_timezone, "Asia/Kuala_Lumpur");
+  #[test]
+  fn exact_times_one_reports_gtfs_schedule_estimate_method() {
+    let mut exact = template();
+    exact.exact_times = Some(1);
+    assert_eq!(next_departures(&[exact], dt("2026-08-27T06:00:00+08:00"), 1).unwrap()[0].estimate_method, "gtfs_schedule");
+
+    let mut headway = template();
+    headway.exact_times = Some(0);
+    assert_eq!(next_departures(&[headway], dt("2026-08-27T06:00:00+08:00"), 1).unwrap()[0].estimate_method, "frequency_start_plus_headway");
   }
 
   #[test]

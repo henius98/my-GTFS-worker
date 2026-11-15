@@ -1,8 +1,12 @@
 use serde::Deserialize;
 use std::{fs, path::PathBuf};
 
+#[path = "../../importer/src/budget_limits.rs"]
+pub mod budget_limits;
 #[path = "../../scripts/schema_parser.rs"]
 pub mod schema_parser;
+#[path = "../../importer/src/sql_queries.rs"]
+pub mod sql_queries;
 
 pub type CheckResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 

@@ -15,6 +15,13 @@ struct ImportProgress {
   updated_at: Option<String>,
 }
 
+fn canonical_cache_key(url: &Url, provider: &str) -> String {
+  let mut cache_url = url.clone();
+  cache_url.set_path(&format!("/{}/status", provider.to_ascii_lowercase()));
+  cache_url.set_query(None);
+  cache_url.to_string()
+}
+
 pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider: &str) -> Result<Response> {
   if req.method() != Method::Get {
     return Response::error(format!("{} Method Not Allowed", req.method()), 405);
@@ -22,10 +29,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
 
   // Query strings, path casing, and a trailing slash do not alter status
   // output; canonicalize them so callers cannot create arbitrary cache keys.
-  let mut cache_url = url.clone();
-  cache_url.set_path(&format!("/{}/status", provider.to_ascii_lowercase()));
-  cache_url.set_query(None);
-  let cache_key = cache_url.to_string();
+  let cache_key = canonical_cache_key(url, provider);
   let cache = Cache::default();
   if let Ok(Some(response)) = cache.get(&cache_key, false).await {
     return Ok(response);
@@ -56,4 +60,33 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     let _ = Cache::default().put(cache_key, cached_response).await;
   });
   Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn canonical_cache_key_strips_query_and_lowercases_provider() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let first = canonical_cache_key(&Url::parse("https://example.com/KTMB/status/?limit=1")?, "KTMB");
+    let second = canonical_cache_key(&Url::parse("https://example.com/ktmb/status")?, "ktmb");
+    assert_eq!(first, "https://example.com/ktmb/status");
+    assert_eq!(first, second);
+    Ok(())
+  }
+
+  #[test]
+  fn import_progress_round_trips_pascal_case_and_crc() -> std::result::Result<(), serde_json::Error> {
+    let row = serde_json::json!({
+      "FileName": "stops.txt",
+      "CRC": "a1b2c3d4",
+      "LastProcessedLine": 42,
+      "LastProcessedByte": 1024,
+      "Status": 0,
+      "UpdatedAt": "2026-09-24 00:00:00"
+    });
+    let progress: ImportProgress = serde_json::from_value(row.clone())?;
+    assert_eq!(serde_json::to_value(progress)?, row);
+    Ok(())
+  }
 }

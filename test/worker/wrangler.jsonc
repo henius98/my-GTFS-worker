@@ -11,6 +11,12 @@
       "database_name": "gtfs-worker-test",
       "database_id": "00000000-0000-0000-0000-000000000001",
       "migrations_dir": "../../migrations/ktmb"
+    },
+    {
+      "binding": "DB_RAPID_BUS_KL",
+      "database_name": "gtfs-worker-rapid-bus-kl-test",
+      "database_id": "00000000-0000-0000-0000-000000000002",
+      "migrations_dir": "../../migrations/rapid-bus-kl"
     }
   ]
 }

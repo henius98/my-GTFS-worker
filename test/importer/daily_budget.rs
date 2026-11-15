@@ -1,6 +1,10 @@
 //! Exercise the production ledger SQL locally; no Cloudflare requests.
 
-use gtfs_checks::{CheckResult, root};
+use gtfs_checks::{
+  CheckResult,
+  budget_limits::{DAILY_WRITE_LIMIT, LEDGER_WRITE_RESERVE, METADATA_WRITE_RESERVE},
+  root,
+};
 use rusqlite::{Connection, OptionalExtension, functions::FunctionFlags, params};
 use std::{
   fs,
@@ -8,21 +12,6 @@ use std::{
   sync::{Arc, Mutex},
   thread,
 };
-
-fn source() -> CheckResult<String> {
-  Ok(fs::read_to_string(root().join("importer/src/d1.rs"))?)
-}
-
-fn sql_after(source: &str, prefix: &str) -> CheckResult<String> {
-  let marker = format!("sql: \"{prefix}");
-  let rest = source.split_once(&marker).ok_or_else(|| format!("missing SQL prefix: {prefix}"))?.1;
-  Ok(format!("{prefix}{}", rest.split('"').next().ok_or("unterminated SQL")?))
-}
-
-fn number(source: &str, name: &str) -> CheckResult<i64> {
-  let line = source.lines().find(|line| line.contains(&format!("const {name}:")) || line.contains(&format!("pub const {name}:"))).ok_or_else(|| format!("missing {name}"))?;
-  Ok(line.split_once('=').ok_or("missing assignment")?.1.trim().trim_end_matches(';').replace('_', "").parse()?)
-}
 
 struct Budget {
   _directory: tempfile::TempDir,
@@ -42,7 +31,6 @@ impl Budget {
     let path = directory.path().join("budget.db");
     let day = Arc::new(Mutex::new("2026-09-12".to_owned()));
     let db = Self::connect(&path, &day)?;
-    let source = source()?;
     let migration = fs::read_to_string(root().join("migrations/ktmb/0_gtfs_schema.sql"))?;
     db.execute_batch(&migration)?;
     let rename_migration = fs::read_to_string(root().join("migrations/ktmb/20261028_prefix_infrastructure_tables.sql"))?;
@@ -52,11 +40,11 @@ impl Budget {
       db,
       path,
       day,
-      acquire_sql: sql_after(&source, "WITH allowance")?,
-      release_sql: sql_after(&source, "UPDATE \"0_daily_import_budget\"")?,
+      acquire_sql: fs::read_to_string(root().join("importer/src/sql/acquire_daily_budget.sql"))?,
+      release_sql: fs::read_to_string(root().join("importer/src/sql/release_daily_budget.sql"))?,
       migration,
-      limit: number(&source, "DAILY_WRITE_LIMIT")?,
-      overhead: number(&source, "METADATA_WRITE_RESERVE")? + number(&source, "LEDGER_WRITE_RESERVE")?,
+      limit: i64::try_from(DAILY_WRITE_LIMIT)?,
+      overhead: i64::try_from(METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE)?,
     })
   }
 

@@ -75,7 +75,9 @@ pub fn strip_sql_comments(sql: &str) -> String {
       '\'' if in_string => {
         if chars.peek() == Some(&'\'') {
           result.push('\'');
-          result.push(chars.next().unwrap());
+          if let Some(escaped) = chars.next() {
+            result.push(escaped);
+          }
         } else {
           in_string = false;
           result.push(ch);
@@ -138,18 +140,13 @@ pub fn extract_first_identifier(s: &str) -> Option<&str> {
   if s.is_empty() {
     return None;
   }
-  if s.starts_with('"') {
-    s[1..].find('"').map(|end| &s[..end + 2])
-  } else if s.starts_with('`') {
-    s[1..].find('`').map(|end| &s[..end + 2])
-  } else if s.starts_with('\'') {
-    s[1..].find('\'').map(|end| &s[..end + 2])
-  } else if s.starts_with('[') {
-    s[1..].find(']').map(|end| &s[..end + 2])
-  } else {
-    let end = s.find(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ',' || c == ';').unwrap_or(s.len());
-    if end == 0 { None } else { Some(&s[..end]) }
+  for (open, close) in [('"', '"'), ('`', '`'), ('\'', '\''), ('[', ']')] {
+    if let Some(rest) = s.strip_prefix(open) {
+      return rest.find(close).map(|end| &s[..end + open.len_utf8() + close.len_utf8()]);
+    }
   }
+  let end = s.find(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ',' || c == ';').unwrap_or(s.len());
+  if end == 0 { None } else { Some(&s[..end]) }
 }
 
 pub fn parse_table_definitions(sql: &str) -> Vec<(String, String)> {
@@ -321,12 +318,13 @@ pub fn parse_primary_keys_str(sql: &str) -> BTreeMap<String, Vec<String>> {
             }
           }
         }
-      } else if !is_other_table_constraint(first_word, second_word) && has_primary_key_tokens(part) {
-        if let Some(col_name) = extract_first_identifier(part) {
-          let col_name = col_name.trim_matches(['"', '`', '\'', '[', ']']);
-          if !col_name.is_empty() {
-            keys.push(col_name.to_string());
-          }
+      } else if !is_other_table_constraint(first_word, second_word)
+        && has_primary_key_tokens(part)
+        && let Some(col_name) = extract_first_identifier(part)
+      {
+        let col_name = col_name.trim_matches(['"', '`', '\'', '[', ']']);
+        if !col_name.is_empty() {
+          keys.push(col_name.to_string());
         }
       }
     }
@@ -357,6 +355,16 @@ mod tests {
     assert_eq!(strip_sql_comments(sql), "CREATE TABLE foo (id INT);");
   }
 
+  fn assert_tables(sql: &str, expected: &[(&str, &[&str], &[&str])]) {
+    let schemas = parse_schema_str(sql);
+    let pks = parse_primary_keys_str(sql);
+    let to_owned_vec = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
+    for (table, cols, pk_cols) in expected {
+      assert_eq!(schemas.get(*table), Some(&to_owned_vec(cols)), "columns for {table}");
+      assert_eq!(pks.get(*table), Some(&to_owned_vec(pk_cols)), "primary keys for {table}");
+    }
+  }
+
   #[test]
   fn test_parse_schema_and_primary_keys_composite_and_inline() {
     let sql = r#"
@@ -382,14 +390,7 @@ mod tests {
         val2 TEXT
       );
     "#;
-    let schemas = parse_schema_str(sql);
-    assert_eq!(schemas.get("test_table"), Some(&vec!["id".to_string(), "trip_id".to_string(), "note".to_string(), "status".to_string()]));
-    assert_eq!(schemas.get("single_pk"), Some(&vec!["code".to_string(), "description".to_string()]));
-
-    let pks = parse_primary_keys_str(sql);
-    assert_eq!(pks.get("test_table"), Some(&vec!["id".to_string(), "trip_id".to_string()]));
-    assert_eq!(pks.get("single_pk"), Some(&vec!["code".to_string()]));
-    assert_eq!(pks.get("no_pk"), Some(&vec![]));
+    assert_tables(sql, &[("test_table", &["id", "trip_id", "note", "status"], &["id", "trip_id"]), ("single_pk", &["code", "description"], &["code"]), ("no_pk", &["val1", "val2"], &[])]);
   }
 
   #[test]
@@ -405,13 +406,7 @@ mod tests {
         dept_time TEXT
       );
     "#;
-    let schemas = parse_schema_str(sql);
-    assert_eq!(schemas.get("bus routes"), Some(&vec!["route id".to_string(), "route_name".to_string()]));
-    assert_eq!(schemas.get("train schedules"), Some(&vec!["schedule_id".to_string(), "dept_time".to_string()]));
-
-    let pks = parse_primary_keys_str(sql);
-    assert_eq!(pks.get("bus routes"), Some(&vec!["route id".to_string()]));
-    assert_eq!(pks.get("train schedules"), Some(&vec!["schedule_id".to_string()]));
+    assert_tables(sql, &[("bus routes", &["route id", "route_name"], &["route id"]), ("train schedules", &["schedule_id", "dept_time"], &["schedule_id"])]);
   }
 
   #[test]
@@ -427,13 +422,7 @@ mod tests {
         CHECK (check_id > 0)
       );
     "#;
-    let schemas = parse_schema_str(sql);
-    assert_eq!(
-      schemas.get("test_check"),
-      Some(&vec!["check_id".to_string(), "checkpoint".to_string(), "unique_code".to_string(), "constraint_name".to_string(), "bracket_col".to_string(), "status".to_string()])
-    );
-    let pks = parse_primary_keys_str(sql);
-    assert_eq!(pks.get("test_check"), Some(&vec!["check_id".to_string()]));
+    assert_tables(sql, &[("test_check", &["check_id", "checkpoint", "unique_code", "constraint_name", "bracket_col", "status"], &["check_id"])]);
   }
 
   #[test]
@@ -447,10 +436,7 @@ mod tests {
         CONSTRAINT "pk_路线" PRIMARY KEY (service_id ASC, [start_date] DESC, "路线_id" COLLATE NOCASE)
       );
     "#;
-    let schemas = parse_schema_str(sql);
-    assert_eq!(schemas.get("trips_utf8"), Some(&vec!["路线_id".to_string(), "service_id".to_string(), "start_date".to_string(), "end_date".to_string()]));
-    let pks = parse_primary_keys_str(sql);
-    assert_eq!(pks.get("trips_utf8"), Some(&vec!["service_id".to_string(), "start_date".to_string(), "路线_id".to_string()]));
+    assert_tables(sql, &[("trips_utf8", &["路线_id", "service_id", "start_date", "end_date"], &["service_id", "start_date", "路线_id"])]);
   }
 
   #[test]
@@ -479,16 +465,14 @@ mod tests {
         col1 TEXT PRIMARY KEY
       );
     "#;
-    let schemas = parse_schema_str(sql);
-    assert_eq!(schemas.get("multiline_pk"), Some(&vec!["service_id".to_string(), "date".to_string()]));
-    assert_eq!(schemas.get("inline_multiline_pk"), Some(&vec!["trip_id".to_string(), "direction_id".to_string()]));
-    assert_eq!(schemas.get("no_space_table"), Some(&vec!["id".to_string()]));
-    assert_eq!(schemas.get("quoted (paren) table"), Some(&vec!["col1".to_string()]));
-
-    let pks = parse_primary_keys_str(sql);
-    assert_eq!(pks.get("multiline_pk"), Some(&vec!["service_id".to_string(), "date".to_string()]));
-    assert_eq!(pks.get("inline_multiline_pk"), Some(&vec!["trip_id".to_string()]));
-    assert_eq!(pks.get("no_space_table"), Some(&vec!["id".to_string()]));
-    assert_eq!(pks.get("quoted (paren) table"), Some(&vec!["col1".to_string()]));
+    assert_tables(
+      sql,
+      &[
+        ("multiline_pk", &["service_id", "date"], &["service_id", "date"]),
+        ("inline_multiline_pk", &["trip_id", "direction_id"], &["trip_id"]),
+        ("no_space_table", &["id"], &["id"]),
+        ("quoted (paren) table", &["col1"], &["col1"]),
+      ],
+    );
   }
 }

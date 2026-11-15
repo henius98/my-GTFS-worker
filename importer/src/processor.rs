@@ -1,12 +1,13 @@
 use crate::config::{ProviderConfig, RuntimeConfig};
-use crate::d1::{D1Client, D1Error, D1Query, FileProgressInit};
+use crate::d1::{Checkpoint, D1Client, D1Error, D1Query, FileProgressInit, FileProgressUpdate, StoredFileProgress};
+pub use crate::schema::{SchemaCatalog, get_provider_schema_sql, parse_provider_schemas, positional_insert_sql, primary_keys, provider_maintenance_queries};
 use reqwest::{
-  StatusCode,
+  Client, StatusCode,
   header::{CONTENT_LENGTH, ETAG, IF_NONE_MATCH},
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::path::PathBuf;
 use std::sync::{
   Arc, Mutex,
@@ -26,6 +27,11 @@ const MAX_D1_WRITES_PER_LOGICAL_ROW: u64 = 2;
 // The CSV reader buffers ahead. This small allowance lets it find the end of a
 // record before the exact byte-span check below rejects an oversized record.
 const CSV_RECORD_READ_AHEAD_BYTES: u64 = 64 * 1024;
+const STOP_TIMES_KEY_PAGE_SIZE: usize = 10_000;
+const SELECT_STOP_TIMES_KEYS_FIRST_PAGE_SQL: &str =
+  "SELECT \"rowid\" AS rowid, \"stop_id\", \"trip_id\", \"stop_sequence\" FROM \"stop_times\" ORDER BY \"stop_id\", \"trip_id\", \"stop_sequence\" LIMIT ?";
+const SELECT_STOP_TIMES_KEYS_AFTER_SQL: &str = "SELECT \"rowid\" AS rowid, \"stop_id\", \"trip_id\", \"stop_sequence\" FROM \"stop_times\" WHERE (\"stop_id\", \"trip_id\", \"stop_sequence\") > (?, ?, ?) ORDER BY \"stop_id\", \"trip_id\", \"stop_sequence\" LIMIT ?";
+const DELETE_STALE_STOP_TIMES_SQL: &str = "DELETE FROM \"stop_times\" WHERE rowid IN (SELECT value FROM json_each(?))";
 
 pub struct TempFeedStorage {
   used_bytes: AtomicU64,
@@ -72,21 +78,96 @@ pub enum ProcessorError {
   UploaderClosed,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct Checkpoint {
-  line: u64,
-  byte: u64,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SerializedBatch {
+  pub payload: String,
+  pub start: Checkpoint,
+  pub end: Checkpoint,
+  pub rows: u64,
 }
 
-struct SerializedBatch {
-  payload: String,
-  start: Checkpoint,
-  end: Checkpoint,
+struct JsonBatchBuilder {
+  json: Vec<u8>,
+  batch_rows: usize,
+  batch_start: Checkpoint,
+  batch_size: usize,
+  max_payload_bytes: u64,
+  item_description: &'static str,
 }
 
-enum BatchMessage {
-  InitSql(String),
-  Data(SerializedBatch),
+impl JsonBatchBuilder {
+  fn new(initial: Checkpoint, batch_size: usize, max_payload_bytes: u64, row_bytes_hint: usize, item_description: &'static str) -> Self {
+    let maximum_payload_capacity = usize::try_from(max_payload_bytes).unwrap_or(usize::MAX);
+    let initial_capacity = batch_size.saturating_mul(row_bytes_hint).min(256 * 1024).min(maximum_payload_capacity);
+    let mut json = Vec::with_capacity(initial_capacity);
+    json.push(b'[');
+    Self { json, batch_rows: 0, batch_start: initial, batch_size, max_payload_bytes, item_description }
+  }
+
+  fn push_row<W, F>(&mut self, start: Checkpoint, end: Checkpoint, write_row: W, mut on_batch: F) -> Result<(), ProcessorError>
+  where
+    W: FnOnce(&mut Vec<u8>) -> Result<(), serde_json::Error>,
+    F: FnMut(SerializedBatch) -> Result<(), ProcessorError>,
+  {
+    let prefix_length = self.json.len();
+    let previous_batch_rows = self.batch_rows;
+    if previous_batch_rows == 0 {
+      self.batch_start = start;
+    } else {
+      self.json.push(b',');
+    }
+    let row_start = self.json.len();
+    write_row(&mut self.json)?;
+    self.batch_rows += 1;
+
+    let mut serialized_bytes = u64::try_from(self.json.len().saturating_add(1)).unwrap_or(u64::MAX);
+    if serialized_bytes > self.max_payload_bytes && previous_batch_rows != 0 {
+      let row_payload = self.json.split_off(row_start);
+      self.json.truncate(prefix_length);
+      self.batch_rows = previous_batch_rows;
+      let flushed = self.take_batch(self.batch_start, start)?;
+      on_batch(flushed)?;
+      self.batch_start = start;
+      self.json.extend_from_slice(&row_payload);
+      self.batch_rows = 1;
+      serialized_bytes = u64::try_from(self.json.len().saturating_add(1)).unwrap_or(u64::MAX);
+    }
+    if serialized_bytes > self.max_payload_bytes {
+      return Err(
+        io::Error::new(
+          io::ErrorKind::InvalidData,
+          format!("serialized {} made its statement payload {serialized_bytes} bytes, exceeding the configured {}-byte limit", self.item_description, self.max_payload_bytes),
+        )
+        .into(),
+      );
+    }
+    if self.batch_rows >= self.batch_size || serialized_bytes == self.max_payload_bytes {
+      let flushed = self.take_batch(self.batch_start, end)?;
+      on_batch(flushed)?;
+    }
+    Ok(())
+  }
+
+  fn finish<F>(&mut self, end: Checkpoint, mut on_batch: F) -> Result<(), ProcessorError>
+  where
+    F: FnMut(SerializedBatch) -> Result<(), ProcessorError>,
+  {
+    if self.batch_rows != 0 {
+      let flushed = self.take_batch(self.batch_start, end)?;
+      on_batch(flushed)?;
+    }
+    Ok(())
+  }
+
+  fn take_batch(&mut self, start: Checkpoint, end: Checkpoint) -> Result<SerializedBatch, ProcessorError> {
+    self.json.push(b']');
+    let next_capacity = self.json.capacity();
+    let payload = String::from_utf8(std::mem::replace(&mut self.json, Vec::with_capacity(next_capacity)))?;
+    self.json.push(b'[');
+    let rows = u64::try_from(self.batch_rows).unwrap_or(u64::MAX);
+    self.batch_rows = 0;
+    Ok(SerializedBatch { payload, start, end, rows })
+  }
 }
 
 struct BatchTaskResult {
@@ -98,6 +179,7 @@ struct UploadOutcome {
   committed_through: Checkpoint,
   had_error: bool,
   write_budget_exhausted: bool,
+  first_error: Option<ProcessorError>,
 }
 
 struct TemporaryFeed {
@@ -175,46 +257,55 @@ impl PreparedProvider {
 }
 
 #[derive(Clone)]
-struct BatchWorker {
+struct StatementGroupExecutor {
   d1_client: D1Client,
   database_id: Arc<str>,
-  insert_sql: Arc<str>,
+  sql: Arc<str>,
   database_semaphore: Arc<tokio::sync::Semaphore>,
   provider_name: Arc<str>,
+  statements_per_request: usize,
+  database_concurrency_limit: usize,
+  failure_label: &'static str,
 }
 
-impl BatchWorker {
+impl StatementGroupExecutor {
+  async fn execute_payloads(&self, payloads: Vec<String>, logical_rows: u64) -> Result<(), ProcessorError> {
+    let queries = payloads.into_iter().map(|payload| D1Query { sql: self.sql.as_ref(), params: vec![serde_json::Value::String(payload)] }).collect::<Vec<_>>();
+    let _permit = self.database_semaphore.acquire().await.map_err(|error| ProcessorError::D1(D1Error::ApiError(format!("Failed to acquire per-database D1 permit: {error}"))))?;
+    let maximum_writes = logical_rows.checked_mul(MAX_D1_WRITES_PER_LOGICAL_ROW).ok_or_else(|| ProcessorError::D1(D1Error::ApiError("D1 batch write reservation overflowed u64".to_owned())))?;
+    let reservation = self.d1_client.reserve_import_writes(maximum_writes).await?;
+    let (results, had_ambiguous_retry) = match self.d1_client.batch_with_retry_state(self.database_id.as_ref(), &queries).await {
+      Ok(outcome) => outcome,
+      Err(error) => {
+        // A terminal transport failure may be ambiguous. Consuming the
+        // full reservation prevents later work from spending it again.
+        reservation.consume_all();
+        return Err(error.into());
+      }
+    };
+    let actual_writes = results.iter().try_fold(0_u64, |total, result| result.rows_written().and_then(|writes| total.checked_add(writes)));
+    let Some(actual_writes) = actual_writes else {
+      reservation.consume_all();
+      return Err(ProcessorError::D1(D1Error::ApiError("D1 response omitted or overflowed rows_written metadata; consumed the full write reservation".to_owned())));
+    };
+    let operation = self.sql.split_whitespace().next().unwrap_or("SQL");
+    let table = self.sql.split_whitespace().nth(2).unwrap_or("unknown table");
+    println!("[{}] {operation} {table}: {logical_rows} logical rows, {actual_writes} D1 writes", self.provider_name);
+    if had_ambiguous_retry {
+      reservation.consume_all();
+    } else {
+      reservation.finish(actual_writes)?;
+    }
+    Ok(())
+  }
+
   async fn flush_group(self: Arc<Self>, batches: Vec<SerializedBatch>) -> BatchTaskResult {
     let ranges = batches.iter().map(|batch| (batch.start, batch.end)).collect();
     let result = async {
-      let _permit = self.database_semaphore.acquire().await.map_err(|error| ProcessorError::D1(D1Error::ApiError(format!("Failed to acquire per-database D1 permit: {error}"))))?;
-      let logical_rows = batches.iter().try_fold(0_u64, |total, batch| {
-        total.checked_add(batch.end.line.saturating_sub(batch.start.line)).ok_or_else(|| ProcessorError::D1(D1Error::ApiError("D1 batch logical-row reservation overflowed u64".to_owned())))
-      })?;
-      let maximum_writes = logical_rows.checked_mul(MAX_D1_WRITES_PER_LOGICAL_ROW).ok_or_else(|| ProcessorError::D1(D1Error::ApiError("D1 batch write reservation overflowed u64".to_owned())))?;
-      let reservation = self.d1_client.reserve_import_writes(maximum_writes).await?;
-      let queries = batches.into_iter().map(|batch| D1Query { sql: self.insert_sql.as_ref(), params: vec![serde_json::Value::String(batch.payload)] }).collect::<Vec<_>>();
-      let (results, had_ambiguous_retry) = match self.d1_client.batch_with_retry_state(self.database_id.as_ref(), &queries).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-          // A terminal transport failure may be ambiguous. Consuming the
-          // full reservation prevents later work from spending it again.
-          reservation.consume_all();
-          return Err(error.into());
-        }
-      };
-      let actual_writes = results.iter().try_fold(0_u64, |total, result| result.rows_written().and_then(|writes| total.checked_add(writes)));
-      let Some(actual_writes) = actual_writes else {
-        reservation.consume_all();
-        return Err(ProcessorError::D1(D1Error::ApiError("D1 response omitted or overflowed rows_written metadata; consumed the full write reservation".to_owned())));
-      };
-      println!("[{}] {}: {logical_rows} logical rows, {actual_writes} D1 writes", self.provider_name, self.insert_sql.split_whitespace().nth(2).unwrap_or("unknown table"));
-      if had_ambiguous_retry {
-        reservation.consume_all();
-      } else {
-        reservation.finish(actual_writes)?;
-      }
-      Ok(())
+      let overflow = || ProcessorError::D1(D1Error::ApiError("D1 batch logical-row reservation overflowed u64".to_owned()));
+      let logical_rows = batches.iter().try_fold(0_u64, |total, batch| total.checked_add(batch.rows).ok_or_else(overflow))?;
+      let payloads = batches.into_iter().map(|batch| batch.payload).collect();
+      self.execute_payloads(payloads, logical_rows).await
     }
     .await;
 
@@ -227,93 +318,110 @@ impl BatchWorker {
     let worker = self.clone();
     batch_tasks.spawn(async move { worker.flush_group(batches).await });
   }
-}
 
-pub fn parse_provider_schemas(provider_name: &str) -> Option<&'static [(&'static str, &'static [&'static str])]> {
-  include!(concat!(env!("OUT_DIR"), "/schemas.rs"))
-}
+  async fn execute_channel(self: Arc<Self>, initial: Checkpoint, mut receiver: tokio::sync::mpsc::Receiver<SerializedBatch>) -> UploadOutcome {
+    let mut pending = Vec::with_capacity(self.statements_per_request);
+    let mut batch_tasks = JoinSet::new();
+    let mut statuses = BTreeMap::new();
+    let mut had_error = false;
+    let mut write_budget_exhausted = false;
+    let mut first_error = None;
 
-pub fn get_provider_schema_sql(provider_name: &str) -> Option<&'static [&'static str]> {
-  include!(concat!(env!("OUT_DIR"), "/schema_sql.rs"))
-}
+    while let Some(batch) = receiver.recv().await {
+      pending.push(batch);
+      if pending.len() < self.statements_per_request {
+        continue;
+      }
 
-pub fn provider_maintenance_queries(provider_name: &str) -> Vec<&'static str> {
-  match provider_name {
-    "rapid-bus-penang" => vec![
-      "DELETE FROM stop_times WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
-      "DELETE FROM trips WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
-      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
-      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
-    ],
-    "rapid-bus-mrtfeeder" => vec![
-      "DELETE FROM stop_times WHERE trip_id IN (SELECT trip_id FROM trips WHERE service_id IN (SELECT service_id FROM (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id UNION ALL SELECT service_id, MAX(date) AS max_end FROM calendar_dates WHERE exception_type = 1 GROUP BY service_id) GROUP BY service_id HAVING MAX(max_end) < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER)))",
-      "DELETE FROM trips WHERE service_id IN (SELECT service_id FROM (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id UNION ALL SELECT service_id, MAX(date) AS max_end FROM calendar_dates WHERE exception_type = 1 GROUP BY service_id) GROUP BY service_id HAVING MAX(max_end) < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
-      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
-      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
-      "DELETE FROM calendar_dates WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
-    ],
-    "ktmb" => vec![
-      "INSERT OR IGNORE INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES ('37200', 'LARKIN / TAMPOI HALTE', 1.5050, 103.7400)",
-      "DELETE FROM stop_times WHERE stop_sequence < 100 AND trip_id IN (SELECT trip_id FROM stop_times WHERE stop_sequence >= 100)",
-      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
-      "DELETE FROM stop_times WHERE trip_id IN (SELECT trip_id FROM trips WHERE service_id IN (SELECT service_id FROM (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id UNION ALL SELECT service_id, MAX(date) AS max_end FROM calendar_dates WHERE exception_type = 1 GROUP BY service_id) GROUP BY service_id HAVING MAX(max_end) < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER)))",
-      "DELETE FROM trips WHERE service_id IN (SELECT service_id FROM (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id UNION ALL SELECT service_id, MAX(date) AS max_end FROM calendar_dates WHERE exception_type = 1 GROUP BY service_id) GROUP BY service_id HAVING MAX(max_end) < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
-      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
-      "DELETE FROM calendar_dates WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
-    ],
-    "mybas-johor" => vec![
-      "DELETE FROM fare_leg_rules WHERE fare_product_id NOT IN (SELECT fare_product_id FROM fare_products)",
-      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
-      "DELETE FROM stop_times WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
-      "DELETE FROM trips WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
-      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
-    ],
-    "rapid-bus-kl" => vec![
-      "DELETE FROM frequencies WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
-      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
-      "DELETE FROM stop_times WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
-      "DELETE FROM trips WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
-      "DELETE FROM frequencies WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM trips)",
-      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
-    ],
-    "rapid-rail-kl" => vec![
-      "DELETE FROM frequencies WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
-      "DELETE FROM trips WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM stop_times)",
-      "DELETE FROM stop_times WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
-      "DELETE FROM trips WHERE trip_id IN (SELECT t.trip_id FROM trips t JOIN (SELECT service_id, MAX(end_date) AS max_end FROM calendar GROUP BY service_id) c ON t.service_id = c.service_id WHERE c.max_end < CAST(strftime('%Y%m%d', 'now', '+8 hours') AS INTEGER))",
-      "DELETE FROM frequencies WHERE trip_id NOT IN (SELECT DISTINCT trip_id FROM trips)",
-      "DELETE FROM calendar WHERE service_id NOT IN (SELECT DISTINCT service_id FROM trips)",
-    ],
-    _ => Vec::new(),
+      while batch_tasks.len() >= self.database_concurrency_limit {
+        if let Some(result) = batch_tasks.join_next().await {
+          let (completion, error) = record_task_result(result, &self.provider_name, self.failure_label, &mut statuses);
+          match completion {
+            BatchCompletion::Success => {}
+            BatchCompletion::WriteBudgetExhausted => write_budget_exhausted = true,
+            BatchCompletion::Failed => {
+              had_error = true;
+              if first_error.is_none() {
+                first_error = error;
+              }
+            }
+          }
+          if had_error || write_budget_exhausted {
+            break;
+          }
+        }
+      }
+      if had_error || write_budget_exhausted {
+        break;
+      }
+      self.spawn_group(&mut batch_tasks, &mut pending);
+    }
+
+    if !had_error && !write_budget_exhausted && !pending.is_empty() {
+      self.spawn_group(&mut batch_tasks, &mut pending);
+    }
+    drop(receiver);
+
+    while let Some(result) = batch_tasks.join_next().await {
+      let (completion, error) = record_task_result(result, &self.provider_name, self.failure_label, &mut statuses);
+      match completion {
+        BatchCompletion::Success => {}
+        BatchCompletion::WriteBudgetExhausted => write_budget_exhausted = true,
+        BatchCompletion::Failed => {
+          had_error = true;
+          if first_error.is_none() {
+            first_error = error;
+          }
+        }
+      }
+    }
+
+    UploadOutcome { committed_through: contiguous_committed_checkpoint(initial, &statuses), had_error, write_budget_exhausted, first_error }
+  }
+
+  async fn execute_batches(self: Arc<Self>, batches: Vec<SerializedBatch>) -> Result<bool, ProcessorError> {
+    if batches.is_empty() {
+      return Ok(true);
+    }
+    let (sender, receiver) = tokio::sync::mpsc::channel(batches.len().max(1));
+    for batch in batches {
+      let _ = sender.send(batch).await;
+    }
+    drop(sender);
+    let outcome = self.execute_channel(Checkpoint::default(), receiver).await;
+    if let Some(error) = outcome.first_error {
+      return Err(error);
+    }
+    if outcome.had_error {
+      return Err(ProcessorError::D1(D1Error::ApiError("One or more D1 delete batch groups failed".to_owned())));
+    }
+    Ok(!outcome.write_budget_exhausted)
   }
 }
 
-fn get_resume_state(row: Option<&serde_json::Value>, csv_file: &str, file_crc: &str, provider_name: &str) -> Option<Checkpoint> {
-  let Some(row) = row else {
+fn resolve_resume_checkpoint(stored: Option<&StoredFileProgress>, csv_file: &str, file_crc: &str, provider_name: &str) -> Option<Checkpoint> {
+  let Some(stored) = stored else {
     return Some(Checkpoint::default());
   };
 
-  let db_crc = row.get("CRC").and_then(serde_json::Value::as_str).unwrap_or("");
-  if db_crc != file_crc {
-    println!("[{}] File {} changed (CRC: {} -> {}). Restarting file.", provider_name, csv_file, db_crc, file_crc);
+  if stored.crc != file_crc {
+    println!("[{}] File {} changed (CRC: {} -> {}). Restarting file.", provider_name, csv_file, stored.crc, file_crc);
     return Some(Checkpoint::default());
   }
 
-  let status = row.get("Status").and_then(serde_json::Value::as_i64).unwrap_or(-1);
-  if status == 0 {
+  if stored.completed {
     println!("[{}] Skipping {}, already completed.", provider_name, csv_file);
     return None;
   }
 
-  Some(Checkpoint { line: row.get("LastProcessedLine").and_then(serde_json::Value::as_u64).unwrap_or(0), byte: row.get("LastProcessedByte").and_then(serde_json::Value::as_u64).unwrap_or(0) })
+  Some(stored.checkpoint)
 }
 
 struct CsvExtractJob {
   feed: Arc<TemporaryFeed>,
-  provider_name: String,
   csv_file: String,
-  table_name: String,
-  db_columns: &'static [&'static str],
+  csv_indices: Vec<usize>,
+  header_end: u64,
   checkpoint: Checkpoint,
   batch_size: usize,
   max_rows: u64,
@@ -327,18 +435,18 @@ struct CsvExtractOutcome {
   write_budget_exhausted: bool,
 }
 
-struct RecordSizeLimiter<R> {
+pub struct RecordSizeLimiter<R> {
   inner: R,
   maximum_bytes: u64,
   remaining_bytes: u64,
 }
 
 impl<R> RecordSizeLimiter<R> {
-  fn new(inner: R, maximum_bytes: u64) -> Self {
+  pub fn new(inner: R, maximum_bytes: u64) -> Self {
     Self { inner, maximum_bytes, remaining_bytes: maximum_bytes.saturating_add(CSV_RECORD_READ_AHEAD_BYTES) }
   }
 
-  fn reset(&mut self) {
+  pub fn reset(&mut self) {
     self.remaining_bytes = self.maximum_bytes.saturating_add(CSV_RECORD_READ_AHEAD_BYTES);
   }
 }
@@ -367,7 +475,7 @@ fn validate_record_span(start: u64, end: u64, maximum_bytes: u64) -> Result<(), 
   Ok(())
 }
 
-fn read_bounded_record<R: Read>(reader: &mut csv::Reader<RecordSizeLimiter<R>>, record: &mut csv::StringRecord, maximum_bytes: u64) -> Result<bool, ProcessorError> {
+pub fn read_bounded_record<R: Read>(reader: &mut csv::Reader<RecordSizeLimiter<R>>, record: &mut csv::StringRecord, maximum_bytes: u64) -> Result<bool, ProcessorError> {
   let start = reader.position().byte();
   reader.get_mut().reset();
   let has_record = reader.read_record(record)?;
@@ -375,60 +483,55 @@ fn read_bounded_record<R: Read>(reader: &mut csv::Reader<RecordSizeLimiter<R>>, 
   Ok(has_record)
 }
 
-fn extract_and_batch_csv(job: CsvExtractJob, rows_processed_this_run: Arc<AtomicU64>, tx: tokio::sync::mpsc::Sender<BatchMessage>) -> Result<CsvExtractOutcome, ProcessorError> {
-  if rows_processed_this_run.load(Ordering::Relaxed) >= job.max_rows {
-    return Ok(CsvExtractOutcome { file_done: false, checkpoint: job.checkpoint, write_budget_exhausted: false });
-  }
+pub fn read_zip_csv_headers<R: Read + Seek>(archive: &mut ZipArchive<R>, csv_file: &str, max_record_bytes: u64) -> Result<(csv::StringRecord, u64), ProcessorError> {
+  let file = archive.by_name(csv_file)?;
+  let mut header_reader = csv::ReaderBuilder::new().has_headers(true).flexible(true).from_reader(RecordSizeLimiter::new(file, max_record_bytes));
+  let headers = header_reader.headers()?.clone();
+  let header_end = header_reader.position().byte();
+  validate_record_span(0, header_end, max_record_bytes)?;
+  Ok((headers, header_end))
+}
 
-  let mut archive = ZipArchive::new(File::open(&job.feed.path)?)?;
-  let (headers, header_end) = {
-    let file = archive.by_name(&job.csv_file)?;
-    let mut header_reader = csv::ReaderBuilder::new().has_headers(true).flexible(true).from_reader(RecordSizeLimiter::new(file, job.max_record_bytes));
-    let headers = header_reader.headers()?.clone();
-    let header_end = header_reader.position().byte();
-    validate_record_span(0, header_end, job.max_record_bytes)?;
-    (headers, header_end)
-  };
+pub type ZipCsvReader<'a, R> = csv::Reader<RecordSizeLimiter<zip::read::ZipFile<'a, R>>>;
 
-  let mut csv_indices = Vec::with_capacity(job.db_columns.len());
-  let mut matched_cols = Vec::with_capacity(job.db_columns.len());
-  for &db_column in job.db_columns {
-    if let Some(position) = headers.iter().position(|header| header == db_column) {
-      csv_indices.push(position);
-      matched_cols.push(db_column);
-    }
-  }
-
-  if matched_cols.is_empty() {
-    println!("[{}] No matching columns in {}, skipping", job.provider_name, job.csv_file);
-    return Ok(CsvExtractOutcome { file_done: true, checkpoint: job.checkpoint, write_budget_exhausted: false });
-  }
-
-  let insert_sql = positional_insert_sql(&job.table_name, &matched_cols, primary_keys(&job.provider_name, &job.table_name));
-  tx.blocking_send(BatchMessage::InitSql(insert_sql)).map_err(|_| ProcessorError::UploaderClosed)?;
-
-  let file = archive.by_name(&job.csv_file)?;
+pub fn resume_zip_csv_at_byte_offset<'a, R: Read + Seek>(
+  archive: &'a mut ZipArchive<R>,
+  csv_file: &str,
+  header_end: u64,
+  resume_byte: u64,
+  max_record_bytes: u64,
+) -> Result<(ZipCsvReader<'a, R>, u64), ProcessorError> {
+  let file = archive.by_name(csv_file)?;
   let uncompressed_size = file.size();
-  let has_byte_checkpoint = job.checkpoint.byte != 0;
-  if has_byte_checkpoint && job.checkpoint.byte < header_end {
-    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("saved byte offset {} for {} precedes the CSV header boundary {header_end}", job.checkpoint.byte, job.csv_file)).into());
+  let has_byte_checkpoint = resume_byte != 0;
+  if has_byte_checkpoint && resume_byte < header_end {
+    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("saved byte offset {resume_byte} for {csv_file} precedes the CSV header boundary {header_end}")).into());
   }
 
   let file = if has_byte_checkpoint {
-    let mut prefix = file.take(job.checkpoint.byte);
+    let mut prefix = file.take(resume_byte);
     let skipped = io::copy(&mut prefix, &mut io::sink())?;
     let file = prefix.into_inner();
-    if skipped != job.checkpoint.byte {
-      return Err(
-        io::Error::new(io::ErrorKind::UnexpectedEof, format!("saved byte offset {} for {} exceeds its {uncompressed_size}-byte uncompressed size", job.checkpoint.byte, job.csv_file)).into(),
-      );
+    if skipped != resume_byte {
+      return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("saved byte offset {resume_byte} for {csv_file} exceeds its {uncompressed_size}-byte uncompressed size")).into());
     }
     file
   } else {
     file
   };
 
-  let mut reader = csv::ReaderBuilder::new().has_headers(!has_byte_checkpoint).flexible(true).from_reader(RecordSizeLimiter::new(file, job.max_record_bytes));
+  let reader = csv::ReaderBuilder::new().has_headers(!has_byte_checkpoint).flexible(true).from_reader(RecordSizeLimiter::new(file, max_record_bytes));
+  Ok((reader, uncompressed_size))
+}
+
+fn extract_and_batch_csv(job: CsvExtractJob, rows_processed_this_run: Arc<AtomicU64>, tx: tokio::sync::mpsc::Sender<SerializedBatch>) -> Result<CsvExtractOutcome, ProcessorError> {
+  if rows_processed_this_run.load(Ordering::Relaxed) >= job.max_rows {
+    return Ok(CsvExtractOutcome { file_done: false, checkpoint: job.checkpoint, write_budget_exhausted: false });
+  }
+
+  let mut archive = ZipArchive::new(File::open(&job.feed.path)?)?;
+  let has_byte_checkpoint = job.checkpoint.byte != 0;
+  let (mut reader, uncompressed_size) = resume_zip_csv_at_byte_offset(&mut archive, &job.csv_file, job.header_end, job.checkpoint.byte, job.max_record_bytes)?;
   let mut record = csv::StringRecord::new();
   if !has_byte_checkpoint {
     reader.get_mut().reset();
@@ -441,16 +544,11 @@ fn extract_and_batch_csv(job: CsvExtractJob, rows_processed_this_run: Arc<Atomic
     }
   }
 
-  let maximum_payload_capacity = usize::try_from(job.max_payload_bytes).unwrap_or(usize::MAX);
-  let initial_capacity = job.batch_size.saturating_mul(64).min(256 * 1024).min(maximum_payload_capacity);
-  let mut json = Vec::with_capacity(initial_capacity);
-  json.push(b'[');
-  let mut batch_rows = 0_usize;
-  let mut batch_start = job.checkpoint;
   let mut local_checkpoint = job.checkpoint;
   if !has_byte_checkpoint {
     local_checkpoint.byte = reader.position().byte();
   }
+  let mut builder = JsonBatchBuilder::new(local_checkpoint, job.batch_size, job.max_payload_bytes, 64, "CSV row");
   let mut file_done = true;
 
   loop {
@@ -467,83 +565,15 @@ fn extract_and_batch_csv(job: CsvExtractJob, rows_processed_this_run: Arc<Atomic
     }
 
     let record_start = local_checkpoint;
-    let prefix_length = json.len();
-    let previous_batch_rows = batch_rows;
-    if previous_batch_rows == 0 {
-      batch_start = record_start;
-    } else {
-      json.push(b',');
-    }
-    let row_start = json.len();
-    append_positional_json_row(&mut json, &record, &csv_indices)?;
-    batch_rows += 1;
     let record_end = Checkpoint { line: record_start.line.saturating_add(1), byte: job.checkpoint.byte.saturating_add(reader.position().byte()) };
-
-    let mut serialized_bytes = u64::try_from(json.len().saturating_add(1)).unwrap_or(u64::MAX);
-    if serialized_bytes > job.max_payload_bytes && previous_batch_rows != 0 {
-      let row_payload = json.split_off(row_start);
-      json.truncate(prefix_length);
-      batch_rows = previous_batch_rows;
-      send_serialized_batch(&tx, &mut json, &mut batch_rows, batch_start, record_start)?;
-      batch_start = record_start;
-      json.extend_from_slice(&row_payload);
-      batch_rows = 1;
-      serialized_bytes = u64::try_from(json.len().saturating_add(1)).unwrap_or(u64::MAX);
-    }
-    if serialized_bytes > job.max_payload_bytes {
-      return Err(
-        io::Error::new(io::ErrorKind::InvalidData, format!("serialized CSV row made its statement payload {serialized_bytes} bytes, exceeding the configured {}-byte limit", job.max_payload_bytes))
-          .into(),
-      );
-    }
+    let write = |json: &mut Vec<u8>| append_positional_json_row(json, &record, &job.csv_indices);
+    let send = |batch| tx.blocking_send(batch).map_err(|_| ProcessorError::UploaderClosed);
+    builder.push_row(record_start, record_end, write, send)?;
     local_checkpoint = record_end;
-
-    if batch_rows >= job.batch_size || serialized_bytes == job.max_payload_bytes {
-      send_serialized_batch(&tx, &mut json, &mut batch_rows, batch_start, local_checkpoint)?;
-    }
   }
 
-  if batch_rows != 0 {
-    send_serialized_batch(&tx, &mut json, &mut batch_rows, batch_start, local_checkpoint)?;
-  }
-
+  builder.finish(local_checkpoint, |batch| tx.blocking_send(batch).map_err(|_| ProcessorError::UploaderClosed))?;
   Ok(CsvExtractOutcome { file_done, checkpoint: local_checkpoint, write_budget_exhausted: false })
-}
-
-fn primary_keys(provider_name: &str, table_name: &str) -> &'static [&'static str] {
-  include!(concat!(env!("OUT_DIR"), "/primary_keys.rs"))
-}
-
-fn positional_insert_sql(table_name: &str, columns: &[&str], keys: &[&str]) -> String {
-  let column_list = columns.iter().map(|column| quote_identifier(column)).collect::<Vec<_>>().join(", ");
-  let selects = (0..columns.len()).map(|index| format!("json_extract(value, '$[{index}]')")).collect::<Vec<_>>().join(", ");
-  let assignments = columns
-    .iter()
-    .filter(|column| !keys.contains(column))
-    .map(|column| {
-      let quoted = quote_identifier(column);
-      format!("{quoted} = excluded.{quoted}")
-    })
-    .collect::<Vec<_>>()
-    .join(", ");
-  let quoted_table = quote_identifier(table_name);
-  if assignments.is_empty() {
-    return format!("INSERT INTO {quoted_table} ({column_list}) SELECT {selects} FROM json_each(?) WHERE TRUE ON CONFLICT DO NOTHING");
-  }
-  let changed = columns
-    .iter()
-    .filter(|column| !keys.contains(column))
-    .map(|column| {
-      let quoted = quote_identifier(column);
-      format!("{quoted_table}.{quoted} IS NOT excluded.{quoted}")
-    })
-    .collect::<Vec<_>>()
-    .join(" OR ");
-  format!("INSERT INTO {quoted_table} ({column_list}) SELECT {selects} FROM json_each(?) WHERE TRUE ON CONFLICT DO UPDATE SET {assignments} WHERE {changed}")
-}
-
-fn quote_identifier(identifier: &str) -> String {
-  format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn append_positional_json_row(json: &mut Vec<u8>, record: &csv::StringRecord, csv_indices: &[usize]) -> Result<(), serde_json::Error> {
@@ -558,15 +588,6 @@ fn append_positional_json_row(json: &mut Vec<u8>, record: &csv::StringRecord, cs
   Ok(())
 }
 
-fn send_serialized_batch(tx: &tokio::sync::mpsc::Sender<BatchMessage>, json: &mut Vec<u8>, batch_rows: &mut usize, start: Checkpoint, end: Checkpoint) -> Result<(), ProcessorError> {
-  json.push(b']');
-  let next_capacity = json.capacity();
-  let payload = String::from_utf8(std::mem::replace(json, Vec::with_capacity(next_capacity)))?;
-  json.push(b'[');
-  *batch_rows = 0;
-  tx.blocking_send(BatchMessage::Data(SerializedBatch { payload, start, end })).map_err(|_| ProcessorError::UploaderClosed)
-}
-
 fn try_claim_row(counter: &AtomicU64, maximum: u64) -> bool {
   counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| (current < maximum).then_some(current + 1)).is_ok()
 }
@@ -578,31 +599,200 @@ enum BatchCompletion {
   Failed,
 }
 
-fn record_task_result(result: Result<BatchTaskResult, JoinError>, provider_name: &str, statuses: &mut BTreeMap<u64, (Checkpoint, bool)>) -> BatchCompletion {
+fn classify_batch_result(result: Result<(), ProcessorError>, provider_name: &str, kind: &str) -> (BatchCompletion, Option<ProcessorError>) {
+  match result {
+    Ok(()) => (BatchCompletion::Success, None),
+    Err(ProcessorError::D1(error @ D1Error::WriteBudgetExhausted { .. })) => {
+      println!("[{provider_name}] {error}");
+      (BatchCompletion::WriteBudgetExhausted, None)
+    }
+    Err(error) => {
+      println!("[{provider_name}] D1 {kind} failed: {error}");
+      (BatchCompletion::Failed, Some(error))
+    }
+  }
+}
+
+fn record_task_result(result: Result<BatchTaskResult, JoinError>, provider_name: &str, kind: &str, statuses: &mut BTreeMap<u64, (Checkpoint, bool)>) -> (BatchCompletion, Option<ProcessorError>) {
   match result {
     Ok(BatchTaskResult { ranges, result }) => {
-      let completion = match result {
-        Ok(()) => BatchCompletion::Success,
-        Err(ProcessorError::D1(error @ D1Error::WriteBudgetExhausted { .. })) => {
-          println!("[{provider_name}] {error}");
-          BatchCompletion::WriteBudgetExhausted
-        }
-        Err(error) => {
-          println!("[{}] D1 batch group failed: {}", provider_name, error);
-          BatchCompletion::Failed
-        }
-      };
+      let (completion, error) = classify_batch_result(result, provider_name, kind);
       let succeeded = completion == BatchCompletion::Success;
       for (start, end) in ranges {
         statuses.insert(start.line, (end, succeeded));
       }
-      completion
+      (completion, error)
     }
     Err(error) => {
-      println!("[{}] D1 batch task failed to join: {}", provider_name, error);
-      BatchCompletion::Failed
+      println!("[{}] D1 {} task failed to join: {}", provider_name, kind, error);
+      (BatchCompletion::Failed, Some(ProcessorError::TaskJoin(error)))
     }
   }
+}
+
+#[derive(Default)]
+struct CsvStopTimeKeySet {
+  stop_ids: HashMap<Box<str>, u32>,
+  trip_ids: HashMap<Box<str>, u32>,
+  int_keys: HashSet<(u32, u32, i64)>,
+  text_keys: HashSet<(Box<str>, Box<str>, Box<str>)>,
+}
+
+fn intern_key_part(map: &mut HashMap<Box<str>, u32>, value: &str) -> Result<u32, ProcessorError> {
+  if let Some(&id) = map.get(value) {
+    return Ok(id);
+  }
+  let id = u32::try_from(map.len()).map_err(|_| io::Error::other("stop_times interner exceeded u32::MAX entries"))?;
+  map.insert(Box::from(value), id);
+  Ok(id)
+}
+
+fn parse_stop_sequence_integer(raw: &str) -> Option<i64> {
+  let trimmed = raw.trim();
+  if let Ok(value) = trimmed.parse::<i64>() {
+    return Some(value);
+  }
+  let (whole, fraction) = trimmed.split_once('.')?;
+  if !fraction.is_empty() && fraction.bytes().all(|byte| byte == b'0') { whole.parse::<i64>().ok() } else { None }
+}
+
+impl CsvStopTimeKeySet {
+  fn is_empty(&self) -> bool {
+    self.int_keys.is_empty() && self.text_keys.is_empty()
+  }
+
+  fn insert(&mut self, stop_id: &str, trip_id: &str, stop_sequence: &str) -> Result<(), ProcessorError> {
+    if let Some(sequence) = parse_stop_sequence_integer(stop_sequence) {
+      let stop_index = intern_key_part(&mut self.stop_ids, stop_id)?;
+      let trip_index = intern_key_part(&mut self.trip_ids, trip_id)?;
+      self.int_keys.insert((stop_index, trip_index, sequence));
+    } else {
+      self.text_keys.insert((Box::from(stop_id), Box::from(trip_id), Box::from(stop_sequence)));
+    }
+    Ok(())
+  }
+
+  fn contains(&self, stop_id: &serde_json::Value, trip_id: &serde_json::Value, stop_sequence: &serde_json::Value) -> bool {
+    let (Some(stop_id), Some(trip_id)) = (stop_id.as_str(), trip_id.as_str()) else {
+      return false;
+    };
+    if let Some(sequence) = stop_sequence.as_i64() {
+      let (Some(&stop_index), Some(&trip_index)) = (self.stop_ids.get(stop_id), self.trip_ids.get(trip_id)) else {
+        return false;
+      };
+      return self.int_keys.contains(&(stop_index, trip_index, sequence));
+    }
+    if let Some(sequence) = stop_sequence.as_str() {
+      if self.text_keys.is_empty() {
+        return false;
+      }
+      return self.text_keys.contains(&(Box::from(stop_id), Box::from(trip_id), Box::from(sequence)));
+    }
+    false
+  }
+}
+
+fn extract_stop_time_keys(feed: &TemporaryFeed, csv_file: &str, max_record_bytes: u64) -> Result<Option<CsvStopTimeKeySet>, ProcessorError> {
+  let mut archive = ZipArchive::new(File::open(&feed.path)?)?;
+  let file = archive.by_name(csv_file)?;
+  let mut reader = csv::ReaderBuilder::new().has_headers(true).flexible(true).from_reader(RecordSizeLimiter::new(file, max_record_bytes));
+  reader.get_mut().reset();
+  let headers = reader.headers()?.clone();
+  validate_record_span(0, reader.position().byte(), max_record_bytes)?;
+
+  let Some(stop_id_index) = headers.iter().position(|header| header == "stop_id") else {
+    return Ok(None);
+  };
+  let Some(trip_id_index) = headers.iter().position(|header| header == "trip_id") else {
+    return Ok(None);
+  };
+  let Some(stop_sequence_index) = headers.iter().position(|header| header == "stop_sequence") else {
+    return Ok(None);
+  };
+
+  let mut keys = CsvStopTimeKeySet::default();
+  let mut record = csv::StringRecord::new();
+  while read_bounded_record(&mut reader, &mut record, max_record_bytes)? {
+    if let (Some(stop_id), Some(trip_id), Some(stop_sequence)) = (record.get(stop_id_index), record.get(trip_id_index), record.get(stop_sequence_index)) {
+      keys.insert(stop_id, trip_id, stop_sequence)?;
+    }
+  }
+
+  Ok(Some(keys))
+}
+
+struct StopTimePageScan {
+  stale_rowids: Vec<i64>,
+  last_cursor: Option<[serde_json::Value; 3]>,
+}
+
+fn collect_stale_stop_times_from_page(rows: Vec<serde_json::Value>, csv_keys: &CsvStopTimeKeySet) -> Result<StopTimePageScan, ProcessorError> {
+  let mut stale_rowids = Vec::new();
+  let mut last_cursor = None;
+
+  for row in rows {
+    let serde_json::Value::Object(mut object) = row else {
+      return Err(ProcessorError::D1(D1Error::ApiError("D1 stop_times key query returned a non-object row".to_owned())));
+    };
+    let Some(rowid_value) = object.remove("rowid") else {
+      return Err(ProcessorError::D1(D1Error::ApiError("D1 stop_times key query omitted rowid".to_owned())));
+    };
+    let Some(rowid) = rowid_value.as_i64() else {
+      return Err(ProcessorError::D1(D1Error::ApiError(format!("D1 stop_times key query returned non-integer rowid: {rowid_value}"))));
+    };
+    let Some(stop_id) = object.remove("stop_id") else {
+      return Err(ProcessorError::D1(D1Error::ApiError("D1 stop_times key query omitted stop_id".to_owned())));
+    };
+    let Some(trip_id) = object.remove("trip_id") else {
+      return Err(ProcessorError::D1(D1Error::ApiError("D1 stop_times key query omitted trip_id".to_owned())));
+    };
+    let Some(stop_sequence) = object.remove("stop_sequence") else {
+      return Err(ProcessorError::D1(D1Error::ApiError("D1 stop_times key query omitted stop_sequence".to_owned())));
+    };
+
+    if stop_id.is_null() || trip_id.is_null() || stop_sequence.is_null() {
+      stale_rowids.push(rowid);
+      continue;
+    }
+
+    let key = [stop_id, trip_id, stop_sequence];
+    let [stop_id_ref, trip_id_ref, stop_sequence_ref] = &key;
+    if !csv_keys.contains(stop_id_ref, trip_id_ref, stop_sequence_ref) {
+      stale_rowids.push(rowid);
+    }
+    last_cursor = Some(key);
+  }
+
+  Ok(StopTimePageScan { stale_rowids, last_cursor })
+}
+
+fn serialize_delete_rowid_batches(rowids: &[i64], batch_size: usize, max_payload_bytes: u64) -> Result<Vec<SerializedBatch>, ProcessorError> {
+  if rowids.is_empty() {
+    return Ok(Vec::new());
+  }
+
+  let mut batches = Vec::new();
+  let mut builder = JsonBatchBuilder::new(Checkpoint::default(), batch_size, max_payload_bytes, 16, "stop_times rowid");
+  for (index, &rowid) in rowids.iter().enumerate() {
+    let line = u64::try_from(index).unwrap_or(u64::MAX);
+    let start = Checkpoint { line, byte: line };
+    let end = Checkpoint { line: line.saturating_add(1), byte: line.saturating_add(1) };
+    builder.push_row(
+      start,
+      end,
+      |json| serde_json::to_writer(json, &rowid),
+      |batch| {
+        batches.push(batch);
+        Ok(())
+      },
+    )?;
+  }
+  let final_line = u64::try_from(rowids.len()).unwrap_or(u64::MAX);
+  builder.finish(Checkpoint { line: final_line, byte: final_line }, |batch| {
+    batches.push(batch);
+    Ok(())
+  })?;
+  Ok(batches)
 }
 
 fn contiguous_committed_checkpoint(initial: Checkpoint, statuses: &BTreeMap<u64, (Checkpoint, bool)>) -> Checkpoint {
@@ -644,80 +834,91 @@ impl ProviderProcessor {
     }
   }
 
-  async fn upload_batches(&self, initial: Checkpoint, mut receiver: tokio::sync::mpsc::Receiver<BatchMessage>) -> UploadOutcome {
-    let mut worker: Option<Arc<BatchWorker>> = None;
-    let mut pending = Vec::with_capacity(self.runtime.d1_statements_per_request);
-    let mut batch_tasks = JoinSet::new();
-    let mut statuses = BTreeMap::new();
-    let mut had_error = false;
-    let mut write_budget_exhausted = false;
-
-    while let Some(message) = receiver.recv().await {
-      match message {
-        BatchMessage::InitSql(sql) => {
-          if worker.is_none() {
-            worker = Some(Arc::new(BatchWorker {
-              d1_client: self.d1_client.clone(),
-              database_id: Arc::from(self.provider.database_id.as_str()),
-              insert_sql: Arc::from(sql),
-              database_semaphore: self.database_semaphore.clone(),
-              provider_name: Arc::from(self.provider.name.as_str()),
-            }));
-          }
-        }
-        BatchMessage::Data(batch) => {
-          pending.push(batch);
-          if pending.len() < self.runtime.d1_statements_per_request {
-            continue;
-          }
-
-          while batch_tasks.len() >= self.runtime.d1_database_concurrency_limit {
-            if let Some(result) = batch_tasks.join_next().await {
-              match record_task_result(result, &self.provider.name, &mut statuses) {
-                BatchCompletion::Success => {}
-                BatchCompletion::WriteBudgetExhausted => write_budget_exhausted = true,
-                BatchCompletion::Failed => had_error = true,
-              }
-              if had_error || write_budget_exhausted {
-                break;
-              }
-            }
-          }
-          if had_error || write_budget_exhausted {
-            break;
-          }
-          if let Some(worker) = worker.as_ref() {
-            worker.spawn_group(&mut batch_tasks, &mut pending);
-          } else {
-            println!("[{}] Received CSV data before insert SQL initialization", self.provider.name);
-            had_error = true;
-            break;
-          }
-        }
-      }
-    }
-
-    if !had_error && !write_budget_exhausted && !pending.is_empty() {
-      if let Some(worker) = worker.as_ref() {
-        worker.spawn_group(&mut batch_tasks, &mut pending);
-      } else {
-        had_error = true;
-      }
-    }
-    drop(receiver);
-
-    while let Some(result) = batch_tasks.join_next().await {
-      match record_task_result(result, &self.provider.name, &mut statuses) {
-        BatchCompletion::Success => {}
-        BatchCompletion::WriteBudgetExhausted => write_budget_exhausted = true,
-        BatchCompletion::Failed => had_error = true,
-      }
-    }
-
-    UploadOutcome { committed_through: contiguous_committed_checkpoint(initial, &statuses), had_error, write_budget_exhausted }
+  fn group_executor(&self, sql: Arc<str>, failure_label: &'static str) -> Arc<StatementGroupExecutor> {
+    Arc::new(StatementGroupExecutor {
+      d1_client: self.d1_client.clone(),
+      database_id: Arc::from(self.provider.database_id.as_str()),
+      sql,
+      database_semaphore: self.database_semaphore.clone(),
+      provider_name: Arc::from(self.provider.name.as_str()),
+      statements_per_request: self.runtime.d1_statements_per_request,
+      database_concurrency_limit: self.runtime.d1_database_concurrency_limit,
+      failure_label,
+    })
   }
 
-  #[allow(clippy::too_many_arguments)]
+  async fn purge_stale_stop_times(&self, feed: Arc<TemporaryFeed>, csv_file: &str) -> Result<bool, ProcessorError> {
+    self.purge_stale_stop_times_with_page_size(feed, csv_file, STOP_TIMES_KEY_PAGE_SIZE).await
+  }
+
+  async fn purge_stale_stop_times_with_page_size(&self, feed: Arc<TemporaryFeed>, csv_file: &str, page_size: usize) -> Result<bool, ProcessorError> {
+    let csv_permit = self.csv_semaphore.clone().acquire_owned().await.map_err(|error| ProcessorError::D1(D1Error::ApiError(format!("Failed to acquire CSV producer permit: {error}"))))?;
+    let csv_file_owned = csv_file.to_owned();
+    let max_record_bytes = self.runtime.max_csv_record_bytes;
+    let Some(csv_keys) = tokio::task::spawn_blocking(move || {
+      let _csv_permit = csv_permit;
+      extract_stop_time_keys(&feed, &csv_file_owned, max_record_bytes)
+    })
+    .await??
+    else {
+      return Ok(true);
+    };
+
+    if csv_keys.is_empty() {
+      println!("[{}] Skipping stale stop_times cleanup because {} contained zero rows", self.provider.name, csv_file);
+      return Ok(true);
+    }
+
+    let delete_executor = self.group_executor(Arc::from(DELETE_STALE_STOP_TIMES_SQL), "delete batch group");
+    let mut cursor: Option<[serde_json::Value; 3]> = None;
+    let mut deleted_total = 0_u64;
+
+    loop {
+      let query = match cursor.as_ref() {
+        None => D1Query { sql: SELECT_STOP_TIMES_KEYS_FIRST_PAGE_SQL, params: vec![serde_json::Value::Number(page_size.into())] },
+        Some([stop_id, trip_id, stop_sequence]) => {
+          D1Query { sql: SELECT_STOP_TIMES_KEYS_AFTER_SQL, params: vec![stop_id.clone(), trip_id.clone(), stop_sequence.clone(), serde_json::Value::Number(page_size.into())] }
+        }
+      };
+      let mut results = match self.d1_client.query_rows(&self.provider.database_id, query).await {
+        Ok(results) => results,
+        Err(error @ D1Error::WriteBudgetExhausted { .. }) => {
+          println!("[{}] {error}", self.provider.name);
+          return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+      };
+      let rows = results.pop().map(|result| result.results).unwrap_or_default();
+      let page_len = rows.len();
+      let scan = collect_stale_stop_times_from_page(rows, &csv_keys)?;
+
+      if !scan.stale_rowids.is_empty() {
+        let stale_count = u64::try_from(scan.stale_rowids.len()).unwrap_or(u64::MAX);
+        let batches = serialize_delete_rowid_batches(&scan.stale_rowids, self.runtime.query_statement_batch_size, self.runtime.max_statement_payload_bytes)?;
+        if !delete_executor.clone().execute_batches(batches).await? {
+          return Ok(false);
+        }
+        deleted_total = deleted_total.saturating_add(stale_count);
+      }
+
+      if page_len < page_size {
+        break;
+      }
+      match scan.last_cursor {
+        Some(next_cursor) => cursor = Some(next_cursor),
+        None if !scan.stale_rowids.is_empty() => {}
+        None => {
+          return Err(ProcessorError::D1(D1Error::ApiError("stop_times keyset pagination did not produce a cursor".to_owned())));
+        }
+      }
+    }
+
+    if deleted_total != 0 {
+      println!("[{}] Removed {} stale stop_times row(s)", self.provider.name, deleted_total);
+    }
+    Ok(true)
+  }
+
   async fn process_csv_file(
     &self,
     feed: Arc<TemporaryFeed>,
@@ -739,14 +940,54 @@ impl ProviderProcessor {
       }
       Err(error) => return Err(error.into()),
     };
-    let csv_permit = self.csv_semaphore.clone().acquire_owned().await.map_err(|error| ProcessorError::D1(D1Error::ApiError(format!("Failed to acquire CSV producer permit: {error}"))))?;
+
+    let (checkpoint_to_save, completed, outcome_result) = self.run_csv_import_session(feed, csv_file, table_name, db_columns, checkpoint).await;
+    let update = FileProgressUpdate { file: csv_file, checkpoint: checkpoint_to_save, completed };
+    self.d1_client.save_file_progress(progress_reservation, &self.provider.database_id, update).await?;
+    outcome_result
+  }
+
+  async fn run_csv_import_session(
+    &self,
+    feed: Arc<TemporaryFeed>,
+    csv_file: &str,
+    table_name: &str,
+    db_columns: &'static [&'static str],
+    checkpoint: Checkpoint,
+  ) -> (Checkpoint, bool, Result<CsvExtractOutcome, ProcessorError>) {
+    let csv_permit = match self.csv_semaphore.clone().acquire_owned().await {
+      Ok(permit) => permit,
+      Err(error) => {
+        return (checkpoint, false, Err(ProcessorError::D1(D1Error::ApiError(format!("Failed to acquire CSV producer permit: {error}")))));
+      }
+    };
+
+    let header_feed = feed.clone();
+    let header_csv_file = csv_file.to_owned();
+    let max_record_bytes = self.runtime.max_csv_record_bytes;
+    let header_scan = tokio::task::spawn_blocking(move || -> Result<(csv::StringRecord, u64), ProcessorError> {
+      let mut archive = ZipArchive::new(File::open(&header_feed.path)?)?;
+      read_zip_csv_headers(&mut archive, &header_csv_file, max_record_bytes)
+    })
+    .await;
+
+    let (headers, header_end) = match header_scan {
+      Ok(Ok(result)) => result,
+      Ok(Err(error)) => return (checkpoint, false, Err(error)),
+      Err(error) => return (checkpoint, false, Err(ProcessorError::TaskJoin(error))),
+    };
+
+    let Some(plan) = SchemaCatalog::plan_table_import(&self.provider.name, table_name, db_columns, &headers) else {
+      println!("[{}] No matching columns in {}, skipping", self.provider.name, csv_file);
+      return (checkpoint, true, Ok(CsvExtractOutcome { file_done: true, checkpoint, write_budget_exhausted: false }));
+    };
+
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
     let job = CsvExtractJob {
-      feed,
-      provider_name: self.provider.name.clone(),
+      feed: feed.clone(),
       csv_file: csv_file.to_owned(),
-      table_name: table_name.to_owned(),
-      db_columns,
+      csv_indices: plan.csv_indices,
+      header_end,
       checkpoint,
       batch_size: self.runtime.query_statement_batch_size,
       max_rows: self.max_rows,
@@ -759,49 +1000,58 @@ impl ProviderProcessor {
       extract_and_batch_csv(job, rows_processed, sender)
     });
 
-    let upload = self.upload_batches(checkpoint, receiver).await;
+    let upload = self.group_executor(plan.insert_sql, "batch group").execute_channel(checkpoint, receiver).await;
     let extraction = match blocking_handle.await {
       Ok(result) => result,
       Err(error) => Err(ProcessorError::TaskJoin(error)),
     };
 
     if upload.had_error {
-      self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
-      if let Err(error) = extraction {
-        return Err(error);
-      }
-      return Err(ProcessorError::D1(D1Error::ApiError("One or more D1 batch groups failed".to_owned())));
+      let error = upload
+        .first_error
+        .or_else(|| extraction.err().filter(|error| !matches!(error, ProcessorError::UploaderClosed)))
+        .unwrap_or_else(|| ProcessorError::D1(D1Error::ApiError("One or more D1 batch groups failed".to_owned())));
+      return (upload.committed_through, false, Err(error));
     }
 
     if upload.write_budget_exhausted {
-      self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
-      match extraction {
-        Ok(_) | Err(ProcessorError::UploaderClosed) => {}
-        Err(error) => return Err(error),
+      if let Err(error) = extraction
+        && !matches!(error, ProcessorError::UploaderClosed)
+      {
+        return (upload.committed_through, false, Err(error));
       }
-      return Ok(CsvExtractOutcome { file_done: false, checkpoint: upload.committed_through, write_budget_exhausted: true });
+      return (upload.committed_through, false, Ok(CsvExtractOutcome { file_done: false, checkpoint: upload.committed_through, write_budget_exhausted: true }));
     }
 
     let extraction = match extraction {
       Ok(extraction) => extraction,
-      Err(error) => {
-        self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
-        return Err(error);
-      }
+      Err(error) => return (upload.committed_through, false, Err(error)),
     };
+
     if !producer_checkpoint_is_committed(extraction.checkpoint, upload.committed_through) {
-      self.d1_client.update_file_progress(progress_reservation, &self.provider.database_id, csv_file, upload.committed_through.line, upload.committed_through.byte, 1).await?;
-      return Err(ProcessorError::D1(D1Error::ApiError(format!(
-        "CSV producer reached row {} at byte {}, but only row {} at byte {} was committed",
-        extraction.checkpoint.line, extraction.checkpoint.byte, upload.committed_through.line, upload.committed_through.byte,
-      ))));
+      return (
+        upload.committed_through,
+        false,
+        Err(ProcessorError::D1(D1Error::ApiError(format!(
+          "CSV producer reached row {} at byte {}, but only row {} at byte {} was committed",
+          extraction.checkpoint.line, extraction.checkpoint.byte, upload.committed_through.line, upload.committed_through.byte,
+        )))),
+      );
     }
 
-    self
-      .d1_client
-      .update_file_progress(progress_reservation, &self.provider.database_id, csv_file, extraction.checkpoint.line, extraction.checkpoint.byte, if extraction.file_done { 0 } else { 1 })
-      .await?;
-    Ok(extraction)
+    if extraction.file_done && table_name == "stop_times" {
+      match self.purge_stale_stop_times(feed, csv_file).await {
+        Ok(true) => {}
+        Ok(false) => {
+          return (extraction.checkpoint, false, Ok(CsvExtractOutcome { file_done: false, checkpoint: extraction.checkpoint, write_budget_exhausted: true }));
+        }
+        Err(error) => {
+          return (extraction.checkpoint, false, Err(error));
+        }
+      }
+    }
+
+    (extraction.checkpoint, extraction.file_done, Ok(extraction))
   }
 }
 
@@ -827,7 +1077,7 @@ fn discover_supported_files(
     let Some(table_name) = base_name.strip_suffix(".txt") else {
       continue;
     };
-    if matches!(table_name, "departure_cache" | "0_daily_import_budget" | "0_import_progress" | "0_dataset_versions") {
+    if SchemaCatalog::is_infrastructure_table(table_name) {
       continue;
     }
     let Some(db_columns) = schemas.iter().find(|(schema_table, _)| *schema_table == table_name).map(|(_, columns)| *columns) else {
@@ -862,7 +1112,9 @@ pub async fn prepare_provider(
 ) -> Result<Option<PreparedProvider>, ProcessorError> {
   rotate_database_if_needed(d1_client, &mut provider, providers_file_lock, database_rotation_lock, runtime.db_size_threshold_bytes, runtime.d1_max_databases).await?;
 
-  let Some(download) = download_feed(d1_client, &provider, runtime.max_feed_download_bytes, temp_storage).await? else {
+  let user_agent = concat!("my-GTFS-worker/", env!("CARGO_PKG_VERSION"));
+  let feed_http_client = Client::builder().connect_timeout(runtime.http_connect_timeout).timeout(runtime.http_request_timeout).user_agent(user_agent).build()?;
+  let Some(download) = download_feed(d1_client, &feed_http_client, &provider, runtime.max_feed_download_bytes, temp_storage).await? else {
     return Ok(None);
   };
   if download.remote_etag.is_empty() {
@@ -872,17 +1124,17 @@ pub async fn prepare_provider(
   }
   println!("[{}] Downloaded {} bytes to temporary storage", provider.name, download.size);
 
-  let schemas = parse_provider_schemas(&provider.name).unwrap_or(&[]);
+  let schemas = SchemaCatalog::provider_schemas(&provider.name).unwrap_or(&[]);
   let scan_feed = download.file.clone();
   let provider_name = provider.name.clone();
   let maximum_uncompressed_bytes = runtime.max_uncompressed_feed_bytes;
   let discovered = tokio::task::spawn_blocking(move || discover_supported_files(&scan_feed, &provider_name, schemas, maximum_uncompressed_bytes)).await??;
 
-  let progress_rows = d1_client.get_all_files_progress(&provider.database_id).await?;
+  let progress_rows = d1_client.get_files_progress(&provider.database_id).await?;
   let mut files = Vec::with_capacity(discovered.len());
   for file in discovered {
-    let row = progress_rows.iter().find(|row| row.get("FileName").and_then(serde_json::Value::as_str) == Some(file.csv_file.as_str()));
-    let Some(checkpoint) = get_resume_state(row, &file.csv_file, &file.crc, &provider.name) else {
+    let stored = progress_rows.iter().find(|row| row.file_name == file.csv_file);
+    let Some(checkpoint) = resolve_resume_checkpoint(stored, &file.csv_file, &file.crc, &provider.name) else {
       continue;
     };
     files.push(PreparedFile { csv_file: file.csv_file, crc: file.crc, table_name: file.table_name, db_columns: file.db_columns, checkpoint });
@@ -896,7 +1148,7 @@ pub async fn prepare_provider(
     return Ok(None);
   }
 
-  let progress = files.iter().map(|file| FileProgressInit { file: &file.csv_file, crc: &file.crc, line: file.checkpoint.line, byte: file.checkpoint.byte }).collect::<Vec<_>>();
+  let progress = files.iter().map(|file| FileProgressInit { file: &file.csv_file, crc: &file.crc, checkpoint: file.checkpoint }).collect::<Vec<_>>();
   d1_client.init_files_progress(&provider.database_id, &progress).await?;
 
   Ok(Some(PreparedProvider { provider, download, files }))
@@ -958,7 +1210,7 @@ pub async fn process_prepared_provider(
 
   remaining_files.sort_by(|left, right| left.csv_file.cmp(&right.csv_file));
   if remaining_files.is_empty() {
-    let maintenance_sqls = provider_maintenance_queries(&provider.name);
+    let maintenance_sqls = SchemaCatalog::maintenance_queries(&provider.name);
     if !maintenance_sqls.is_empty() {
       println!("[{}] All files imported. Running post-ingest data maintenance...", provider.name);
       d1_client.execute_maintenance_statements(&provider.database_id, &maintenance_sqls).await?;
@@ -990,12 +1242,12 @@ async fn create_temporary_feed(storage: Arc<TempFeedStorage>) -> Result<(tokio::
   Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not allocate a unique temporary feed path after 16 attempts").into())
 }
 
-async fn download_feed(d1_client: &D1Client, provider: &ProviderConfig, maximum_bytes: u64, storage: Arc<TempFeedStorage>) -> Result<Option<DownloadedFeed>, ProcessorError> {
+async fn download_feed(d1_client: &D1Client, http_client: &Client, provider: &ProviderConfig, maximum_bytes: u64, storage: Arc<TempFeedStorage>) -> Result<Option<DownloadedFeed>, ProcessorError> {
   let target_url = format!("{}{}", provider.static_url, provider.static_provider);
   let previous_etag = d1_client.get_dataset_version(&provider.database_id).await?.unwrap_or_default();
 
   println!("[{}] Fetching GTFS zip from {}", provider.name, target_url);
-  let mut request = d1_client.client.get(&target_url);
+  let mut request = http_client.get(&target_url);
   if !previous_etag.is_empty() {
     request = request.header(IF_NONE_MATCH, previous_etag.as_str());
   }
@@ -1008,7 +1260,7 @@ async fn download_feed(d1_client: &D1Client, provider: &ProviderConfig, maximum_
       return Ok(None);
     }
     println!("[{}] Feed unchanged, but progress is missing or {} files are incomplete. Resuming.", provider.name, incomplete);
-    response = d1_client.client.get(&target_url).send().await?;
+    response = http_client.get(&target_url).send().await?;
   }
 
   response = response.error_for_status()?;
@@ -1043,6 +1295,19 @@ async fn rotate_database_if_needed(
   threshold_bytes: u64,
   max_databases: usize,
 ) -> Result<(), ProcessorError> {
+  rotate_database_if_needed_in(d1_client, provider, "providers.toml", providers_file_lock, database_rotation_lock, threshold_bytes, max_databases).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rotate_database_if_needed_in(
+  d1_client: &D1Client,
+  provider: &mut ProviderConfig,
+  providers_path: &str,
+  providers_file_lock: Arc<Mutex<()>>,
+  database_rotation_lock: Arc<tokio::sync::Mutex<()>>,
+  threshold_bytes: u64,
+  max_databases: usize,
+) -> Result<(), ProcessorError> {
   let database = d1_client.get_database_info(&provider.database_id).await?;
   if database.file_size < threshold_bytes {
     return Ok(());
@@ -1067,7 +1332,7 @@ async fn rotate_database_if_needed(
   println!("[{}] Created new database {} with UUID {}", provider.name, new_db_name, new_uuid);
 
   let setup = async {
-    if let Some(schema_sqls) = get_provider_schema_sql(&provider.name) {
+    if let Some(schema_sqls) = SchemaCatalog::provider_migrations(&provider.name) {
       println!("[{}] Applying schemas to new database...", provider.name);
       for schema_sql in schema_sqls {
         d1_client.execute_schema(&new_uuid, schema_sql).await?;
@@ -1076,7 +1341,7 @@ async fn rotate_database_if_needed(
       return Err(ProcessorError::D1(D1Error::ApiError(format!("No schema SQL found for provider {}", provider.name))));
     }
 
-    persist_database_id("providers.toml".to_owned(), provider.name.clone(), provider.database_id.clone(), database.name, new_uuid.clone(), now.to_rfc3339(), providers_file_lock).await
+    persist_database_id(providers_path.to_owned(), provider.name.clone(), provider.database_id.clone(), database.name, new_uuid.clone(), now.to_rfc3339(), providers_file_lock).await
   }
   .await;
 
@@ -1146,7 +1411,69 @@ async fn persist_database_id(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::d1::{D1DatabaseInfo, D1Meta, D1Result, InMemoryTransport};
   use std::io::{Cursor, Write};
+  use std::time::Duration;
+
+  struct TempTestFile(PathBuf);
+
+  impl Drop for TempTestFile {
+    fn drop(&mut self) {
+      let _ = std::fs::remove_file(&self.0);
+    }
+  }
+
+  fn unique_temp_path(label: &str, extension: &str) -> PathBuf {
+    let sequence = TEMP_FEED_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("my-gtfs-worker-{label}-{}-{sequence}.{extension}", std::process::id()))
+  }
+
+  fn temp_zip_feed(label: &str, entry_name: &str, content: &[u8]) -> Result<Arc<TemporaryFeed>, Box<dyn std::error::Error>> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file(entry_name, zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated))?;
+    writer.write_all(content)?;
+    let archive = writer.finish()?.into_inner();
+    let path = unique_temp_path(label, "zip");
+    std::fs::write(&path, archive)?;
+    let reserved_bytes = std::fs::metadata(&path)?.len();
+    let storage = Arc::new(TempFeedStorage::new(reserved_bytes));
+    storage.reserve(reserved_bytes)?;
+    Ok(Arc::new(TemporaryFeed { path, storage, reserved_bytes }))
+  }
+
+  fn test_runtime_config() -> RuntimeConfig {
+    RuntimeConfig {
+      csv_concurrency_limit: 1,
+      d1_global_concurrency_limit: 2,
+      d1_database_concurrency_limit: 1,
+      d1_max_databases: 10,
+      query_statement_batch_size: 10,
+      d1_statements_per_request: 2,
+      max_d1_rows_written_per_workflow: 100,
+      max_rows_per_workflow: 10,
+      max_feed_download_bytes: 1024 * 1024,
+      max_uncompressed_feed_bytes: 1024 * 1024,
+      max_csv_record_bytes: 1024,
+      max_statement_payload_bytes: 4096,
+      max_temp_feed_storage_bytes: 1024 * 1024,
+      db_size_threshold_bytes: 1024 * 1024,
+      http_connect_timeout: Duration::from_secs(1),
+      http_request_timeout: Duration::from_secs(1),
+      d1_query_timeout: Duration::from_secs(1),
+    }
+  }
+
+  fn test_provider(name: &str, database_id: &str) -> ProviderConfig {
+    ProviderConfig { name: name.to_owned(), is_active: true, static_url: String::new(), static_provider: String::new(), database_id: database_id.to_owned() }
+  }
+
+  fn ok_write_result(rows_written: u64) -> D1Result {
+    D1Result { results: Vec::new(), meta: Some(D1Meta { rows_read: 0, rows_written: Some(rows_written) }), success: Some(true) }
+  }
+
+  fn ok_rows_result(results: Vec<serde_json::Value>) -> D1Result {
+    D1Result { meta: Some(D1Meta { rows_read: u64::try_from(results.len()).unwrap_or(u64::MAX), rows_written: Some(0) }), results, success: Some(true) }
+  }
 
   #[test]
   fn positional_json_escapes_values_and_represents_missing_fields_as_null() {
@@ -1158,102 +1485,243 @@ mod tests {
   }
 
   #[test]
-  fn positional_sql_quotes_identifiers() {
-    assert_eq!(
-      positional_insert_sql("stop_times", &["trip_id", "stop_sequence"], &[]),
-      "INSERT INTO \"stop_times\" (\"trip_id\", \"stop_sequence\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?) WHERE TRUE ON CONFLICT DO UPDATE SET \"trip_id\" = excluded.\"trip_id\", \"stop_sequence\" = excluded.\"stop_sequence\" WHERE \"stop_times\".\"trip_id\" IS NOT excluded.\"trip_id\" OR \"stop_times\".\"stop_sequence\" IS NOT excluded.\"stop_sequence\""
-    );
-  }
-
-  #[test]
-  fn upserts_preserve_primary_keys_and_skip_key_only_conflicts() {
-    let keys = primary_keys("ktmb", "stop_times");
-    assert_eq!(keys, &["stop_id", "trip_id", "stop_sequence"]);
-    let sql = positional_insert_sql("stop_times", &["stop_id", "trip_id", "stop_sequence", "arrival_time"], keys);
-    let update = sql.split_once("DO UPDATE SET").map(|(_, update)| update).unwrap_or_default();
-    assert!(update.contains("\"arrival_time\" = excluded.\"arrival_time\""));
-    assert!(!update.contains("\"stop_id\""));
-    assert!(!update.contains("\"trip_id\""));
-    assert!(!update.contains("\"stop_sequence\""));
-    assert!(positional_insert_sql("stop_times", keys, keys).ends_with("DO NOTHING"));
-    assert_eq!(primary_keys("mybas-johor", "areas"), &["area_id"]);
-    assert_eq!(primary_keys("ktmb", "trips"), &["trip_id"]);
-    assert!(primary_keys("mybas-johor", "fare_leg_rules").is_empty());
-  }
-
-  #[test]
   fn byte_checkpoint_resumes_at_a_quoted_record_boundary() -> Result<(), Box<dyn std::error::Error>> {
     let csv = "id,name\n1,alpha\n2,\"two\nlines\"\n3,gamma\n4,delta\n";
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    writer.start_file("stops.txt", options)?;
-    writer.write_all(csv.as_bytes())?;
-    let archive = writer.finish()?.into_inner();
+    let feed = temp_zip_feed("resume-test", "stops.txt", csv.as_bytes())?;
+    let header_end = read_zip_csv_headers(&mut ZipArchive::new(File::open(&feed.path)?)?, "stops.txt", 1024)?.1;
+    let run_extract = |checkpoint: Checkpoint, max_rows: u64, max_payload_bytes: u64| -> Result<(CsvExtractOutcome, Vec<String>), Box<dyn std::error::Error>> {
+      let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+      let outcome = extract_and_batch_csv(
+        CsvExtractJob { feed: feed.clone(), csv_file: "stops.txt".to_owned(), csv_indices: vec![0, 1], header_end, checkpoint, batch_size: 10, max_rows, max_record_bytes: 1024, max_payload_bytes },
+        Arc::new(AtomicU64::new(0)),
+        tx,
+      )?;
+      let mut payloads = Vec::new();
+      while let Ok(batch) = rx.try_recv() {
+        payloads.push(batch.payload);
+      }
+      Ok((outcome, payloads))
+    };
 
-    let sequence = TEMP_FEED_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("my-gtfs-worker-resume-test-{}-{sequence}.zip", std::process::id()));
-    std::fs::write(&path, archive)?;
-    let reserved_bytes = std::fs::metadata(&path)?.len();
-    let storage = Arc::new(TempFeedStorage::new(reserved_bytes));
-    storage.reserve(reserved_bytes)?;
-    let feed = Arc::new(TemporaryFeed { path, storage, reserved_bytes });
-
-    let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(4);
-    let first = extract_and_batch_csv(
-      CsvExtractJob {
-        feed: feed.clone(),
-        provider_name: "test".to_owned(),
-        csv_file: "stops.txt".to_owned(),
-        table_name: "stops".to_owned(),
-        db_columns: &["id", "name"],
-        checkpoint: Checkpoint::default(),
-        batch_size: 10,
-        max_rows: 2,
-        max_record_bytes: 1024,
-        max_payload_bytes: 32,
-      },
-      Arc::new(AtomicU64::new(0)),
-      first_tx,
-    )?;
+    let (first, first_payloads) = run_extract(Checkpoint::default(), 2, 32)?;
     assert!(!first.file_done);
     assert_eq!(first.checkpoint.line, 2);
     assert_eq!(usize::try_from(first.checkpoint.byte).ok(), csv.find("3,gamma"));
-
-    let mut first_payloads = Vec::new();
-    while let Ok(message) = first_rx.try_recv() {
-      if let BatchMessage::Data(batch) = message {
-        first_payloads.push(batch.payload);
-      }
-    }
     assert_eq!(first_payloads, ["[[\"1\",\"alpha\"]]", "[[\"2\",\"two\\nlines\"]]"]);
 
-    let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(4);
-    let second = extract_and_batch_csv(
-      CsvExtractJob {
-        feed,
-        provider_name: "test".to_owned(),
-        csv_file: "stops.txt".to_owned(),
-        table_name: "stops".to_owned(),
-        db_columns: &["id", "name"],
-        checkpoint: first.checkpoint,
-        batch_size: 10,
-        max_rows: 10,
-        max_record_bytes: 1024,
-        max_payload_bytes: 4096,
-      },
-      Arc::new(AtomicU64::new(0)),
-      second_tx,
-    )?;
+    let (second, second_payloads) = run_extract(first.checkpoint, 10, 4096)?;
     assert!(second.file_done);
     assert_eq!(second.checkpoint, Checkpoint { line: 4, byte: u64::try_from(csv.len())? });
+    assert_eq!(second_payloads.last().map(String::as_str), Some("[[\"3\",\"gamma\"],[\"4\",\"delta\"]]"));
+    Ok(())
+  }
 
-    let mut second_payload = None;
-    while let Ok(message) = second_rx.try_recv() {
-      if let BatchMessage::Data(batch) = message {
-        second_payload = Some(batch.payload);
-      }
-    }
-    assert_eq!(second_payload.as_deref(), Some("[[\"3\",\"gamma\"],[\"4\",\"delta\"]]"));
+  #[tokio::test]
+  async fn process_csv_file_commits_checkpoint_through_in_memory_d1_seam() -> Result<(), Box<dyn std::error::Error>> {
+    let feed = temp_zip_feed("session-test", "stops.txt", b"stop_id,stop_name\nS1,Alpha\nS2,Beta\nS3,Gamma\n")?;
+    let transport = InMemoryTransport::new();
+    transport.push_query_response(vec![ok_write_result(2)]);
+    transport.push_query_response(vec![ok_write_result(1)]);
+
+    let client = D1Client::with_in_memory(transport.clone(), 100, 10, 2);
+    let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 2);
+    let outcome = processor.process_csv_file(feed, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
+
+    assert!(!outcome.file_done);
+    assert!(!outcome.write_budget_exhausted);
+    assert_eq!(outcome.checkpoint.line, 2);
+    let recorded = transport.recorded_queries();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded[0].sql.starts_with("INSERT INTO \"stops\""));
+    assert!(recorded[1].sql.starts_with("UPDATE \"0_import_progress\""));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn process_csv_file_propagates_first_batch_error_and_persists_partial_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
+    let feed = temp_zip_feed("batch-err-test", "stops.txt", b"stop_id,stop_name\nS1,Alpha\nS2,Beta\nS3,Gamma\nS4,Delta\n")?;
+    let transport = InMemoryTransport::new();
+    transport.push_query_response(vec![ok_write_result(1)]);
+    transport.push_outcome(Err(D1Error::ApiError("injected batch failure".to_owned())));
+    transport.push_query_response(vec![ok_write_result(1)]);
+
+    let runtime = Arc::new(RuntimeConfig { query_statement_batch_size: 1, d1_statements_per_request: 1, d1_database_concurrency_limit: 1, ..test_runtime_config() });
+    let client = D1Client::with_in_memory(transport.clone(), 100, 10, 1);
+    let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), runtime, 10);
+    let error = match processor.process_csv_file(feed, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await {
+      Ok(_) => panic!("failing D1 batch must return an error"),
+      Err(error) => error,
+    };
+    assert!(error.to_string().contains("injected batch failure"), "unexpected error: {error}");
+
+    let progress_updates = transport.recorded_queries().into_iter().filter(|query| query.sql.starts_with("UPDATE \"0_import_progress\"")).collect::<Vec<_>>();
+    assert_eq!(progress_updates.len(), 1);
+    assert_eq!(progress_updates[0].params[0], serde_json::json!(1));
+    assert_eq!(progress_updates[0].params[2], serde_json::json!(1));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn ambiguous_retry_consumes_full_write_reservation() -> Result<(), Box<dyn std::error::Error>> {
+    let feed = temp_zip_feed("ambiguous-retry-test", "stops.txt", b"stop_id,stop_name\nS1,Alpha\n")?;
+    let transport = InMemoryTransport::new();
+    transport.push_ambiguous_retry_response(vec![ok_write_result(0)]);
+    transport.push_query_response(vec![ok_write_result(1)]);
+
+    let client = D1Client::with_in_memory(transport, 2, 10, 1);
+    let processor = ProviderProcessor::new(client.clone(), test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 1);
+    let outcome = processor.process_csv_file(feed, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
+    assert!(outcome.file_done);
+    assert!(matches!(client.reserve_import_writes(1).await, Err(D1Error::WriteBudgetExhausted { requested: 1, remaining: 0 })));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn purge_stale_stop_times_skips_empty_csv_and_paginates_cursor() -> Result<(), Box<dyn std::error::Error>> {
+    let transport = InMemoryTransport::new();
+    let client = D1Client::with_in_memory(transport.clone(), 100, 10, 1);
+    let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10);
+
+    let empty_feed = temp_zip_feed("stale-empty-test", "stop_times.txt", b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\n")?;
+    assert!(processor.purge_stale_stop_times_with_page_size(empty_feed, "stop_times.txt", 2).await?);
+    assert!(transport.recorded_queries().is_empty());
+
+    let feed = temp_zip_feed("stale-page-test", "stop_times.txt", b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\nT1,07:00:00,07:00:00,100,1\nT1,07:10:00,07:10:00,100,3\n")?;
+    transport.push_query_response(vec![ok_rows_result(vec![
+      serde_json::json!({"rowid": 10, "stop_id": "100", "trip_id": "T1", "stop_sequence": 1}),
+      serde_json::json!({"rowid": 11, "stop_id": "100", "trip_id": "T1", "stop_sequence": 2}),
+    ])]);
+    transport.push_query_response(vec![ok_write_result(1)]);
+    transport.push_query_response(vec![ok_rows_result(vec![serde_json::json!({"rowid": 12, "stop_id": "100", "trip_id": "T1", "stop_sequence": 3})])]);
+
+    assert!(processor.purge_stale_stop_times_with_page_size(feed, "stop_times.txt", 2).await?);
+    let recorded = transport.recorded_queries();
+    assert_eq!(recorded.len(), 3);
+    assert_eq!(recorded[0].sql, SELECT_STOP_TIMES_KEYS_FIRST_PAGE_SQL);
+    assert_eq!(recorded[0].params, vec![serde_json::json!(2)]);
+    assert_eq!(recorded[1].sql, DELETE_STALE_STOP_TIMES_SQL);
+    assert_eq!(recorded[1].params, vec![serde_json::json!("[11]")]);
+    assert_eq!(recorded[2].sql, SELECT_STOP_TIMES_KEYS_AFTER_SQL);
+    assert_eq!(recorded[2].params, vec![serde_json::json!("100"), serde_json::json!("T1"), serde_json::json!(2), serde_json::json!(2)]);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn purge_stale_stop_times_write_budget_exhausted_holds_back_completion() -> Result<(), Box<dyn std::error::Error>> {
+    let feed = temp_zip_feed("stale-budget-test", "stop_times.txt", b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\nT1,07:00:00,07:00:00,100,1\n")?;
+    let transport = InMemoryTransport::new();
+    transport.push_query_response(vec![ok_write_result(2)]);
+    transport.push_query_response(vec![ok_rows_result(vec![serde_json::json!({"rowid": 99, "stop_id": "100", "trip_id": "T9", "stop_sequence": 1})])]);
+    transport.push_query_response(vec![ok_write_result(1)]);
+
+    let client = D1Client::with_in_memory(transport.clone(), 2, 10, 1);
+    let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10);
+    let columns = ["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"];
+    let outcome = processor.process_csv_file(feed, "stop_times.txt", "stop_times", &columns, Checkpoint::default()).await?;
+
+    assert!(!outcome.file_done);
+    assert!(outcome.write_budget_exhausted);
+    let recorded = transport.recorded_queries();
+    let progress = recorded.iter().rfind(|query| query.sql.starts_with("UPDATE \"0_import_progress\"")).ok_or("missing progress update")?;
+    assert_eq!(progress.params[2], serde_json::json!(1));
+    Ok(())
+  }
+
+  #[test]
+  fn resolve_resume_checkpoint_handles_new_changed_completed_and_partial_files() {
+    let checkpoint = Checkpoint { line: 42, byte: 512 };
+    assert_eq!(resolve_resume_checkpoint(None, "stops.txt", "crc-1", "ktmb"), Some(Checkpoint::default()));
+    let changed = StoredFileProgress { file_name: "stops.txt".to_owned(), crc: "crc-0".to_owned(), checkpoint, completed: true };
+    assert_eq!(resolve_resume_checkpoint(Some(&changed), "stops.txt", "crc-1", "ktmb"), Some(Checkpoint::default()));
+    let completed = StoredFileProgress { file_name: "stops.txt".to_owned(), crc: "crc-1".to_owned(), checkpoint, completed: true };
+    assert_eq!(resolve_resume_checkpoint(Some(&completed), "stops.txt", "crc-1", "ktmb"), None);
+    let partial = StoredFileProgress { file_name: "stops.txt".to_owned(), crc: "crc-1".to_owned(), checkpoint, completed: false };
+    assert_eq!(resolve_resume_checkpoint(Some(&partial), "stops.txt", "crc-1", "ktmb"), Some(checkpoint));
+  }
+
+  #[tokio::test]
+  async fn rotate_database_if_needed_enforces_guards_and_cleans_up_failed_setup() -> Result<(), Box<dyn std::error::Error>> {
+    let transport = InMemoryTransport::new();
+    let client = D1Client::with_in_memory(transport.clone(), 100, 100, 1);
+    let file_lock = Arc::new(Mutex::new(()));
+    let rot_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+    transport.set_database_info(D1DatabaseInfo { name: "gtfs-ktmb".to_owned(), file_size: 50 }, 1);
+    let mut provider = test_provider("ktmb", "db-ktmb");
+    rotate_database_if_needed_in(&client, &mut provider, "unused.toml", file_lock.clone(), rot_lock.clone(), 100, 10).await?;
+    assert_eq!(provider.database_id, "db-ktmb");
+    assert!(transport.deleted_databases().is_empty());
+
+    let mut budget_client = client.clone();
+    transport.push_query_response(vec![ok_rows_result(vec![serde_json::json!({ "Granted": 5_000 })])]);
+    assert!(budget_client.acquire_daily_budget("db-ktmb", 5_000).await?);
+    transport.set_database_info(D1DatabaseInfo { name: "gtfs-ktmb".to_owned(), file_size: 200 }, 1);
+    let Err(err) = rotate_database_if_needed_in(&budget_client, &mut provider, "unused.toml", file_lock.clone(), rot_lock.clone(), 100, 10).await else {
+      return Err("budget database must refuse automatic rotation".into());
+    };
+    assert!(err.to_string().contains("daily-budget"));
+
+    transport.set_database_info(D1DatabaseInfo { name: "gtfs-ktmb".to_owned(), file_size: 200 }, 10);
+    let Err(err) = rotate_database_if_needed_in(&client, &mut provider, "unused.toml", file_lock.clone(), rot_lock.clone(), 100, 10).await else {
+      return Err("max database limit must block rotation".into());
+    };
+    assert!(err.to_string().contains("Archive and delete"));
+
+    transport.set_database_info(D1DatabaseInfo { name: "gtfs-unknown".to_owned(), file_size: 200 }, 1);
+    let mut unknown = test_provider("unknown-provider", "db-rot");
+    assert!(rotate_database_if_needed_in(&client, &mut unknown, "unused.toml", file_lock.clone(), rot_lock.clone(), 100, 10).await.is_err());
+    assert_eq!(unknown.database_id, "db-rot");
+    assert_eq!(transport.deleted_databases(), vec!["in-memory-uuid-1"]);
+
+    let happy_transport = InMemoryTransport::new();
+    let happy_client = D1Client::with_in_memory(happy_transport.clone(), 100, 1_000, 1);
+    happy_transport.set_database_info(D1DatabaseInfo { name: "gtfs-ktmb-old".to_owned(), file_size: 200 }, 1);
+    let path = unique_temp_path("rotate-providers-test", "toml");
+    let _cleanup = TempTestFile(path.clone());
+    std::fs::write(&path, "[[providers]]\nname = \"ktmb\"\ndatabase_id = \"db-old\"\n")?;
+    let mut happy_provider = test_provider("ktmb", "db-old");
+    rotate_database_if_needed_in(&happy_client, &mut happy_provider, &path.to_string_lossy(), file_lock, rot_lock, 100, 10).await?;
+    assert_eq!(happy_provider.database_id, "in-memory-uuid-1");
+    assert!(happy_transport.deleted_databases().is_empty());
+    let updated = std::fs::read_to_string(&path)?;
+    assert!(updated.contains("database_id = \"in-memory-uuid-1\""));
+    assert!(updated.contains("database_id = \"db-old\""));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn process_prepared_provider_runs_maintenance_and_records_version() -> Result<(), Box<dyn std::error::Error>> {
+    let feed = temp_zip_feed("prepared-provider-test", "stops.txt", b"stop_id,stop_name\nS1,Alpha\n")?;
+    let transport = InMemoryTransport::new();
+    let client = D1Client::with_in_memory(transport.clone(), 100, 100, 1);
+    let prepared = PreparedProvider {
+      provider: test_provider("ktmb", "db-ktmb"),
+      download: DownloadedFeed { size: feed.reserved_bytes, file: feed.clone(), previous_etag: String::new(), remote_etag: "etag-2".to_owned() },
+      files: vec![PreparedFile { csv_file: "stops.txt".to_owned(), crc: "crc-1".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default() }],
+    };
+    let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10).await?;
+    assert!(outcome.remaining.is_none());
+    assert_eq!(outcome.rows_processed, 1);
+    assert!(!outcome.write_budget_exhausted);
+    let recorded = transport.recorded_queries();
+    let expected_maintenance = SchemaCatalog::maintenance_queries("ktmb")[0];
+    assert!(recorded.iter().any(|query| query.sql == expected_maintenance));
+    assert!(recorded.iter().any(|query| query.sql.starts_with("INSERT INTO \"0_dataset_versions\"") && query.params == vec![serde_json::json!("etag-2")]));
+
+    let fail_transport = InMemoryTransport::new();
+    fail_transport.push_outcome(Err(D1Error::ApiError("batch failed".to_owned())));
+    let fail_client = D1Client::with_in_memory(fail_transport.clone(), 100, 100, 1);
+    let failing = PreparedProvider {
+      provider: test_provider("ktmb", "db-ktmb"),
+      download: DownloadedFeed { size: feed.reserved_bytes, file: feed, previous_etag: String::new(), remote_etag: "etag-2".to_owned() },
+      files: vec![PreparedFile { csv_file: "stops.txt".to_owned(), crc: "crc-1".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default() }],
+    };
+    let error = match process_prepared_provider(&fail_client, failing, Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10).await {
+      Ok(_) => panic!("CSV batch failure must fail process_prepared_provider"),
+      Err(error) => error,
+    };
+    assert!(error.to_string().contains("One or more CSV files failed"));
+    assert!(!fail_transport.recorded_queries().iter().any(|query| query.sql.starts_with("INSERT INTO \"0_dataset_versions\"")));
     Ok(())
   }
 
@@ -1305,19 +1773,7 @@ mod tests {
 
   #[test]
   fn declared_uncompressed_feed_size_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    writer.start_file("stops.txt", zip::write::SimpleFileOptions::default())?;
-    writer.write_all(b"id,name\n1,a-name-that-exceeds-the-test-limit\n")?;
-    let archive = writer.finish()?.into_inner();
-
-    let sequence = TEMP_FEED_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("my-gtfs-worker-expansion-test-{}-{sequence}.zip", std::process::id()));
-    std::fs::write(&path, archive)?;
-    let reserved_bytes = std::fs::metadata(&path)?.len();
-    let storage = Arc::new(TempFeedStorage::new(reserved_bytes));
-    storage.reserve(reserved_bytes)?;
-    let feed = TemporaryFeed { path, storage, reserved_bytes };
-
+    let feed = temp_zip_feed("expansion-test", "stops.txt", b"id,name\n1,a-name-that-exceeds-the-test-limit\n")?;
     let error = match discover_supported_files(&feed, "test", &[("stops", &["id", "name"])], 8) {
       Ok(_) => panic!("expanded feed must fail"),
       Err(error) => error,
@@ -1353,23 +1809,24 @@ mod tests {
   #[test]
   fn write_budget_exhaustion_is_not_reported_as_a_batch_failure() {
     let mut statuses = BTreeMap::new();
-    let completion = record_task_result(
+    let (completion, error) = record_task_result(
       Ok(BatchTaskResult {
         ranges: vec![(Checkpoint::default(), Checkpoint { line: 100, byte: 1_000 })],
         result: Err(ProcessorError::D1(D1Error::WriteBudgetExhausted { requested: 200, remaining: 50 })),
       }),
       "test",
+      "batch group",
       &mut statuses,
     );
     assert_eq!(completion, BatchCompletion::WriteBudgetExhausted);
+    assert!(error.is_none());
     assert_eq!(contiguous_committed_checkpoint(Checkpoint::default(), &statuses), Checkpoint::default());
   }
 
   #[tokio::test]
   async fn rotation_persists_current_and_retired_database_metadata() -> Result<(), Box<dyn std::error::Error>> {
-    let sequence = TEMP_FEED_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("my-gtfs-worker-providers-test-{}-{sequence}.toml", std::process::id()));
-    let temporary = TemporaryFeed { path: path.clone(), storage: Arc::new(TempFeedStorage::new(1)), reserved_bytes: 0 };
+    let path = unique_temp_path("providers-test", "toml");
+    let _cleanup = TempTestFile(path.clone());
     std::fs::write(
       &path,
       r#"[[providers]]
@@ -1396,20 +1853,75 @@ database_id = "old-id"
     assert!(content.contains("provider = \"test-provider\""));
     assert!(content.contains("name = \"old-name\""));
     assert!(content.contains("database_id = \"old-id\""));
-    drop(temporary);
     Ok(())
   }
 
   #[test]
-  fn provider_maintenance_queries_are_non_empty_for_known_providers() {
-    let providers = ["mybas-johor", "ktmb", "rapid-bus-mrtfeeder", "rapid-rail-kl", "rapid-bus-kl", "rapid-bus-penang"];
-    for provider in providers {
-      let queries = provider_maintenance_queries(provider);
-      assert!(!queries.is_empty(), "queries for {provider} should not be empty");
-      for query in queries {
-        assert!(query.starts_with("DELETE") || query.starts_with("INSERT"), "unexpected query in {provider}: {query}");
-      }
-    }
-    assert!(provider_maintenance_queries("unknown-provider").is_empty());
+  fn csv_stop_time_key_set_matches_trimmed_integers_and_text_fallbacks() -> Result<(), Box<dyn std::error::Error>> {
+    let mut keys = CsvStopTimeKeySet::default();
+    assert!(keys.is_empty());
+    keys.insert("100", "T1", "10")?;
+    keys.insert("100", "T1", " 20 ")?;
+    keys.insert("100", "T1", "30.0")?;
+    keys.insert("200", "T2", "bad_seq")?;
+    assert!(!keys.is_empty());
+
+    let has = |stop: serde_json::Value, trip: &str, seq: serde_json::Value| keys.contains(&stop, &serde_json::json!(trip), &seq);
+    assert!(has(serde_json::json!("100"), "T1", serde_json::json!(10)));
+    assert!(has(serde_json::json!("100"), "T1", serde_json::json!(20)));
+    assert!(has(serde_json::json!("100"), "T1", serde_json::json!(30)));
+    assert!(has(serde_json::json!("200"), "T2", serde_json::json!("bad_seq")));
+    assert!(!has(serde_json::json!("100"), "T1", serde_json::json!(90)));
+    assert!(!has(serde_json::json!("999"), "T1", serde_json::json!(10)));
+    assert!(!has(serde_json::json!(null), "T1", serde_json::json!(10)));
+    Ok(())
+  }
+
+  #[test]
+  fn extract_stop_time_keys_reads_archive_and_skips_missing_key_columns() -> Result<(), Box<dyn std::error::Error>> {
+    let valid_feed = temp_zip_feed("stop-times-keys-test", "stop_times.txt", b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\nT1,07:00:00,07:00:00,100,1\n")?;
+    let keys = extract_stop_time_keys(&valid_feed, "stop_times.txt", 1024)?.ok_or("expected Some(CsvStopTimeKeySet) when key columns are present")?;
+    assert!(keys.contains(&serde_json::json!("100"), &serde_json::json!("T1"), &serde_json::json!(1)));
+    assert!(!keys.contains(&serde_json::json!("100"), &serde_json::json!("T1"), &serde_json::json!(2)));
+
+    let missing_feed = temp_zip_feed("stop-times-missing-col-test", "stop_times.txt", b"trip_id,stop_id\nT1,100\n")?;
+    assert!(extract_stop_time_keys(&missing_feed, "stop_times.txt", 1024)?.is_none());
+    Ok(())
+  }
+
+  #[test]
+  fn collect_stale_stop_times_separates_stale_null_and_cursor() -> Result<(), Box<dyn std::error::Error>> {
+    let mut keys = CsvStopTimeKeySet::default();
+    keys.insert("100", "T1", "1")?;
+    keys.insert("100", "T1", "2")?;
+
+    let rows = vec![
+      serde_json::json!({"rowid": 10, "stop_id": null, "trip_id": "T0", "stop_sequence": 1}),
+      serde_json::json!({"rowid": 11, "stop_id": "100", "trip_id": "T1", "stop_sequence": 1}),
+      serde_json::json!({"rowid": 12, "stop_id": "100", "trip_id": "T1", "stop_sequence": 99}),
+      serde_json::json!({"rowid": 13, "stop_id": "100", "trip_id": "T1", "stop_sequence": 2}),
+      serde_json::json!({"rowid": 14, "stop_id": "200", "trip_id": "T1", "stop_sequence": null}),
+    ];
+    let scan = collect_stale_stop_times_from_page(rows, &keys)?;
+    assert_eq!(scan.stale_rowids, vec![10, 12, 14]);
+    assert_eq!(scan.last_cursor, Some([serde_json::json!("100"), serde_json::json!("T1"), serde_json::json!(2)]));
+    Ok(())
+  }
+
+  #[test]
+  fn serialize_delete_rowid_batches_splits_by_count_and_payload_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let rowids = vec![101_i64, 102, 103];
+    let by_count = serialize_delete_rowid_batches(&rowids, 2, 4096)?;
+    assert_eq!(by_count.len(), 2);
+    assert_eq!(by_count[0].rows, 2);
+    assert_eq!(by_count[0].payload, "[101,102]");
+    assert_eq!(by_count[1].rows, 1);
+    assert_eq!(by_count[1].payload, "[103]");
+
+    let by_bytes = serialize_delete_rowid_batches(&rowids, 10, 8)?;
+    assert_eq!(by_bytes.len(), 3);
+    assert!(by_bytes.iter().all(|batch| batch.rows == 1 && batch.payload.len() <= 8));
+    assert!(serialize_delete_rowid_batches(&rowids, 10, 4).is_err());
+    Ok(())
   }
 }

@@ -1,6 +1,9 @@
 //! Validate live GTFS headers against every active provider's schema and migration chain.
 
-use gtfs_checks::{CheckResult, Provider, providers, root};
+use gtfs_checks::{
+  CheckResult, Provider, providers, root,
+  sql_queries::{provider_maintenance_queries, quote_identifier},
+};
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params_from_iter};
 use std::{
@@ -15,17 +18,13 @@ use zip::ZipArchive;
 const INFRASTRUCTURE_TABLES: [&str; 4] = ["departure_cache", "0_daily_import_budget", "0_dataset_versions", "0_import_progress"];
 type Schema = BTreeMap<String, Vec<String>>;
 
-fn quote(identifier: &str) -> String {
-  format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
 fn table_names(db: &Connection) -> CheckResult<BTreeSet<String>> {
   let mut statement = db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")?;
   Ok(statement.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?)
 }
 
 fn columns(db: &Connection, table: &str) -> CheckResult<Vec<String>> {
-  let mut statement = db.prepare(&format!("PRAGMA table_info({})", quote(table)))?;
+  let mut statement = db.prepare(&format!("PRAGMA table_info({})", quote_identifier(table)))?;
   Ok(statement.query_map([], |row| row.get(1))?.collect::<Result<_, _>>()?)
 }
 
@@ -101,7 +100,7 @@ fn validate_legacy_progress_upgrade(directory: &Path) -> CheckResult {
   Ok(())
 }
 
-fn validate_local_migrations(directory: &Path, expected: &Schema) -> CheckResult {
+fn validate_local_migrations(provider_name: &str, directory: &Path, expected: &Schema) -> CheckResult {
   validate_legacy_progress_upgrade(directory)?;
   let db = Connection::open_in_memory()?;
   for migration in migration_files(directory)? {
@@ -141,11 +140,11 @@ fn validate_local_migrations(directory: &Path, expected: &Schema) -> CheckResult
       return Err(format!("runtime columns for `{table}` differ from compile-time schema: runtime={actual_columns:?}, compile_time={expected_columns:?}").into());
     }
     let has_primary_key = {
-      let mut statement = db.prepare(&format!("PRAGMA table_info({})", quote(table)))?;
+      let mut statement = db.prepare(&format!("PRAGMA table_info({})", quote_identifier(table)))?;
       statement.query_map([], |row| row.get::<_, i64>(5))?.collect::<Result<Vec<_>, _>>()?.into_iter().any(|key| key != 0)
     };
     let indexes = {
-      let mut statement = db.prepare(&format!("PRAGMA index_list({})", quote(table)))?;
+      let mut statement = db.prepare(&format!("PRAGMA index_list({})", quote_identifier(table)))?;
       statement.query_map([], |row| row.get::<_, i64>(2))?.collect::<Result<Vec<_>, _>>()?
     };
     if !has_primary_key && indexes.iter().all(|unique| *unique == 0) {
@@ -155,21 +154,24 @@ fn validate_local_migrations(directory: &Path, expected: &Schema) -> CheckResult
     if indexes.len() > max_allowed_indexes {
       return Err(format!("`{table}` has {} indexes; write-budget reservation assumes at most {} index writes per row", indexes.len(), max_allowed_indexes).into());
     }
-    let quoted_columns = actual_columns.iter().map(|column| quote(column)).collect::<Vec<_>>().join(", ");
+    let quoted_columns = actual_columns.iter().map(|column| quote_identifier(column)).collect::<Vec<_>>().join(", ");
     let placeholders = vec!["?"; actual_columns.len()].join(", ");
-    let assignments = actual_columns.iter().map(|column| format!("{} = excluded.{}", quote(column), quote(column))).collect::<Vec<_>>().join(", ");
-    let changed = actual_columns.iter().map(|column| format!("{}.{} IS NOT excluded.{}", quote(table), quote(column), quote(column))).collect::<Vec<_>>().join(" OR ");
-    let sql = format!("INSERT INTO {} ({quoted_columns}) VALUES ({placeholders}) ON CONFLICT DO UPDATE SET {assignments} WHERE {changed}", quote(table));
+    let assignments = actual_columns.iter().map(|column| format!("{} = excluded.{}", quote_identifier(column), quote_identifier(column))).collect::<Vec<_>>().join(", ");
+    let changed = actual_columns.iter().map(|column| format!("{}.{} IS NOT excluded.{}", quote_identifier(table), quote_identifier(column), quote_identifier(column))).collect::<Vec<_>>().join(" OR ");
+    let sql = format!("INSERT INTO {} ({quoted_columns}) VALUES ({placeholders}) ON CONFLICT DO UPDATE SET {assignments} WHERE {changed}", quote_identifier(table));
     let probe = (0..actual_columns.len()).map(|index| format!("replay-probe-{index}")).collect::<Vec<_>>();
     db.execute(&sql, params_from_iter(probe.iter()))?;
     let before = db.total_changes();
     db.execute(&sql, params_from_iter(probe.iter()))?;
     let replay_writes = db.total_changes() - before;
-    let replay_count: i64 = db.query_row(&format!("SELECT COUNT(*) FROM {}", quote(table)), [], |row| row.get(0))?;
-    db.execute(&format!("DELETE FROM {}", quote(table)), [])?;
+    let replay_count: i64 = db.query_row(&format!("SELECT COUNT(*) FROM {}", quote_identifier(table)), [], |row| row.get(0))?;
+    db.execute(&format!("DELETE FROM {}", quote_identifier(table)), [])?;
     if replay_count != 1 || replay_writes != 0 {
       return Err(format!("`{table}` retained {replay_count} rows after identical UPSERT and reported {replay_writes} unnecessary writes").into());
     }
+  }
+  for sql in provider_maintenance_queries(provider_name) {
+    db.execute(sql, [])?;
   }
   Ok(())
 }
@@ -190,7 +192,7 @@ fn validate_provider(provider: &Provider, client: &Client) -> (Vec<String>, usiz
     }
   };
   let mut errors = 0;
-  match validate_local_migrations(migration.parent().unwrap_or(Path::new(".")), &expected) {
+  match validate_local_migrations(name, migration.parent().unwrap_or(Path::new(".")), &expected) {
     Ok(()) => lines.push("- ✅ Local migration chain matches the compile-time schema and uses one progress table; identical UPSERT replay is idempotent with zero changed rows and every table satisfies the two-write reservation bound.".into()),
     Err(error) => { lines.push(format!("- ❌ Local migration chain failed: {error}")); errors += 1; }
   }
@@ -293,4 +295,20 @@ fn main() -> CheckResult {
   }
   println!("All active provider schemas match their live GTFS feeds.");
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn local_migrations_and_maintenance_queries_succeed() -> CheckResult {
+    validate_replay_cleanup_migrations()?;
+    for provider in providers()?.into_iter().filter(|provider| provider.is_active) {
+      let directory = root().join("migrations").join(&provider.name);
+      let expected = schema(&directory.join("0_gtfs_schema.sql"))?;
+      validate_local_migrations(&provider.name, &directory, &expected)?;
+    }
+    Ok(())
+  }
 }

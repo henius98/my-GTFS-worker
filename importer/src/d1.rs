@@ -4,6 +4,8 @@ use reqwest::{
   header::{AUTHORIZATION, HeaderValue, RETRY_AFTER},
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::{
   sync::{
     Arc, Mutex, MutexGuard,
@@ -14,12 +16,12 @@ use std::{
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 
+pub use crate::budget_limits::{DAILY_WRITE_LIMIT, LEDGER_WRITE_RESERVE, METADATA_WRITE_RESERVE};
+
 const MAX_QUERY_RETRIES: u32 = 3;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-pub const DAILY_WRITE_LIMIT: u64 = 100_000;
-pub const METADATA_WRITE_RESERVE: u64 = 1_000;
-// One ledger update to acquire a lease and one to return unused capacity.
-pub const LEDGER_WRITE_RESERVE: u64 = 2;
+const ACQUIRE_DAILY_BUDGET_SQL: &str = include_str!("sql/acquire_daily_budget.sql");
+const RELEASE_DAILY_BUDGET_SQL: &str = include_str!("sql/release_daily_budget.sql");
 
 #[derive(Error, Debug)]
 pub enum D1Error {
@@ -33,7 +35,33 @@ pub enum D1Error {
   WriteBudgetExhausted { requested: u64, remaining: u64 },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Checkpoint {
+  pub line: u64,
+  pub byte: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredFileProgress {
+  pub file_name: String,
+  pub crc: String,
+  pub checkpoint: Checkpoint,
+  pub completed: bool,
+}
+
+pub struct FileProgressInit<'a> {
+  pub file: &'a str,
+  pub crc: &'a str,
+  pub checkpoint: Checkpoint,
+}
+
+pub struct FileProgressUpdate<'a> {
+  pub file: &'a str,
+  pub checkpoint: Checkpoint,
+  pub completed: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
 pub struct D1Query<'a> {
   pub sql: &'a str,
   pub params: Vec<serde_json::Value>,
@@ -69,9 +97,9 @@ impl D1Result {
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct D1Meta {
   #[serde(default)]
-  rows_read: u64,
+  pub rows_read: u64,
   #[serde(default)]
-  rows_written: Option<u64>,
+  pub rows_written: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,13 +112,6 @@ pub struct D1Usage {
 pub struct D1DatabaseInfo {
   pub name: String,
   pub file_size: u64,
-}
-
-pub struct FileProgressInit<'a> {
-  pub file: &'a str,
-  pub crc: &'a str,
-  pub line: u64,
-  pub byte: u64,
 }
 
 #[derive(Debug)]
@@ -187,15 +208,113 @@ impl Drop for D1WriteReservation {
 }
 
 #[derive(Clone)]
-pub struct D1Client {
-  pub client: Client,
+struct HttpTransport {
+  client: Client,
   account_id: Arc<str>,
   authorization: HeaderValue,
+  query_timeout: Duration,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct RecordedQuery {
+  pub database_id: String,
+  pub sql: String,
+  pub params: Vec<serde_json::Value>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub struct InMemoryTransport {
+  responses: Mutex<VecDeque<Result<(Vec<D1Result>, bool), D1Error>>>,
+  recorded: Mutex<Vec<RecordedQuery>>,
+  database_info: Mutex<Option<D1DatabaseInfo>>,
+  database_count: AtomicU64,
+  created_databases: Mutex<Vec<(String, String)>>,
+  deleted_databases: Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl InMemoryTransport {
+  pub fn new() -> Arc<Self> {
+    Arc::new(Self::default())
+  }
+
+  pub fn push_query_response(&self, results: Vec<D1Result>) {
+    self.push_outcome(Ok((results, false)));
+  }
+
+  pub fn push_ambiguous_retry_response(&self, results: Vec<D1Result>) {
+    self.push_outcome(Ok((results, true)));
+  }
+
+  pub fn push_outcome(&self, outcome: Result<(Vec<D1Result>, bool), D1Error>) {
+    let mut guard = match self.responses.lock() {
+      Ok(guard) => guard,
+      Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.push_back(outcome);
+  }
+
+  pub fn set_database_info(&self, info: D1DatabaseInfo, total_databases: u64) {
+    let mut guard = match self.database_info.lock() {
+      Ok(guard) => guard,
+      Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(info);
+    self.database_count.store(total_databases, Ordering::Relaxed);
+  }
+
+  pub fn recorded_queries(&self) -> Vec<RecordedQuery> {
+    match self.recorded.lock() {
+      Ok(guard) => guard.clone(),
+      Err(poisoned) => poisoned.into_inner().clone(),
+    }
+  }
+
+  pub fn deleted_databases(&self) -> Vec<String> {
+    match self.deleted_databases.lock() {
+      Ok(guard) => guard.clone(),
+      Err(poisoned) => poisoned.into_inner().clone(),
+    }
+  }
+
+  fn record(&self, db_id: &str, queries: &[D1Query<'_>]) -> Result<(Vec<D1Result>, bool), D1Error> {
+    {
+      let mut recorded = match self.recorded.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+      };
+      for query in queries {
+        recorded.push(RecordedQuery { database_id: db_id.to_owned(), sql: query.sql.to_owned(), params: query.params.clone() });
+      }
+    }
+    let mut responses = match self.responses.lock() {
+      Ok(guard) => guard,
+      Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(next) = responses.pop_front() {
+      return next;
+    }
+    let default_results = queries.iter().map(|_| D1Result { results: Vec::new(), meta: Some(D1Meta { rows_read: 0, rows_written: Some(1) }), success: Some(true) }).collect();
+    Ok((default_results, false))
+  }
+}
+
+#[derive(Clone)]
+enum D1Transport {
+  Http(HttpTransport),
+  #[cfg(test)]
+  InMemory(Arc<InMemoryTransport>),
+}
+
+#[derive(Clone)]
+pub struct D1Client {
+  transport: D1Transport,
   concurrency_limit: Arc<Semaphore>,
   write_budget: Arc<D1WriteBudget>,
   metadata_budget: Arc<D1WriteBudget>,
   daily_lease: Option<Arc<DailyLease>>,
-  query_timeout: Duration,
   rows_read: Arc<AtomicU64>,
   rows_written: Arc<AtomicU64>,
 }
@@ -212,17 +331,27 @@ impl D1Client {
     authorization.set_sensitive(true);
 
     Ok(Self {
-      client,
-      account_id: Arc::from(account_id),
-      authorization,
+      transport: D1Transport::Http(HttpTransport { client, account_id: Arc::from(account_id), authorization, query_timeout: runtime.d1_query_timeout }),
       concurrency_limit: Arc::new(Semaphore::new(runtime.d1_global_concurrency_limit)),
       write_budget: Arc::new(D1WriteBudget::new(runtime.max_d1_rows_written_per_workflow)),
       metadata_budget: Arc::new(D1WriteBudget::new(METADATA_WRITE_RESERVE)),
       daily_lease: None,
-      query_timeout: runtime.d1_query_timeout,
       rows_read: Arc::new(AtomicU64::new(0)),
       rows_written: Arc::new(AtomicU64::new(0)),
     })
+  }
+
+  #[cfg(test)]
+  pub fn with_in_memory(transport: Arc<InMemoryTransport>, max_data_writes: u64, max_metadata_writes: u64, global_concurrency: usize) -> Self {
+    Self {
+      transport: D1Transport::InMemory(transport),
+      concurrency_limit: Arc::new(Semaphore::new(global_concurrency.max(1))),
+      write_budget: Arc::new(D1WriteBudget::new(max_data_writes)),
+      metadata_budget: Arc::new(D1WriteBudget::new(max_metadata_writes)),
+      daily_lease: None,
+      rows_read: Arc::new(AtomicU64::new(0)),
+      rows_written: Arc::new(AtomicU64::new(0)),
+    }
   }
 
   pub async fn acquire_daily_budget(&mut self, database_id: &str, workflow_limit: u64) -> Result<bool, D1Error> {
@@ -231,11 +360,8 @@ impl D1Client {
     if requested <= METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE {
       return Err(D1Error::ApiError("Workflow budget is too small for metadata and ledger writes".into()));
     }
-    let query = D1Query {
-      sql: "WITH allowance AS MATERIALIZED (SELECT MIN(?, ? - (CASE WHEN Day = date('now') THEN Reserved ELSE 0 END)) AS Granted FROM \"0_daily_import_budget\" WHERE Id = 1) UPDATE \"0_daily_import_budget\" SET Day = date('now'), Reserved = (CASE WHEN Day = date('now') THEN Reserved ELSE 0 END) + (SELECT Granted FROM allowance) WHERE Id = 1 AND date('now') = ? AND (SELECT Granted FROM allowance) > ? RETURNING (SELECT Granted FROM allowance) AS Granted",
-      params: vec![requested.into(), DAILY_WRITE_LIMIT.into(), day.clone().into(), (METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE).into()],
-    };
-    let (results, _) = self.execute_query_body(database_id, &query, 0).await?;
+    let query = D1Query { sql: ACQUIRE_DAILY_BUDGET_SQL, params: vec![requested.into(), DAILY_WRITE_LIMIT.into(), day.clone().into(), (METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE).into()] };
+    let (results, _) = self.execute_single_query(database_id, &query, 0).await?;
     let Some(row) = results.first().and_then(|result| result.results.first()) else {
       println!("Daily D1 budget cannot cover another workflow's metadata and ledger writes; deferring until the next UTC day.");
       return Ok(false);
@@ -256,10 +382,9 @@ impl D1Client {
       return Ok(());
     };
     let unused = self.write_budget.state().remaining + self.metadata_budget.state().remaining;
-    let query =
-      D1Query { sql: "UPDATE \"0_daily_import_budget\" SET Reserved = Reserved - ? WHERE Id = 1 AND Day = ? AND Reserved >= ?", params: vec![unused.into(), lease.day.clone().into(), unused.into()] };
+    let query = D1Query { sql: RELEASE_DAILY_BUDGET_SQL, params: vec![unused.into(), lease.day.clone().into(), unused.into()] };
     // Never retry this subtraction: a lost response leaves a conservative lease.
-    self.execute_query_body(&lease.database_id, &query, 0).await?;
+    self.execute_single_query(&lease.database_id, &query, 0).await?;
     Ok(())
   }
 
@@ -290,11 +415,8 @@ impl D1Client {
     self.write_budget.reserve(maximum_writes).await
   }
 
-  pub async fn query(&self, db_id: &str, query: D1Query<'_>) -> Result<Vec<D1Result>, D1Error> {
-    if !query.sql.trim_start().starts_with("SELECT") {
-      return self.metadata_batch(db_id, &[query], 2).await;
-    }
-    let (results, _) = self.execute_query_body(db_id, &query, MAX_QUERY_RETRIES).await?;
+  pub async fn query_rows(&self, db_id: &str, query: D1Query<'_>) -> Result<Vec<D1Result>, D1Error> {
+    let (results, _) = self.execute_single_query(db_id, &query, MAX_QUERY_RETRIES).await?;
     validate_result_count(results, 1)
   }
 
@@ -308,7 +430,7 @@ impl D1Client {
   }
 
   async fn reserved_metadata_batch(&self, db_id: &str, queries: &[D1Query<'_>], reservation: D1WriteReservation) -> Result<Vec<D1Result>, D1Error> {
-    let (results, _) = self.execute_query_body(db_id, &D1BatchRequest { batch: queries }, 0).await?;
+    let (results, _) = self.execute_batch_queries(db_id, queries, 0).await?;
     let results = validate_result_count(results, queries.len())?;
     let actual = results.iter().try_fold(0_u64, |total, result| result.rows_written().and_then(|writes| total.checked_add(writes)));
     match actual {
@@ -324,15 +446,43 @@ impl D1Client {
     if queries.is_empty() {
       return Ok((Vec::new(), false));
     }
-    let (results, had_ambiguous_retry) = self.execute_query_body(db_id, &D1BatchRequest { batch: queries }, 0).await?;
+    let (results, had_ambiguous_retry) = self.execute_batch_queries(db_id, queries, 0).await?;
     Ok((validate_result_count(results, queries.len())?, had_ambiguous_retry))
   }
 
-  async fn execute_query_body<T>(&self, db_id: &str, body: &T, max_retries: u32) -> Result<(Vec<D1Result>, bool), D1Error>
+  async fn execute_single_query(&self, db_id: &str, query: &D1Query<'_>, max_retries: u32) -> Result<(Vec<D1Result>, bool), D1Error> {
+    match &self.transport {
+      D1Transport::Http(http) => self.execute_http_query_body(http, db_id, query, max_retries).await,
+      #[cfg(test)]
+      D1Transport::InMemory(memory) => {
+        let _permit = self.concurrency_limit.acquire().await.map_err(|error| D1Error::ApiError(format!("Failed to acquire D1 request permit: {error}")))?;
+        self.check_daily_window()?;
+        let (results, had_ambiguous_retry) = memory.record(db_id, std::slice::from_ref(query))?;
+        self.record_usage(&results);
+        Ok((results, had_ambiguous_retry))
+      }
+    }
+  }
+
+  async fn execute_batch_queries(&self, db_id: &str, queries: &[D1Query<'_>], max_retries: u32) -> Result<(Vec<D1Result>, bool), D1Error> {
+    match &self.transport {
+      D1Transport::Http(http) => self.execute_http_query_body(http, db_id, &D1BatchRequest { batch: queries }, max_retries).await,
+      #[cfg(test)]
+      D1Transport::InMemory(memory) => {
+        let _permit = self.concurrency_limit.acquire().await.map_err(|error| D1Error::ApiError(format!("Failed to acquire D1 request permit: {error}")))?;
+        self.check_daily_window()?;
+        let (results, had_ambiguous_retry) = memory.record(db_id, queries)?;
+        self.record_usage(&results);
+        Ok((results, had_ambiguous_retry))
+      }
+    }
+  }
+
+  async fn execute_http_query_body<T>(&self, http: &HttpTransport, db_id: &str, body: &T, max_retries: u32) -> Result<(Vec<D1Result>, bool), D1Error>
   where
     T: Serialize + Sync + ?Sized,
   {
-    let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{db_id}/query", self.account_id);
+    let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{db_id}/query", http.account_id);
     let mut retries = 0;
     let mut backoff = Duration::from_secs(1);
     let mut had_ambiguous_retry = false;
@@ -340,7 +490,7 @@ impl D1Client {
     loop {
       let permit = self.concurrency_limit.acquire().await.map_err(|error| D1Error::ApiError(format!("Failed to acquire D1 request permit: {error}")))?;
       self.check_daily_window()?;
-      let response = self.client.post(&url).header(AUTHORIZATION, self.authorization.clone()).timeout(self.query_timeout).json(body).send().await;
+      let response = http.client.post(&url).header(AUTHORIZATION, http.authorization.clone()).timeout(http.query_timeout).json(body).send().await;
 
       match response {
         Ok(response) if response.status().is_success() => {
@@ -401,27 +551,41 @@ impl D1Client {
   }
 
   pub async fn get_dataset_version(&self, db_id: &str) -> Result<Option<String>, D1Error> {
-    let res = self.query(db_id, D1Query { sql: "SELECT ETag FROM \"0_dataset_versions\" ORDER BY rowid DESC LIMIT 1", params: Vec::new() }).await?;
+    let res = self.query_rows(db_id, D1Query { sql: "SELECT ETag FROM \"0_dataset_versions\" ORDER BY rowid DESC LIMIT 1", params: Vec::new() }).await?;
     Ok(res.first().and_then(|result| result.results.first()).and_then(|row| row.get("ETag")).and_then(serde_json::Value::as_str).map(str::to_owned))
   }
 
   pub async fn set_dataset_version(&self, db_id: &str, etag: &str) -> Result<(), D1Error> {
-    self.query(db_id, D1Query { sql: "INSERT INTO \"0_dataset_versions\" (ETag, UpdatedAt) VALUES (?, CURRENT_TIMESTAMP)", params: vec![serde_json::Value::String(etag.to_owned())] }).await?;
+    self
+      .metadata_batch(db_id, &[D1Query { sql: "INSERT INTO \"0_dataset_versions\" (ETag, UpdatedAt) VALUES (?, CURRENT_TIMESTAMP)", params: vec![serde_json::Value::String(etag.to_owned())] }], 2)
+      .await?;
     Ok(())
   }
 
   pub async fn get_file_progress_summary(&self, db_id: &str) -> Result<(u64, u64), D1Error> {
-    let res =
-      self.query(db_id, D1Query { sql: "SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN Status != 0 THEN 1 ELSE 0 END), 0) AS incomplete FROM \"0_import_progress\"", params: Vec::new() }).await?;
+    let query = D1Query { sql: "SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN Status != 0 THEN 1 ELSE 0 END), 0) AS incomplete FROM \"0_import_progress\"", params: Vec::new() };
+    let res = self.query_rows(db_id, query).await?;
     let row = res.first().and_then(|result| result.results.first());
     let total = row.and_then(|value| value.get("total")).and_then(serde_json::Value::as_u64).unwrap_or(0);
     let incomplete = row.and_then(|value| value.get("incomplete")).and_then(serde_json::Value::as_u64).unwrap_or(0);
     Ok((total, incomplete))
   }
 
-  pub async fn get_all_files_progress(&self, db_id: &str) -> Result<Vec<serde_json::Value>, D1Error> {
-    let res = self.query(db_id, D1Query { sql: "SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status FROM \"0_import_progress\"", params: Vec::new() }).await?;
-    Ok(res.into_iter().next().map(|result| result.results).unwrap_or_default())
+  pub async fn get_files_progress(&self, db_id: &str) -> Result<Vec<StoredFileProgress>, D1Error> {
+    let res = self.query_rows(db_id, D1Query { sql: "SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status FROM \"0_import_progress\"", params: Vec::new() }).await?;
+    let rows = res.into_iter().next().map(|result| result.results).unwrap_or_default();
+    let mut parsed = Vec::with_capacity(rows.len());
+    for row in rows {
+      let Some(file_name) = row.get("FileName").and_then(serde_json::Value::as_str).map(str::to_owned) else {
+        continue;
+      };
+      let crc = row.get("CRC").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+      let line = row.get("LastProcessedLine").and_then(serde_json::Value::as_u64).unwrap_or(0);
+      let byte = row.get("LastProcessedByte").and_then(serde_json::Value::as_u64).unwrap_or(0);
+      let status = row.get("Status").and_then(serde_json::Value::as_i64).unwrap_or(-1);
+      parsed.push(StoredFileProgress { file_name, crc, checkpoint: Checkpoint { line, byte }, completed: status == 0 });
+    }
+    Ok(parsed)
   }
 
   pub async fn init_files_progress(&self, db_id: &str, files: &[FileProgressInit<'_>]) -> Result<(), D1Error> {
@@ -432,8 +596,8 @@ impl D1Client {
         params: vec![
           serde_json::Value::String(file.file.to_owned()),
           serde_json::Value::String(file.crc.to_owned()),
-          serde_json::Value::Number(file.line.into()),
-          serde_json::Value::Number(file.byte.into()),
+          serde_json::Value::Number(file.checkpoint.line.into()),
+          serde_json::Value::Number(file.checkpoint.byte.into()),
         ],
       })
       .collect::<Vec<_>>();
@@ -441,78 +605,112 @@ impl D1Client {
     Ok(())
   }
 
-  #[allow(clippy::too_many_arguments)]
-  pub async fn update_file_progress(&self, reservation: D1WriteReservation, db_id: &str, file: &str, line: u64, byte: u64, status: i64) -> Result<(), D1Error> {
-    self.reserved_metadata_batch(
-            db_id,
-            &[D1Query {
-                sql: "UPDATE \"0_import_progress\" SET LastProcessedLine = ?, LastProcessedByte = ?, Status = ?, UpdatedAt = CURRENT_TIMESTAMP WHERE FileName = ? AND (LastProcessedLine IS NOT ? OR LastProcessedByte IS NOT ? OR Status IS NOT ?)",
-                params: vec![
-                    serde_json::Value::Number(line.into()),
-                    serde_json::Value::Number(byte.into()),
-                    serde_json::Value::Number(status.into()),
-                    serde_json::Value::String(file.to_owned()),
-                    serde_json::Value::Number(line.into()),
-                    serde_json::Value::Number(byte.into()),
-                    serde_json::Value::Number(status.into()),
-                ],
-            }],
-            reservation,
-        )
-        .await?;
+  pub async fn save_file_progress(&self, reservation: D1WriteReservation, db_id: &str, update: FileProgressUpdate<'_>) -> Result<(), D1Error> {
+    let status: i64 = if update.completed { 0 } else { 1 };
+    self
+      .reserved_metadata_batch(
+        db_id,
+        &[D1Query {
+          sql: "UPDATE \"0_import_progress\" SET LastProcessedLine = ?, LastProcessedByte = ?, Status = ?, UpdatedAt = CURRENT_TIMESTAMP WHERE FileName = ? AND (LastProcessedLine IS NOT ? OR LastProcessedByte IS NOT ? OR Status IS NOT ?)",
+          params: vec![
+            serde_json::Value::Number(update.checkpoint.line.into()),
+            serde_json::Value::Number(update.checkpoint.byte.into()),
+            serde_json::Value::Number(status.into()),
+            serde_json::Value::String(update.file.to_owned()),
+            serde_json::Value::Number(update.checkpoint.line.into()),
+            serde_json::Value::Number(update.checkpoint.byte.into()),
+            serde_json::Value::Number(status.into()),
+          ],
+        }],
+        reservation,
+      )
+      .await?;
     Ok(())
   }
 
   pub async fn get_database_info(&self, db_id: &str) -> Result<D1DatabaseInfo, D1Error> {
-    let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{db_id}", self.account_id);
-    let response = self.client.get(&url).header(AUTHORIZATION, self.authorization.clone()).send().await?;
-    if !response.status().is_success() {
-      return Err(D1Error::ApiError(format!("Failed to get database {db_id}: {}", response.text().await.unwrap_or_default())));
-    }
+    match &self.transport {
+      D1Transport::Http(http) => {
+        let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{db_id}", http.account_id);
+        let response = http.client.get(&url).header(AUTHORIZATION, http.authorization.clone()).send().await?;
+        if !response.status().is_success() {
+          return Err(D1Error::ApiError(format!("Failed to get database {db_id}: {}", response.text().await.unwrap_or_default())));
+        }
 
-    let json: serde_json::Value = response.json().await?;
-    if !json.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false) {
-      return Err(D1Error::ApiError(format!("API success=false: {json:?}")));
-    }
+        let json: serde_json::Value = response.json().await?;
+        if !json.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+          return Err(D1Error::ApiError(format!("API success=false: {json:?}")));
+        }
 
-    let result = json.get("result").ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a result")))?;
-    let name = result.get("name").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a name")))?;
-    let file_size = result.get("file_size").and_then(serde_json::Value::as_u64).ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a numeric file_size")))?;
-    Ok(D1DatabaseInfo { name, file_size })
+        let result = json.get("result").ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a result")))?;
+        let name = result.get("name").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a name")))?;
+        let file_size = result.get("file_size").and_then(serde_json::Value::as_u64).ok_or_else(|| D1Error::ApiError(format!("Database {db_id} response did not contain a numeric file_size")))?;
+        Ok(D1DatabaseInfo { name, file_size })
+      }
+      #[cfg(test)]
+      D1Transport::InMemory(memory) => {
+        let guard = match memory.database_info.lock() {
+          Ok(guard) => guard,
+          Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone().ok_or_else(|| D1Error::ApiError(format!("In-memory database {db_id} was not configured")))
+      }
+    }
   }
 
   pub async fn get_database_count(&self) -> Result<u64, D1Error> {
-    let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database", self.account_id);
-    let response = self.client.get(&url).header(AUTHORIZATION, self.authorization.clone()).query(&[("per_page", "10")]).send().await?;
-    if !response.status().is_success() {
-      return Err(D1Error::ApiError(format!("Failed to list D1 databases: {}", response.text().await.unwrap_or_default())));
-    }
+    match &self.transport {
+      D1Transport::Http(http) => {
+        let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database", http.account_id);
+        let response = http.client.get(&url).header(AUTHORIZATION, http.authorization.clone()).query(&[("per_page", "10")]).send().await?;
+        if !response.status().is_success() {
+          return Err(D1Error::ApiError(format!("Failed to list D1 databases: {}", response.text().await.unwrap_or_default())));
+        }
 
-    let json: serde_json::Value = response.json().await?;
-    if !json.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false) {
-      return Err(D1Error::ApiError(format!("API success=false while listing D1 databases: {json:?}")));
-    }
+        let json: serde_json::Value = response.json().await?;
+        if !json.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+          return Err(D1Error::ApiError(format!("API success=false while listing D1 databases: {json:?}")));
+        }
 
-    json
-      .get("result_info")
-      .and_then(|result_info| result_info.get("total_count"))
-      .and_then(serde_json::Value::as_u64)
-      .ok_or_else(|| D1Error::ApiError("D1 database list response did not contain result_info.total_count".into()))
+        json
+          .get("result_info")
+          .and_then(|result_info| result_info.get("total_count"))
+          .and_then(serde_json::Value::as_u64)
+          .ok_or_else(|| D1Error::ApiError("D1 database list response did not contain result_info.total_count".into()))
+      }
+      #[cfg(test)]
+      D1Transport::InMemory(memory) => Ok(memory.database_count.load(Ordering::Relaxed)),
+    }
   }
 
   pub async fn create_database(&self, name: &str) -> Result<String, D1Error> {
-    let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database", self.account_id);
-    let response = self.client.post(&url).header(AUTHORIZATION, self.authorization.clone()).json(&serde_json::json!({ "name": name })).send().await?;
-    if !response.status().is_success() {
-      return Err(D1Error::ApiError(format!("Failed to create database {name}: {}", response.text().await.unwrap_or_default())));
-    }
+    match &self.transport {
+      D1Transport::Http(http) => {
+        let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database", http.account_id);
+        let response = http.client.post(&url).header(AUTHORIZATION, http.authorization.clone()).json(&serde_json::json!({ "name": name })).send().await?;
+        if !response.status().is_success() {
+          return Err(D1Error::ApiError(format!("Failed to create database {name}: {}", response.text().await.unwrap_or_default())));
+        }
 
-    let json: serde_json::Value = response.json().await?;
-    if !json.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false) {
-      return Err(D1Error::ApiError(format!("API success=false: {json:?}")));
-    }
+        let json: serde_json::Value = response.json().await?;
+        if !json.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+          return Err(D1Error::ApiError(format!("API success=false: {json:?}")));
+        }
 
-    json.get("result").and_then(|result| result.get("uuid")).and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| D1Error::ApiError("No uuid in create database response".into()))
+        json.get("result").and_then(|result| result.get("uuid")).and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| D1Error::ApiError("No uuid in create database response".into()))
+      }
+      #[cfg(test)]
+      D1Transport::InMemory(memory) => {
+        let mut created = match memory.created_databases.lock() {
+          Ok(guard) => guard,
+          Err(poisoned) => poisoned.into_inner(),
+        };
+        let uuid = format!("in-memory-uuid-{}", created.len() + 1);
+        created.push((name.to_owned(), uuid.clone()));
+        memory.database_count.fetch_add(1, Ordering::Relaxed);
+        Ok(uuid)
+      }
+    }
   }
 
   pub async fn execute_schema(&self, db_id: &str, schema_sql: &str) -> Result<(), D1Error> {
@@ -531,23 +729,36 @@ impl D1Client {
   pub async fn execute_maintenance_statements(&self, db_id: &str, statements: &[&str]) -> Result<(), D1Error> {
     for sql in statements {
       let query = D1Query { sql, params: Vec::new() };
-      self.execute_query_body(db_id, &query, MAX_QUERY_RETRIES).await?;
+      self.execute_single_query(db_id, &query, MAX_QUERY_RETRIES).await?;
     }
     Ok(())
   }
 
   pub async fn delete_database(&self, db_id: &str) -> Result<(), D1Error> {
-    let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{db_id}", self.account_id);
-    let response = self.client.delete(&url).header(AUTHORIZATION, self.authorization.clone()).send().await?;
-    if !response.status().is_success() {
-      return Err(D1Error::ApiError(format!("Failed to delete database {db_id}: {}", response.text().await.unwrap_or_default())));
-    }
+    match &self.transport {
+      D1Transport::Http(http) => {
+        let url = format!("https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{db_id}", http.account_id);
+        let response = http.client.delete(&url).header(AUTHORIZATION, http.authorization.clone()).send().await?;
+        if !response.status().is_success() {
+          return Err(D1Error::ApiError(format!("Failed to delete database {db_id}: {}", response.text().await.unwrap_or_default())));
+        }
 
-    let json: serde_json::Value = response.json().await?;
-    if !json.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false) {
-      return Err(D1Error::ApiError(format!("API success=false: {json:?}")));
+        let json: serde_json::Value = response.json().await?;
+        if !json.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+          return Err(D1Error::ApiError(format!("API success=false: {json:?}")));
+        }
+        Ok(())
+      }
+      #[cfg(test)]
+      D1Transport::InMemory(memory) => {
+        let mut deleted = match memory.deleted_databases.lock() {
+          Ok(guard) => guard,
+          Err(poisoned) => poisoned.into_inner(),
+        };
+        deleted.push(db_id.to_owned());
+        Ok(())
+      }
     }
-    Ok(())
   }
 }
 
@@ -582,6 +793,10 @@ fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
 mod tests {
   use super::*;
 
+  fn ok_result(rows_read: u64, rows_written: Option<u64>) -> D1Result {
+    D1Result { results: Vec::new(), meta: Some(D1Meta { rows_read, rows_written }), success: Some(true) }
+  }
+
   #[test]
   fn omitted_write_metadata_is_not_a_zero_write_response() -> Result<(), serde_json::Error> {
     let result: D1Result = serde_json::from_str(r#"{"meta":{"rows_read":0},"success":true}"#)?;
@@ -591,13 +806,48 @@ mod tests {
 
   #[tokio::test]
   async fn exhausted_data_budget_preserves_checkpoint_capacity() -> Result<(), D1Error> {
-    let data = Arc::new(D1WriteBudget::new(8));
-    let metadata = Arc::new(D1WriteBudget::new(2));
-    let checkpoint = metadata.reserve(2).await?;
-    data.reserve(8).await?.consume_all();
-    assert!(matches!(data.reserve(1).await, Err(D1Error::WriteBudgetExhausted { .. })));
-    checkpoint.finish(1)?;
-    assert_eq!(metadata.state().remaining, 1);
+    let transport = InMemoryTransport::new();
+    let client = D1Client::with_in_memory(transport, 8, 2, 1);
+    let checkpoint = client.reserve_checkpoint().await?;
+    client.reserve_import_writes(8).await?.consume_all();
+    assert!(matches!(client.reserve_import_writes(1).await, Err(D1Error::WriteBudgetExhausted { .. })));
+    let update = FileProgressUpdate { file: "stops.txt", checkpoint: Checkpoint { line: 10, byte: 120 }, completed: false };
+    client.save_file_progress(checkpoint, "db-1", update).await?;
+    assert_eq!(client.metadata_budget.state().remaining, 1);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn typed_progress_round_trip_decodes_status_and_checkpoints() -> Result<(), D1Error> {
+    let transport = InMemoryTransport::new();
+    transport.push_query_response(vec![D1Result {
+      results: vec![
+        serde_json::json!({
+          "FileName": "stops.txt",
+          "CRC": "a1b2c3d4",
+          "LastProcessedLine": 42,
+          "LastProcessedByte": 1024,
+          "Status": 1
+        }),
+        serde_json::json!({
+          "FileName": "routes.txt",
+          "CRC": "ff00ff00",
+          "LastProcessedLine": 10,
+          "LastProcessedByte": 256,
+          "Status": 0
+        }),
+      ],
+      ..ok_result(2, Some(0))
+    }]);
+    let client = D1Client::with_in_memory(transport, 100, 10, 2);
+    let progress = client.get_files_progress("db-1").await?;
+    assert_eq!(
+      progress,
+      vec![
+        StoredFileProgress { file_name: "stops.txt".to_owned(), crc: "a1b2c3d4".to_owned(), checkpoint: Checkpoint { line: 42, byte: 1024 }, completed: false },
+        StoredFileProgress { file_name: "routes.txt".to_owned(), crc: "ff00ff00".to_owned(), checkpoint: Checkpoint { line: 10, byte: 256 }, completed: true },
+      ]
+    );
     Ok(())
   }
 
@@ -616,39 +866,14 @@ mod tests {
   #[test]
   fn result_count_must_match_submitted_statements() {
     assert!(validate_result_count(Vec::new(), 1).is_err());
-    assert!(validate_result_count(vec![D1Result { results: Vec::new(), meta: None, success: Some(true) }], 1).is_ok());
+    assert!(validate_result_count(vec![ok_result(0, None)], 1).is_ok());
   }
 
   #[test]
   fn usage_metadata_is_aggregated() {
-    let runtime = RuntimeConfig {
-      csv_concurrency_limit: 1,
-      d1_global_concurrency_limit: 1,
-      d1_database_concurrency_limit: 1,
-      d1_max_databases: 10,
-      query_statement_batch_size: 1,
-      d1_statements_per_request: 1,
-      max_d1_rows_written_per_workflow: 2,
-      max_rows_per_workflow: 1,
-      max_feed_download_bytes: 1,
-      max_uncompressed_feed_bytes: 1,
-      max_csv_record_bytes: 1,
-      max_statement_payload_bytes: 1,
-      max_temp_feed_storage_bytes: 1,
-      db_size_threshold_bytes: 1,
-      http_connect_timeout: Duration::from_secs(1),
-      http_request_timeout: Duration::from_secs(1),
-      d1_query_timeout: Duration::from_secs(1),
-    };
-    let client = D1Client::new("account".into(), "token".into(), &runtime);
-    assert!(client.is_ok());
-    let Some(client) = client.ok() else {
-      return;
-    };
-    client.record_usage(&[
-      D1Result { results: Vec::new(), meta: Some(D1Meta { rows_read: 7, rows_written: Some(3) }), success: Some(true) },
-      D1Result { results: Vec::new(), meta: Some(D1Meta { rows_read: 11, rows_written: Some(5) }), success: Some(true) },
-    ]);
+    let transport = InMemoryTransport::new();
+    let client = D1Client::with_in_memory(transport, 2, 2, 1);
+    client.record_usage(&[ok_result(7, Some(3)), ok_result(11, Some(5))]);
     assert_eq!(client.usage(), D1Usage { rows_read: 18, rows_written: 8 });
   }
 
@@ -674,13 +899,10 @@ mod tests {
     tokio::task::yield_now().await;
     first.finish(2)?;
 
-    let joined = match tokio::time::timeout(Duration::from_secs(1), waiter).await {
-      Ok(joined) => joined.map_err(|error| D1Error::ApiError(format!("write-budget waiter failed to join: {error}")))?,
-      Err(_) => {
-        return Err(D1Error::ApiError("write-budget waiter was not notified".to_owned()));
-      }
-    };
-    let reservation = joined?;
+    let reservation = tokio::time::timeout(Duration::from_secs(1), waiter)
+      .await
+      .map_err(|_| D1Error::ApiError("write-budget waiter was not notified".to_owned()))?
+      .map_err(|error| D1Error::ApiError(format!("write-budget waiter failed to join: {error}")))??;
     reservation.finish(0)?;
     assert_eq!(budget.state().remaining, 8);
     Ok(())
