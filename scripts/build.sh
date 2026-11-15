@@ -15,10 +15,10 @@ if ! rustup target list --installed | grep -qx 'wasm32-unknown-unknown'; then
     rustup target add wasm32-unknown-unknown
 fi
 
-# 3. Ensure worker-build is installed (optimized via --locked)
-if ! command -v worker-build &> /dev/null; then
-    echo "worker-build not found. Installing..."
-    cargo install -q worker-build --locked
+# 3. Ensure worker-build ^0.9 is installed (optimized via --locked)
+if ! command -v worker-build &> /dev/null || [[ "$(worker-build --version 2>/dev/null || true)" != 0.9.* ]]; then
+    echo "worker-build (^0.9) not found. Installing..."
+    cargo install -q worker-build --version "^0.9" --locked --force
 fi
 
 # 4. Build the worker
