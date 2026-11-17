@@ -49,6 +49,16 @@ fn coordinates(lat: Option<f64>, lng: Option<f64>) -> Option<[f64; 2]> {
   }
 }
 
+fn route_select_sql(provider: &str) -> String {
+  let has = |column: &str| crate::data::schema::has_column(provider, "routes", column);
+  format!(
+    "SELECT {}, {}, {} FROM routes WHERE route_id = ?1 LIMIT 1",
+    if has("route_short_name") { "route_short_name" } else { "NULL AS route_short_name" },
+    if has("route_long_name") { "route_long_name" } else { "NULL AS route_long_name" },
+    if has("route_color") { "route_color" } else { "NULL AS route_color" },
+  )
+}
+
 fn json_error(status: u16, message: &str) -> Result<Response> {
   Ok(Response::from_json(&json!({ "error": message }))?.with_status(status))
 }
@@ -95,7 +105,8 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   };
   let filter = JsValue::from(&route_id);
 
-  let route_result = db.prepare("SELECT route_short_name, route_long_name, route_color FROM routes WHERE route_id = ?1 LIMIT 1").bind(std::slice::from_ref(&filter))?.all().await?;
+  let route_sql = route_select_sql(provider);
+  let route_result = db.prepare(&route_sql).bind(std::slice::from_ref(&filter))?.all().await?;
   if !route_result.success() {
     return json_error(503, "Map data is unavailable");
   }
@@ -104,7 +115,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   };
 
   let mut paths: BTreeMap<(String, String), Vec<[f64; 2]>> = BTreeMap::new();
-  let has_shapes = crate::data::schema::has_column(provider, "shapes", "shape_id");
+  let has_shapes = crate::data::schema::has_column(provider, "shapes", "shape_id") && crate::data::schema::has_column(provider, "trips", "shape_id");
   if has_shapes {
     let shape_result = db
       .prepare(
@@ -258,5 +269,17 @@ mod tests {
       assert_eq!(parse_route_id(&url), Err((400, "Expected at most one non-empty route_id")), "{query}");
     }
     Ok(())
+  }
+
+  #[test]
+  fn route_select_sql_handles_missing_route_color() {
+    assert_eq!(
+      route_select_sql("rapid-bus-mrtfeeder"),
+      "SELECT route_short_name, route_long_name, NULL AS route_color FROM routes WHERE route_id = ?1 LIMIT 1"
+    );
+    assert_eq!(
+      route_select_sql("ktmb"),
+      "SELECT route_short_name, route_long_name, route_color FROM routes WHERE route_id = ?1 LIMIT 1"
+    );
   }
 }

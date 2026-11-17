@@ -33,7 +33,7 @@ pub async fn fetch_route(mut req: Request, env: Env, ctx: Context) -> Result<Res
     response.headers_mut().set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key")?;
     response
   } else {
-    match (segments.next(), segments.next(), segments.next(), segments.next()) {
+    let result = match (segments.next(), segments.next(), segments.next(), segments.next()) {
       (Some(provider), Some("status"), None, None) => status::handle(&req, &env, ctx, &url, provider).await,
       (Some(provider), Some("departures"), None, None) => departures::handle(&req, &env, &url, provider).await,
       (Some(provider), Some("map"), None, None) => map::handle(&req, &env, ctx, &url, provider).await,
@@ -41,7 +41,14 @@ pub async fn fetch_route(mut req: Request, env: Env, ctx: Context) -> Result<Res
       (Some(provider), Some("data"), Some(table_name), None) => data::handle(&req, &env, &url, provider, table_name).await,
       (Some(""), None, None, None) | (None, None, None, None) => Response::ok("Worker is running. Use /<provider>/status to check GTFS import progress."),
       _ => Response::error("Not Found", 404),
-    }?
+    };
+    match result {
+      Ok(response) => response,
+      Err(err) => {
+        worker::console_error!("Unhandled route error: {err}");
+        Response::error("Internal Server Error", 500)?
+      }
+    }
   };
   response.headers_mut().set("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN)?;
   Ok(response)
