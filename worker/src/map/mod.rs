@@ -273,13 +273,7 @@ mod tests {
 
   #[test]
   fn route_select_sql_handles_missing_route_color() {
-    assert_eq!(
-      route_select_sql("rapid-bus-mrtfeeder"),
-      "SELECT route_short_name, route_long_name, NULL AS route_color FROM routes WHERE route_id = ?1 LIMIT 1"
-    );
-    assert_eq!(
-      route_select_sql("ktmb"),
-      "SELECT route_short_name, route_long_name, route_color FROM routes WHERE route_id = ?1 LIMIT 1"
-    );
+    assert_eq!(route_select_sql("rapid-bus-mrtfeeder"), "SELECT route_short_name, route_long_name, NULL AS route_color FROM routes WHERE route_id = ?1 LIMIT 1");
+    assert_eq!(route_select_sql("ktmb"), "SELECT route_short_name, route_long_name, route_color FROM routes WHERE route_id = ?1 LIMIT 1");
   }
 }
