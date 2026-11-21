@@ -15,6 +15,7 @@ on:
         options:
           - "1000"
           - "2000"
+          - "vars.MAX_ROWS_PER_WORKFLOW"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -52,7 +53,7 @@ jobs:
           D1_MAX_DATABASES: ${{ vars.D1_MAX_DATABASES }}
           D1_STATEMENTS_PER_REQUEST: ${{ vars.D1_STATEMENTS_PER_REQUEST }}
           D1_DAILY_WRITE_LIMIT: ${{ vars.D1_DAILY_WRITE_LIMIT }}
-          MAX_ROWS_PER_WORKFLOW: ${{ github.event_name == 'workflow_dispatch' && inputs.max_rows || vars.MAX_ROWS_PER_WORKFLOW }}
+          MAX_ROWS_PER_WORKFLOW: ${{ github.event_name == 'workflow_dispatch' && inputs.max_rows != 'vars.MAX_ROWS_PER_WORKFLOW' && inputs.max_rows || vars.MAX_ROWS_PER_WORKFLOW }}
           MAX_FEED_DOWNLOAD_MB: ${{ vars.MAX_FEED_DOWNLOAD_MB }}
           MAX_UNCOMPRESSED_FEED_MB: ${{ vars.MAX_UNCOMPRESSED_FEED_MB }}
           MAX_FEED_ARCHIVE_ENTRIES: ${{ vars.MAX_FEED_ARCHIVE_ENTRIES }}
