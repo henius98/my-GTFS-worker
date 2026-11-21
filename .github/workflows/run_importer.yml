@@ -2,9 +2,9 @@ name: GTFS Import Pipeline
 
 on:
   schedule:
-    # Run twice daily at 05:00 and 13:00 UTC+8; the durable UTC-day budget also covers manual runs.
-    - cron: "0 5,13 * * *"
-      timezone: "Asia/Kuala_Lumpur"
+    # Run twice daily at 04:00 and 13:00 UTC+8; the durable UTC-day budget also covers manual runs.
+    - cron: "0 4,13 * * *"
+      timezone: "Asia/Singapore"
   workflow_dispatch:
     inputs:
       max_rows:
@@ -34,11 +34,12 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download Pre-built Importer
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release download latest-cron -p importer -O importer_bin --clobber
           chmod +x importer_bin
@@ -47,40 +48,72 @@ jobs:
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CSV_CONCURRENCY_LIMIT: ${{ vars.CSV_CONCURRENCY_LIMIT || '2' }}
-          D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT || '6' }}
-          D1_DATABASE_CONCURRENCY_LIMIT: ${{ vars.D1_DATABASE_CONCURRENCY_LIMIT || '8' }}
-          D1_MAX_DATABASES: ${{ vars.D1_MAX_DATABASES || '10' }}
-          D1_STATEMENTS_PER_REQUEST: ${{ vars.D1_STATEMENTS_PER_REQUEST || '4' }}
-          MAX_D1_ROWS_WRITTEN_PER_WORKFLOW: ${{ vars.MAX_D1_ROWS_WRITTEN_PER_WORKFLOW }}
-          MAX_ROWS_PER_WORKFLOW: ${{ github.event_name == 'workflow_dispatch' && inputs.max_rows || vars.MAX_ROWS_PER_WORKFLOW || '1750000' }}
-          MAX_FEED_DOWNLOAD_MB: ${{ vars.MAX_FEED_DOWNLOAD_MB || '256' }}
-          MAX_UNCOMPRESSED_FEED_MB: ${{ vars.MAX_UNCOMPRESSED_FEED_MB || '512' }}
-          MAX_CSV_RECORD_KB: ${{ vars.MAX_CSV_RECORD_KB || '512' }}
-          MAX_STATEMENT_PAYLOAD_KB: ${{ vars.MAX_STATEMENT_PAYLOAD_KB || '1536' }}
-          MAX_TEMP_FEED_STORAGE_MB: ${{ vars.MAX_TEMP_FEED_STORAGE_MB || '2048' }}
-          QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE || '1000' }}
-          DB_SIZE_THRESHOLD_MB: ${{ vars.DB_SIZE_THRESHOLD_MB || '400' }}
+          D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT }}
+          D1_MAX_DATABASES: ${{ vars.D1_MAX_DATABASES }}
+          D1_STATEMENTS_PER_REQUEST: ${{ vars.D1_STATEMENTS_PER_REQUEST }}
+          D1_DAILY_WRITE_LIMIT: ${{ vars.D1_DAILY_WRITE_LIMIT }}
+          MAX_ROWS_PER_WORKFLOW: ${{ github.event_name == 'workflow_dispatch' && inputs.max_rows || vars.MAX_ROWS_PER_WORKFLOW }}
+          MAX_FEED_DOWNLOAD_MB: ${{ vars.MAX_FEED_DOWNLOAD_MB }}
+          MAX_UNCOMPRESSED_FEED_MB: ${{ vars.MAX_UNCOMPRESSED_FEED_MB }}
+          MAX_FEED_ARCHIVE_ENTRIES: ${{ vars.MAX_FEED_ARCHIVE_ENTRIES }}
+          MAX_CSV_RECORD_KB: ${{ vars.MAX_CSV_RECORD_KB }}
+          MAX_STATEMENT_PAYLOAD_KB: ${{ vars.MAX_STATEMENT_PAYLOAD_KB }}
+          MAX_TEMP_FEED_STORAGE_MB: ${{ vars.MAX_TEMP_FEED_STORAGE_MB }}
+          QUERY_STATEMENT_BATCH_SIZE: ${{ vars.QUERY_STATEMENT_BATCH_SIZE }}
+          DB_SIZE_THRESHOLD_MB: ${{ vars.DB_SIZE_THRESHOLD_MB }}
+          HTTP_CONNECT_TIMEOUT_SECS: ${{ vars.HTTP_CONNECT_TIMEOUT_SECS }}
+          HTTP_REQUEST_TIMEOUT_SECS: ${{ vars.HTTP_REQUEST_TIMEOUT_SECS }}
+          D1_QUERY_TIMEOUT_SECS: ${{ vars.D1_QUERY_TIMEOUT_SECS }}
+          D1_MAX_QUERY_RETRIES: ${{ vars.D1_MAX_QUERY_RETRIES }}
+          D1_MAX_RETRY_DELAY_SECS: ${{ vars.D1_MAX_RETRY_DELAY_SECS }}
         run: ./importer_bin
 
-      - name: Auto-Commit and Redeploy on Rotation
+      - name: Check for Database Rotation
+        id: rotation
         if: always()
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           if ! git diff --quiet providers.toml; then
-            echo "Database rotation detected. Committing changes..."
+            echo "Database rotation detected. Updating wrangler.toml and committing changes..."
+            echo "rotated=true" >> "$GITHUB_OUTPUT"
             bash ./scripts/generate-wrangler.sh
             git config --global user.name "github-actions[bot]"
             git config --global user.email "github-actions[bot]@users.noreply.github.com"
             git add providers.toml wrangler.toml
             git commit -m "chore: auto-rotate D1 databases"
             git push
-
-            echo "Deploying updated worker..."
-            npm ci
-            npx wrangler deploy
           else
+            echo "rotated=false" >> "$GITHUB_OUTPUT"
             echo "No database rotation occurred."
           fi
+
+      - name: Setup pnpm for Worker Redeploy
+        if: always() && steps.rotation.outputs.rotated == 'true'
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js for Worker Redeploy
+        if: always() && steps.rotation.outputs.rotated == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Rust for Worker Redeploy
+        if: always() && steps.rotation.outputs.rotated == 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.100.0
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust Dependencies for Worker Redeploy
+        if: always() && steps.rotation.outputs.rotated == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Redeploy Worker on Rotation
+        if: always() && steps.rotation.outputs.rotated == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          echo "Deploying updated worker..."
+          pnpm install --frozen-lockfile
+          pnpm run deploy

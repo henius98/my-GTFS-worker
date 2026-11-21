@@ -142,7 +142,7 @@ graph TD
 
 Ensure your local environment is correctly configured with:
 
-1. **[Rust & Cargo](https://rustup.rs/)** (the repository pins Rust `1.94.0`)
+1. **[Rust & Cargo](https://rustup.rs/)** (the repository pins Rust `1.100.0`)
 2. **[Node.js / npm](https://nodejs.org/en/)**
 3. **Wrangler CLI**: Install globally using `npm install -g wrangler`. (You can authenticate via `wrangler login`, or just use the `.env` file with your API token as shown below).
 4. **Cloudflare Account**: Create an API Token with the following permissions:
@@ -171,24 +171,28 @@ cp .env.example .env
 
 Then, edit `.env` and fill in `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` (this allows you to skip `wrangler login`).
 
-The checked-in `.env.example` profile uses high scan concurrency. Both direct and scheduled imports must acquire capacity from the shared daily write ledger.
+The importer requires these environment variables from the server environment (`.env` locally or GitHub repository `vars` in CI). Missing or invalid values fail fast without silent fallback defaults. Both direct and scheduled imports must acquire capacity from the shared daily write ledger.
 
-| Variable                           | Example value | Purpose                                                                                                         |
-| ---------------------------------- | ------------: | --------------------------------------------------------------------------------------------------------------- |
-| `CSV_CONCURRENCY_LIMIT`            |            20 | Concurrent blocking ZIP/CSV producers; an unset local value detects CPUs                                        |
-| `D1_CONCURRENCY_LIMIT`             |            10 | Concurrent D1 REST requests across the account (one per active database)                                        |
-| `D1_DATABASE_CONCURRENCY_LIMIT`    |             8 | Concurrent requests permitted to one D1 database                                                                |
-| `D1_MAX_DATABASES`                 |            20 | Refuse automatic rotation once the configured account database count is exhausted                               |
-| `QUERY_STATEMENT_BATCH_SIZE`       |          2000 | CSV rows encoded in one SQL statement                                                                           |
-| `D1_STATEMENTS_PER_REQUEST`        |             8 | SQL statements grouped into one REST request                                                                    |
-| `MAX_D1_ROWS_WRITTEN_PER_WORKFLOW` |        100000 | Maximum daily-ledger lease, including data, metadata and ledger writes; capped by the remaining daily allowance |
-| `MAX_ROWS_PER_WORKFLOW`            |       5000000 | Logical scan ceiling shared fairly by providers, independent of actual writes                                   |
-| `MAX_FEED_DOWNLOAD_MB`             |           256 | Reject a declared or streamed ZIP larger than this temporary-file safety limit                                  |
-| `MAX_UNCOMPRESSED_FEED_MB`         |           512 | Reject supported CSV entries whose combined declared expansion exceeds this ZIP-bomb/work cap                   |
-| `MAX_CSV_RECORD_KB`                |           512 | Reject pathological CSV headers/records well below D1's 2,000,000-byte value limit                              |
-| `MAX_STATEMENT_PAYLOAD_KB`         |          1536 | Flush serialized positional-JSON bind values below D1's 2,000,000-byte hard limit                               |
-| `MAX_TEMP_FEED_STORAGE_MB`         |          2048 | Workflow-wide cap for all retained provider ZIPs in one importer process; must be at least the per-feed cap     |
-| `DB_SIZE_THRESHOLD_MB`             |           490 | Rotation threshold with minimal headroom below the documented 500 MB database limit                             |
+| Variable                     | Example | Purpose                                                                                                         |
+| ---------------------------- | ------: | --------------------------------------------------------------------------------------------------------------- |
+| `D1_CONCURRENCY_LIMIT`       |      10 | Concurrent D1 REST requests (derives `2x` CSV producers and `1x` per-database concurrency)                      |
+| `D1_MAX_DATABASES`           |      10 | Refuse automatic rotation once the configured account database count is exhausted                               |
+| `QUERY_STATEMENT_BATCH_SIZE` |    2000 | CSV rows encoded in one SQL statement                                                                           |
+| `D1_STATEMENTS_PER_REQUEST`  |       8 | SQL statements grouped into one REST request                                                                    |
+| `D1_DAILY_WRITE_LIMIT`       |  100000 | Shared UTC-day D1 row-write ceiling enforced by `0_daily_import_budget` (each workflow leases up to this cap)   |
+| `MAX_ROWS_PER_WORKFLOW`            | 5000000 | Logical scan ceiling shared fairly by providers, independent of actual writes                                   |
+| `MAX_FEED_DOWNLOAD_MB`             |     256 | Reject a declared or streamed ZIP larger than this temporary-file safety limit                                  |
+| `MAX_UNCOMPRESSED_FEED_MB`         |     512 | Reject supported CSV entries whose combined declared expansion exceeds this ZIP-bomb/work cap                   |
+| `MAX_FEED_ARCHIVE_ENTRIES`         |     256 | Reject a feed ZIP archive containing more entries than this safety limit                                        |
+| `MAX_CSV_RECORD_KB`                |     512 | Reject pathological CSV headers/records well below D1's 2,000,000-byte value limit                              |
+| `MAX_STATEMENT_PAYLOAD_KB`         |    1536 | Flush serialized positional-JSON bind values below D1's 2,000,000-byte hard limit                               |
+| `MAX_TEMP_FEED_STORAGE_MB`         |    2048 | Workflow-wide cap for all retained provider ZIPs in one importer process; must be at least the per-feed cap     |
+| `DB_SIZE_THRESHOLD_MB`             |     490 | Rotation threshold with minimal headroom below the documented 500 MB database limit                             |
+| `HTTP_CONNECT_TIMEOUT_SECS`        |      10 | HTTP connection timeout in seconds for feed downloads and D1 API calls                                          |
+| `HTTP_REQUEST_TIMEOUT_SECS`        |     120 | HTTP request timeout in seconds for feed downloads and D1 API calls                                             |
+| `D1_QUERY_TIMEOUT_SECS`            |      35 | Timeout in seconds for one D1 SQL query request                                                                 |
+| `D1_MAX_QUERY_RETRIES`             |       3 | Maximum retry attempts for retryable D1 read queries (`0` disables retries; write batches never retry)          |
+| `D1_MAX_RETRY_DELAY_SECS`          |      30 | Maximum backoff or `Retry-After` delay in seconds between D1 read retries                                       |
 
 `MAX_ROWS_PER_RUN` remains a deprecated fallback when invoking the importer directly, but its value now has workflow-wide semantics. The checked-in GitHub workflow deliberately ignores that legacy repository variable so an old 100,000-row setting cannot silently reintroduce the non-converging scan cap; configure `MAX_ROWS_PER_WORKFLOW` instead.
 
@@ -198,9 +202,9 @@ As of 2026-08-28, D1 Free includes 100,000 rows written and 5 million rows read 
 
 The importer reserves up to the configured workflow allowance atomically in `0_daily_import_budget` before preparing providers, using the remaining daily capacity when a full allowance cannot fit. The daily importer ceiling is 100,000 writes, with no allowance set aside for other account activity. `budget_provider` in `providers.toml` selects the existing database that holds this shared ledger. All importer deployments for the account must use the same ledger; external writers and old importer binaries are not accounted for automatically. Never reset or move the ledger during an active UTC day. Automatic rotation of its database is blocked to preserve accounting.
 
-The default maximum 100,000-write lease includes 1,000 writes allocated to metadata and two ledger writes, leaving up to 98,998 for data. These writes count within the daily allowance. The workflow inherits this default from the importer unless its repository variable overrides it. Each file reserves its checkpoint before uploading. Data batches reserve two writes per logical row and reconcile against `meta.rows_written`; unchanged rows return capacity immediately. Completed runs return only provably unused capacity, which later runs can lease on the same day. A crash or ambiguous write consumes its reservation; mutating requests are not automatically retried. If the remaining daily capacity cannot cover metadata, ledger writes and any data, the run exits without importing. The ledger resets on the first admission of a new UTC day. Requests stop during the final minute of the leased day and cannot spend an old lease after midnight; a boundary interruption may leave checkpoints to be replayed on the next run.
+The default maximum 100,000-write lease includes 2,000 writes allocated to metadata and two ledger writes, leaving up to 97,998 for data. These writes count within the daily allowance. The workflow inherits this default from the importer unless its repository variable overrides it. Each file reserves its checkpoint before uploading. Data batches deduct actual writes post-query from `meta.rows_written`, so unchanged rows (reads only) consume zero write capacity and do not block on upfront `2 × logical_rows` reservations. Completed runs return only provably unused capacity, which later runs can lease on the same day. A crash or ambiguous write consumes its estimated write bound; mutating requests are not automatically retried. If the remaining daily capacity cannot cover metadata, ledger writes and any data, the run exits without importing. The ledger resets on the first admission of a new UTC day. Requests stop during the final minute of the leased day and cannot spend an old lease after midnight; a boundary interruption may leave checkpoints to be replayed on the next run.
 
-Before using the new importer, apply `migrations/ktmb/20260912_add_daily_import_budget.sql` through `./scripts/deploy.sh` and rebuild the importer release. Missing ledger tables fail closed. The daily ceiling and metadata reserves are defined in `importer/src/d1.rs`; workflow settings cannot raise the daily ceiling. Table-level batch logs report provider, table, logical rows and actual D1 writes. Keep necessary indexes: UPSERTs omit primary-key assignments while retaining null-safe comparisons for mutable columns.
+Before using the new importer, apply `migrations/ktmb/20260912_add_daily_import_budget.sql` through `./scripts/deploy.sh` and rebuild the importer release. Missing ledger tables fail closed. `D1_DAILY_WRITE_LIMIT` configures the daily ceiling while metadata and ledger reserves stay defined in `importer/src/budget.rs`. Table-level batch logs report provider, table, logical rows and actual D1 writes. Keep necessary indexes: UPSERTs omit primary-key assignments while retaining null-safe comparisons for mutable columns.
 
 The six feeds contained 1,562,132 source rows when measured on 2026-08-28. An earlier fixed 40,000-logical-row daily limit therefore needed at least 39 days for one scan and could restart large files faster than it completed them. The workflow fallback's separate 1,750,000-row logical ceiling now lets a mostly unchanged snapshot traverse in one workflow, while a full 100,000-write lease allows up to 49,499 indexed source rows for a changed or initial load. Batch reservations can stop earlier when the next batch does not fit. The final `D1 query metadata` log totals successfully decoded responses; use the Cloudflare dashboard as the account-wide authority for the full UTC day.
 
@@ -276,7 +280,7 @@ curl --get 'http://localhost:8787/rapid-rail-kl/departures' --data-urlencode 'st
 
 `stop_id` is required. Optional `route_id` filters a route, `direction_id` is `0` or `1`, `limit` is 1–100 (default 5), and `at` is an RFC3339 instant with a timezone (default: now). The response includes `departures`, `requested_at`, `search_until`, `is_estimate: true`, and `realtime: false`. Each departure identifies its calculation as `gtfs_schedule` or `frequency_start_plus_headway`; scheduled trips have null `headway_secs` and `trip_start_secs`. These are static-feed estimates, with no live delay adjustment. The endpoint is public like the existing `/data` and `/status` routes.
 
-Calculated results are cached on demand in each provider's `departure_cache` table for 24 hours by default. Set `WORKER_DEPARTURE_CACHE_TTL_SECONDS` to a positive number of seconds to change that lifetime; missing, invalid, or zero values use the 24-hour default. Each stop/route/direction filter has one row containing up to 100 departures in its JSON `payload`; different `limit` and `at` requests reuse or replace that row. Cache hits remove elapsed departures and recalculate waits for the requested instant. `0_import_progress` changes invalidate the cache. Expired rows are replaced when requested again. The `X-Departure-Cache` header reports `HIT`, `MISS`, or `BYPASS`; cache failures still return freshly calculated results.
+Calculated results are cached on demand in each provider's `departure_cache` table. Set `WORKER_FEED_CACHE_TTL_SECONDS` in the Worker environment to a positive number of seconds; missing, invalid, or zero values fail the request. Each stop/route/direction filter has one row containing up to `WORKER_DEPARTURES_MAX_LIMIT` departures in its JSON `payload`; different `limit` and `at` requests reuse or replace that row. Cache hits remove elapsed departures and recalculate waits for the requested instant. `0_import_progress` changes invalidate the cache. Expired rows are replaced when requested again. The `X-Departure-Cache` header reports `HIT`, `MISS`, or `BYPASS`; cache failures still return freshly calculated results.
 
 Apply the new `*_add_departure_cache.sql` migrations and deploy through `./scripts/deploy.sh` to enable persistence. Cache writes consume D1 write allowance in addition to the importer's daily ledger; hits do not write. The cache adds no indexes to imported GTFS tables. SQL/cache migration checks can run with `cargo test -p gtfs-checks --test departure_sql`; scheduling and cache-selection regressions are in the worker's Rust tests. Run `pnpm test:worker` for isolated HTTP and D1 integration checks of the built Rust Worker. This command builds the Worker, applies the KTMB migrations to a temporary local D1 database, and exercises the departures endpoint through Cloudflare's test harness.
 
@@ -297,9 +301,29 @@ map.data.setStyle((feature) =>
 );
 ```
 
-Set the Worker `MAX_ROWS` variable to change the response cap for both `/data` and `/sql`; it must be a positive integer. If it is missing or invalid, the Worker uses 1000 rows.
+Set these required Cloudflare Worker variables (missing or invalid values fail fast without silent fallback defaults):
 
-To run the importer locally for testing:
+| Variable                                | Example             | Purpose                                                                                             |
+| --------------------------------------- | ------------------: | --------------------------------------------------------------------------------------------------- |
+| `WORKER_CORS_ALLOW_ORIGIN`              |                 `*` | Value for the `Access-Control-Allow-Origin` response header                                         |
+| `WORKER_SQL_MAX_ROWS`                   |              `1000` | Maximum row cap for both `/data` and `/sql`                                                         |
+| `WORKER_API_CACHE_TTL_SECONDS`          |                `60` | `Cache-Control: public, max-age=<n>` lifetime in seconds for `/status` and `/data`                  |
+| `WORKER_FEED_CACHE_TTL_SECONDS`         |             `86400` | Cache lifetime in seconds for `/map` edge caching and `/departures` D1 `departure_cache`            |
+| `WORKER_DEPARTURE_CACHE_WINDOW_SECONDS` |               `300` | Max distance in seconds from `now` for `/departures` requests to populate `departure_cache`         |
+| `WORKER_DEPARTURES_MAX_LIMIT`           |               `100` | Maximum `limit` parameter and cached departure count for `/departures`                              |
+| `WORKER_DEPARTURES_DEFAULT_LIMIT`       |                 `5` | Default `limit` when `/departures` omits `limit` (must be `<= WORKER_DEPARTURES_MAX_LIMIT`)         |
+| `WORKER_DEPARTURES_SEARCH_DAYS`         |                 `7` | Forward search horizon in days for `/departures`                                                    |
+| `WORKER_DEFAULT_TIMEZONE`               | `Asia/Kuala_Lumpur` | Fallback IANA timezone when a GTFS feed omits `agency_timezone`                                     |
+
+To run the importer locally against local Wrangler D1 databases (writes into `.wrangler/state` so `npx wrangler dev` queries the imported data directly):
+
+```bash
+pnpm import:local
+# Or keep the local D1 HTTP bridge running while iterating with cargo:
+pnpm import:local -- --serve-only
+```
+
+To run the importer locally against remote Cloudflare D1:
 
 ```bash
 set -a; source .env; set +a
@@ -310,10 +334,11 @@ Importer checks and benchmarks are under `test/importer/`:
 
 ```bash
 cargo test -p gtfs-checks --test daily_budget
+cargo test -p gtfs-checks --test resume_checkpoint
 cargo run -p gtfs-checks --bin verify_migrations -- --no-report
 cargo run -p gtfs-checks --bin benchmark_json_payload
 cargo run -p gtfs-checks --bin benchmark_upsert_replay
-cargo bench -p importer --bench resume_checkpoint
+pnpm test:importer:local
 ```
 
 Worker checks are under `test/worker/`:

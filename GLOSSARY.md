@@ -13,7 +13,7 @@ A remote GTFS ZIP archive containing comma-separated `.txt` schedule tables iden
 _Avoid_: Dataset archive, bundle, package
 
 **SchemaCatalog**:
-The compile-time mapping of each provider's SQL migrations to table columns, primary keys, positional upsert statements, and post-import maintenance queries.
+The compile-time mapping of each provider's SQL migrations to table columns, primary keys, staging table DDL, and positional upsert statements.
 _Avoid_: Schema registry, metadata service, table mapper
 
 **Checkpoint**:

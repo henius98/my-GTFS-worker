@@ -5,28 +5,44 @@ on:
     branches:
       - main
     paths:
-      - "importer/**"
-      - "migrations/**"
+      - ".github/workflows/build_importer.yml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain"
-      - ".github/workflows/build_importer.yml"
+      - "rustfmt.toml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "providers.toml"
+      - "wrangler.toml"
+      - "importer/**"
       - "worker/**"
+      - "migrations/**"
       - "test/**"
       - "scripts/build.sh"
       - "scripts/generate-wrangler.sh"
+      - "scripts/local-d1-importer.mjs"
+      - "scripts/schema_parser.rs"
   pull_request:
     paths:
+      - ".github/workflows/build_importer.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain"
+      - "rustfmt.toml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "providers.toml"
+      - "wrangler.toml"
       - "importer/**"
       - "worker/**"
       - "migrations/**"
       - "test/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain"
       - "scripts/build.sh"
       - "scripts/generate-wrangler.sh"
-      - ".github/workflows/build_importer.yml"
+      - "scripts/local-d1-importer.mjs"
+      - "scripts/schema_parser.rs"
   workflow_dispatch:
 
 env:
@@ -47,18 +63,84 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          toolchain: 1.94.0
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Node Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.100.0
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
 
       - name: Cache Rust Dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Verify wrangler.toml Matches providers.toml
+        run: |
+          bash ./scripts/generate-wrangler.sh
+          git diff --exit-code wrangler.toml
+
+      - name: Verify All Tests Live Under test/
+        run: |
+          python3 - << 'EOF'
+          from pathlib import Path
+          import re, sys
+
+          repo = Path.cwd().resolve()
+          test_root = repo / "test"
+          errors = []
+          referenced_unit_tests = set()
+
+          for forbidden in ("importer/tests", "importer/benches", "worker/tests", "worker/benches"):
+            if Path(forbidden).exists():
+              errors.append(f"{forbidden}: test/bench directory outside test/")
+
+          for root in ("importer", "worker", "scripts"):
+            for path in sorted(Path(root).rglob("*.rs")):
+              lines = path.read_text().splitlines()
+              for idx, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith("//"):
+                  continue
+                if re.search(r"#\[(?:[\w:]+::)*test(?:\s*\([^)]*\))?\]", stripped):
+                  errors.append(f"{path}:{idx + 1}: test attribute outside test/")
+                if re.match(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+tests\s*\{", stripped):
+                  errors.append(f"{path}:{idx + 1}: inline mod tests block outside test/")
+                if re.search(r"#\[cfg(?:_attr)?\([^]]*\btest\b", stripped):
+                  next_1 = lines[idx + 1].strip() if idx + 1 < len(lines) else ""
+                  next_2 = lines[idx + 2].strip() if idx + 2 < len(lines) else ""
+                  path_match = re.match(r'^#\[path\s*=\s*"((?:\.\./)+test/[^"]+)"\]$', next_1)
+                  if stripped == "#[cfg(test)]" and path_match and re.match(r"^(?:pub\(crate\)\s+)?mod\s+tests;$", next_2):
+                    target = (path.parent / path_match.group(1)).resolve()
+                    if not target.is_file() or not target.is_relative_to(test_root):
+                      errors.append(f"{path}:{idx + 2}: stub target missing or outside test/: {next_1}")
+                    else:
+                      referenced_unit_tests.add(target)
+                  else:
+                    errors.append(f"{path}:{idx + 1}: non-stub #[cfg(test)] item outside test/")
+
+          for unit_file in sorted((test_root / "unit").rglob("*.rs")):
+            if unit_file.resolve() not in referenced_unit_tests:
+              errors.append(f"{unit_file.relative_to(repo)}: unreferenced unit test file")
+
+          if errors:
+            print("\n".join(errors), file=sys.stderr)
+            sys.exit(1)
+          EOF
 
       - name: Check Formatting
         run: cargo fmt --all -- --check
@@ -78,18 +160,21 @@ jobs:
       - name: Run UPSERT Replay Benchmark Guard
         run: cargo run --locked -p gtfs-checks --bin benchmark_upsert_replay
 
-      - name: Run Resume Checkpoint Benchmark Guard
-        run: cargo bench -p importer --bench resume_checkpoint --locked
-
       - name: Build Worker
         run: bash ./scripts/build.sh
+
+      - name: Run Worker Integration Tests
+        run: node --test test/worker/*.test.mjs
+
+      - name: Run Local D1 Importer Integration Tests
+        run: node --test test/importer/local_d1.test.mjs
 
       - name: Build Importer
         run: cargo build --release --locked -p importer
 
       - name: Transfer Importer to Release Job
-        if: github.event_name == 'push'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: target/release/importer
           archive: false
@@ -97,7 +182,7 @@ jobs:
           retention-days: 1
 
   publish:
-    if: github.event_name == 'push'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -106,7 +191,7 @@ jobs:
 
     steps:
       - name: Download Importer
-        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: importer
 

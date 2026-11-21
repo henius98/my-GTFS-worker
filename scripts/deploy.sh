@@ -3,7 +3,6 @@
 set -euo pipefail
 
 PROVIDERS_FILE="providers.toml"
-D1_MAX_DATABASES="${D1_MAX_DATABASES:-10}"
 
 # ── Pre-flight Checks ────────────────────────────────────────────────────────
 if [ -f ".env" ]; then
@@ -23,7 +22,7 @@ if ! command -v python3 &> /dev/null; then
   echo "❌ Error: 'python3' is required to securely parse providers.toml."
   exit 1
 fi
-if ! [[ "$D1_MAX_DATABASES" =~ ^[1-9][0-9]*$ ]]; then
+if ! [[ "${D1_MAX_DATABASES:-}" =~ ^[1-9][0-9]*$ ]]; then
   echo "❌ Error: D1_MAX_DATABASES must be a positive integer."
   exit 1
 fi

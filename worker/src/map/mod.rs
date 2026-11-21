@@ -1,14 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use worker::wasm_bindgen::JsValue;
-use worker::{Cache, Context, Env, Method, Request, Response, Result, Url};
+use worker::{Cache, Context, D1Database, D1Result, Env, Method, Request, Response, Result, Url};
 
 use crate::database;
 
 #[derive(Deserialize)]
 struct MapRoute {
+  route_id: String,
   route_short_name: Option<String>,
   route_long_name: Option<String>,
   route_color: Option<String>,
@@ -49,35 +50,44 @@ fn coordinates(lat: Option<f64>, lng: Option<f64>) -> Option<[f64; 2]> {
   }
 }
 
-fn route_select_sql(provider: &str) -> String {
+const ROUTES_SQL: &str = include_str!("sql/routes.sql");
+const SHAPES_SQL: &str = include_str!("sql/shapes.sql");
+const SEGMENTS_SQL: &str = include_str!("sql/segments.sql");
+const STOPS_SQL: &str = include_str!("sql/stops.sql");
+
+fn route_select_sql(provider: &str, filter_by_route: bool) -> String {
   let has = |column: &str| crate::data::schema::has_column(provider, "routes", column);
-  format!(
-    "SELECT {}, {}, {} FROM routes WHERE route_id = ?1 LIMIT 1",
+  let where_clause = if filter_by_route { " WHERE route_id = ?1 LIMIT 1" } else { "" };
+  let route_columns = format!(
+    "{}, {}, {}",
     if has("route_short_name") { "route_short_name" } else { "NULL AS route_short_name" },
     if has("route_long_name") { "route_long_name" } else { "NULL AS route_long_name" },
     if has("route_color") { "route_color" } else { "NULL AS route_color" },
-  )
+  );
+  ROUTES_SQL.trim_end().replace("__ROUTE_COLUMNS__", &route_columns).replace("__WHERE_CLAUSE__", where_clause)
 }
 
 fn json_error(status: u16, message: &str) -> Result<Response> {
   Ok(Response::from_json(&json!({ "error": message }))?.with_status(status))
 }
 
-fn parse_route_id(url: &Url) -> std::result::Result<String, (u16, &'static str)> {
+fn parse_route_id(url: &Url) -> std::result::Result<Option<String>, (u16, &'static str)> {
   let mut route_id = None;
   for (key, value) in url.query_pairs() {
-    if key != "route_id" || route_id.is_some() {
-      return Err((400, "Expected at most one non-empty route_id"));
-    }
-    if value.trim().is_empty() {
-      return Err((400, "route_id query parameter is required"));
-    }
-    if value.len() > 256 {
+    if key != "route_id" || route_id.is_some() || value.trim().is_empty() || value.len() > crate::MAX_IDENTIFIER_BYTES {
       return Err((400, "Expected at most one non-empty route_id"));
     }
     route_id = Some(value.into_owned());
   }
-  route_id.ok_or((400, "route_id query parameter is required"))
+  Ok(route_id)
+}
+
+async fn query_all(db: &D1Database, sql: &str, filter: Option<&JsValue>) -> Result<D1Result> {
+  let stmt = db.prepare(sql);
+  match filter {
+    Some(f) => stmt.bind(std::slice::from_ref(f))?.all().await,
+    None => stmt.all().await,
+  }
 }
 
 pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider: &str) -> Result<Response> {
@@ -89,11 +99,14 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     Ok(route_id) => route_id,
     Err((status, message)) => return json_error(status, message),
   };
+  let cache_control = crate::feed_cache_control(env)?;
 
   let mut cache_url = url.clone();
   cache_url.set_path(&format!("/{}/map", provider.to_ascii_lowercase()));
   cache_url.set_query(None);
-  cache_url.query_pairs_mut().append_pair("route_id", &route_id);
+  if let Some(route_id) = &route_id {
+    cache_url.query_pairs_mut().append_pair("route_id", route_id);
+  }
   let cache_key = cache_url.to_string();
   if let Ok(Some(response)) = Cache::default().get(&cache_key, false).await {
     return Ok(response);
@@ -103,30 +116,31 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     Ok(db) => db,
     Err(_) => return json_error(404, "Map database is unavailable"),
   };
-  let filter = JsValue::from(&route_id);
+  let filter = route_id.as_deref().map(JsValue::from);
 
-  let route_sql = route_select_sql(provider);
-  let route_result = db.prepare(&route_sql).bind(std::slice::from_ref(&filter))?.all().await?;
+  let route_sql = route_select_sql(provider, route_id.is_some());
+  let route_result = query_all(&db, &route_sql, filter.as_ref()).await?;
   if !route_result.success() {
     return json_error(503, "Map data is unavailable");
   }
-  let Some(route) = route_result.results::<Value>()?.into_iter().next().map(serde_json::from_value::<MapRoute>).transpose()? else {
+  let routes: HashMap<String, MapRoute> = route_result
+    .results::<Value>()?
+    .into_iter()
+    .map(serde_json::from_value::<MapRoute>)
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .map(|route| (route.route_id.clone(), route))
+    .collect();
+  if route_id.is_some() && routes.is_empty() {
     return json_error(404, "Unknown route_id");
-  };
+  }
 
   let mut paths: BTreeMap<(String, String), Vec<[f64; 2]>> = BTreeMap::new();
   let has_shapes = crate::data::schema::has_column(provider, "shapes", "shape_id") && crate::data::schema::has_column(provider, "trips", "shape_id");
   if has_shapes {
-    let shape_result = db
-      .prepare(
-        "SELECT trip_shapes.route_id, trip_shapes.shape_id, shapes.shape_pt_lat AS lat, shapes.shape_pt_lon AS lng \
-         FROM (SELECT DISTINCT route_id, shape_id FROM trips WHERE shape_id IS NOT NULL AND route_id = ?1) AS trip_shapes \
-         JOIN shapes ON shapes.shape_id = trip_shapes.shape_id \
-         ORDER BY trip_shapes.route_id, trip_shapes.shape_id, shapes.shape_pt_sequence",
-      )
-      .bind(std::slice::from_ref(&filter))?
-      .all()
-      .await?;
+    let shape_filter = if route_id.is_some() { " AND route_id = ?1" } else { "" };
+    let shape_sql = SHAPES_SQL.replace("__SHAPE_FILTER__", shape_filter);
+    let shape_result = query_all(&db, &shape_sql, filter.as_ref()).await?;
     if !shape_result.success() {
       return json_error(503, "Map data is unavailable");
     }
@@ -138,45 +152,19 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     }
   }
 
+  let trip_filter = if route_id.is_some() { " WHERE trips.route_id = ?1" } else { "" };
   let mut segments = Vec::new();
   if paths.is_empty() {
-    let segment_result = db
-      .prepare(
-        "WITH consecutive AS ( \
-           SELECT trips.route_id, stop_times.stop_id AS to_stop_id, \
-                  LAG(stop_times.stop_id) OVER (PARTITION BY trips.trip_id ORDER BY stop_times.stop_sequence) AS from_stop_id \
-           FROM trips JOIN stop_times ON stop_times.trip_id = trips.trip_id \
-           WHERE trips.route_id = ?1 \
-         ) \
-         SELECT DISTINCT consecutive.route_id, consecutive.from_stop_id, consecutive.to_stop_id, \
-                from_stop.stop_lat AS from_lat, from_stop.stop_lon AS from_lng, \
-                to_stop.stop_lat AS to_lat, to_stop.stop_lon AS to_lng \
-         FROM consecutive \
-         JOIN stops AS from_stop ON from_stop.stop_id = consecutive.from_stop_id \
-         JOIN stops AS to_stop ON to_stop.stop_id = consecutive.to_stop_id \
-         WHERE consecutive.from_stop_id <> consecutive.to_stop_id \
-         ORDER BY consecutive.route_id, consecutive.from_stop_id, consecutive.to_stop_id",
-      )
-      .bind(std::slice::from_ref(&filter))?
-      .all()
-      .await?;
+    let segment_sql = SEGMENTS_SQL.replace("__TRIP_FILTER__", trip_filter);
+    let segment_result = query_all(&db, &segment_sql, filter.as_ref()).await?;
     if !segment_result.success() {
       return json_error(503, "Map data is unavailable");
     }
     segments = segment_result.results::<Value>()?.into_iter().map(serde_json::from_value).collect::<std::result::Result<Vec<StopSegment>, _>>()?;
   }
 
-  let stop_result = db
-    .prepare(
-      "SELECT DISTINCT trips.route_id, stops.stop_id, stops.stop_name, stops.stop_lat AS lat, stops.stop_lon AS lng \
-       FROM trips JOIN stop_times ON stop_times.trip_id = trips.trip_id \
-       JOIN stops ON stops.stop_id = stop_times.stop_id \
-       WHERE trips.route_id = ?1 \
-       ORDER BY trips.route_id, stops.stop_id",
-    )
-    .bind(&[filter])?
-    .all()
-    .await?;
+  let stop_sql = STOPS_SQL.replace("__TRIP_FILTER__", trip_filter);
+  let stop_result = query_all(&db, &stop_sql, filter.as_ref()).await?;
   if !stop_result.success() {
     return json_error(503, "Map data is unavailable");
   }
@@ -187,6 +175,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     if points.len() < 2 {
       continue;
     }
+    let route = routes.get(&route_id);
     features.push(json!({
       "type": "Feature",
       "geometry": { "type": "LineString", "coordinates": points },
@@ -195,14 +184,15 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
         "route_id": route_id,
         "shape_id": shape_id,
         "geometry_source": "shape",
-        "route_short_name": route.route_short_name.as_deref(),
-        "route_long_name": route.route_long_name.as_deref(),
-        "route_color": route.route_color.as_deref(),
+        "route_short_name": route.and_then(|r| r.route_short_name.as_deref()),
+        "route_long_name": route.and_then(|r| r.route_long_name.as_deref()),
+        "route_color": route.and_then(|r| r.route_color.as_deref()),
       },
     }));
   }
   for segment in segments {
     if let (Some(from), Some(to)) = (coordinates(segment.from_lat, segment.from_lng), coordinates(segment.to_lat, segment.to_lng)) {
+      let route = routes.get(&segment.route_id);
       features.push(json!({
         "type": "Feature",
         "geometry": { "type": "LineString", "coordinates": [from, to] },
@@ -212,9 +202,9 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
           "from_stop_id": segment.from_stop_id,
           "to_stop_id": segment.to_stop_id,
           "geometry_source": "stop_sequence",
-          "route_short_name": route.route_short_name.as_deref(),
-          "route_long_name": route.route_long_name.as_deref(),
-          "route_color": route.route_color.as_deref(),
+          "route_short_name": route.and_then(|r| r.route_short_name.as_deref()),
+          "route_long_name": route.and_then(|r| r.route_long_name.as_deref()),
+          "route_color": route.and_then(|r| r.route_color.as_deref()),
         },
       }));
     }
@@ -235,7 +225,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   }
 
   let mut response = Response::from_json(&json!({ "type": "FeatureCollection", "features": features }))?;
-  response.headers_mut().set("Cache-Control", "public, max-age=86400")?;
+  response.headers_mut().set("Cache-Control", &cache_control)?;
   let cached_response = response.cloned()?;
   ctx.wait_until(async move {
     let _ = Cache::default().put(cache_key, cached_response).await;
@@ -244,36 +234,5 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
 }
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn coordinates_validates_bounds_and_finiteness() {
-    assert_eq!(coordinates(Some(3.1), Some(101.7)), Some([101.7, 3.1]));
-    assert_eq!(coordinates(Some(-90.0), Some(180.0)), Some([180.0, -90.0]));
-    for (lat, lng) in [(None, Some(101.7)), (Some(90.1), Some(101.7)), (Some(3.1), Some(-180.1)), (Some(f64::NAN), Some(101.7)), (Some(3.1), Some(f64::INFINITY))] {
-      assert_eq!(coordinates(lat, lng), None);
-    }
-  }
-
-  #[test]
-  fn parse_route_id_validates_query_parameters() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    assert_eq!(parse_route_id(&Url::parse("https://example.com/ktmb/map?route_id=KJL")?), Ok("KJL".to_owned()));
-    for query in ["", "?route_id=", "?route_id=%20%20"] {
-      let url = Url::parse(&format!("https://example.com/ktmb/map{query}"))?;
-      assert_eq!(parse_route_id(&url), Err((400, "route_id query parameter is required")), "{query}");
-    }
-    let long = "x".repeat(257);
-    for query in ["?other=1", "?route_id=A&route_id=B", &format!("?route_id={long}")] {
-      let url = Url::parse(&format!("https://example.com/ktmb/map{query}"))?;
-      assert_eq!(parse_route_id(&url), Err((400, "Expected at most one non-empty route_id")), "{query}");
-    }
-    Ok(())
-  }
-
-  #[test]
-  fn route_select_sql_handles_missing_route_color() {
-    assert_eq!(route_select_sql("rapid-bus-mrtfeeder"), "SELECT route_short_name, route_long_name, NULL AS route_color FROM routes WHERE route_id = ?1 LIMIT 1");
-    assert_eq!(route_select_sql("ktmb"), "SELECT route_short_name, route_long_name, route_color FROM routes WHERE route_id = ?1 LIMIT 1");
-  }
-}
+#[path = "../../../test/unit/worker/map/mod.rs"]
+mod tests;

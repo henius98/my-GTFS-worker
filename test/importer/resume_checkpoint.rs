@@ -1,4 +1,5 @@
-use importer::processor::{read_bounded_record, read_zip_csv_headers, resume_zip_csv_at_byte_offset};
+use gtfs_checks::CheckResult;
+use importer::csv_ingest::{read_bounded_record, read_zip_csv_headers, resume_zip_csv_at_byte_offset};
 use std::hint::black_box;
 use std::io::{Cursor, Write};
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ const TARGET_ROWS: usize = 1_000;
 const MEASURED_RUNS: usize = 9;
 const MAX_RECORD_BYTES: u64 = 512 * 1024;
 
-fn build_archive() -> Result<(Vec<u8>, u64), Box<dyn std::error::Error>> {
+fn build_archive() -> CheckResult<(Vec<u8>, u64)> {
   let mut csv = Vec::with_capacity(TOTAL_ROWS * 48);
   csv.extend_from_slice(b"id,name,description\n");
   let mut resume_byte = 0_u64;
@@ -32,7 +33,7 @@ fn build_archive() -> Result<(Vec<u8>, u64), Box<dyn std::error::Error>> {
   Ok((writer.finish()?.into_inner(), resume_byte))
 }
 
-fn legacy_line_resume(archive_bytes: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
+fn legacy_line_resume(archive_bytes: &[u8]) -> CheckResult<usize> {
   let mut archive = ZipArchive::new(Cursor::new(archive_bytes))?;
   let file = archive.by_name("stops.txt")?;
   let mut reader = csv::ReaderBuilder::new().has_headers(true).flexible(true).from_reader(file);
@@ -54,7 +55,7 @@ fn legacy_line_resume(archive_bytes: &[u8]) -> Result<usize, Box<dyn std::error:
   Ok(checksum)
 }
 
-fn byte_offset_resume(archive_bytes: &[u8], resume_byte: u64) -> Result<usize, Box<dyn std::error::Error>> {
+fn byte_offset_resume(archive_bytes: &[u8], resume_byte: u64) -> CheckResult<usize> {
   let mut archive = ZipArchive::new(Cursor::new(archive_bytes))?;
   let (_, header_end) = read_zip_csv_headers(&mut archive, "stops.txt", MAX_RECORD_BYTES)?;
   let (mut reader, _) = resume_zip_csv_at_byte_offset(&mut archive, "stops.txt", header_end, resume_byte, MAX_RECORD_BYTES)?;
@@ -69,11 +70,11 @@ fn byte_offset_resume(archive_bytes: &[u8], resume_byte: u64) -> Result<usize, B
   Ok(checksum)
 }
 
-fn measure<F>(mut operation: F) -> Result<Vec<Duration>, Box<dyn std::error::Error>>
+fn measure<F>(mut operation: F) -> CheckResult<(usize, Vec<Duration>)>
 where
-  F: FnMut() -> Result<usize, Box<dyn std::error::Error>>,
+  F: FnMut() -> CheckResult<usize>,
 {
-  black_box(operation()?);
+  let checksum = black_box(operation()?);
   let mut samples = Vec::with_capacity(MEASURED_RUNS);
   for _ in 0..MEASURED_RUNS {
     let started = Instant::now();
@@ -81,17 +82,20 @@ where
     samples.push(started.elapsed());
   }
   samples.sort_unstable();
-  Ok(samples)
+  Ok((checksum, samples))
 }
 
 fn median(samples: &[Duration]) -> Duration {
   samples[samples.len() / 2]
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[test]
+fn byte_offset_resume_beats_legacy_line_replay() -> CheckResult {
   let (archive, resume_byte) = build_archive()?;
-  let legacy = measure(|| legacy_line_resume(&archive))?;
-  let byte_offset = measure(|| byte_offset_resume(&archive, resume_byte))?;
+  let (legacy_checksum, legacy) = measure(|| legacy_line_resume(&archive))?;
+  let (byte_offset_checksum, byte_offset) = measure(|| byte_offset_resume(&archive, resume_byte))?;
+  assert_eq!(byte_offset_checksum, legacy_checksum);
+
   let before = median(&legacy);
   let after = median(&byte_offset);
   let change = (after.as_secs_f64() / before.as_secs_f64() - 1.0) * 100.0;
@@ -100,8 +104,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   println!("legacy line replay median: {:.3} ms", before.as_secs_f64() * 1_000.0);
   println!("byte-offset replay median: {:.3} ms", after.as_secs_f64() * 1_000.0);
   println!("elapsed-time change: {change:.2}%");
-  if after.as_secs_f64() >= before.as_secs_f64() * 0.85 {
-    return Err(format!("byte-offset resume regression: expected at least 15% lower median latency, observed {change:.2}%").into());
-  }
+  assert!(after.as_secs_f64() < before.as_secs_f64() * 0.85, "byte-offset resume regression: expected at least 15% lower median latency, observed {change:.2}%");
   Ok(())
 }

@@ -344,7 +344,7 @@ test("returns map GeoJSON from stop_sequence fallback and shapes", async () => {
     (await worker.fetch("/ktmb/map?route_id=R", { method: "POST" })).status,
     405
   );
-  assert.equal((await worker.fetch("/ktmb/map")).status, 400);
+  assert.equal((await worker.fetch("/ktmb/map?route_id=")).status, 400);
   assert.equal((await worker.fetch("/ktmb/map?route_id=missing")).status, 404);
 
   const { DB_KTMB: db } = await worker.getEnv();
@@ -390,6 +390,19 @@ test("returns map GeoJSON from stop_sequence fallback and shapes", async () => {
     2
   );
 
+  const ktmbAllMap = await worker.fetch("/ktmb/map");
+  assert.equal(ktmbAllMap.status, 200);
+  const ktmbAllBody = await ktmbAllMap.json();
+  assert.equal(ktmbAllBody.type, "FeatureCollection");
+  assert.ok(
+    ktmbAllBody.features.some(
+      (feature) =>
+        feature.properties.kind === "route" &&
+        feature.properties.route_id === "R" &&
+        feature.properties.geometry_source === "stop_sequence"
+    )
+  );
+
   await seedRapidBusKl();
   const shapeMap = await worker.fetch("/rapid-bus-kl/map?route_id=U1");
   assert.equal(shapeMap.status, 200);
@@ -402,6 +415,19 @@ test("returns map GeoJSON from stop_sequence fallback and shapes", async () => {
     [101.6, 3.1],
     [101.7, 3.2]
   ]);
+
+  const shapeAllMap = await worker.fetch("/rapid-bus-kl/map");
+  assert.equal(shapeAllMap.status, 200);
+  const shapeAllBody = await shapeAllMap.json();
+  assert.equal(shapeAllBody.type, "FeatureCollection");
+  assert.ok(
+    shapeAllBody.features.some(
+      (feature) =>
+        feature.properties.kind === "route" &&
+        feature.properties.route_id === "U1" &&
+        feature.properties.geometry_source === "shape"
+    )
+  );
 });
 
 test("computes frequency departures with exact_times 0 and 1", async () => {

@@ -27,6 +27,8 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     return Response::error(format!("{} Method Not Allowed", req.method()), 405);
   }
 
+  let cache_control = crate::api_cache_control(env)?;
+
   // Query strings, path casing, and a trailing slash do not alter status
   // output; canonicalize them so callers cannot create arbitrary cache keys.
   let cache_key = canonical_cache_key(url, provider);
@@ -41,8 +43,9 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   };
 
   // Fetch detailed import progress
-  let progress_results = match d1.prepare("SELECT FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt FROM \"0_import_progress\"").all().await {
+  let progress_results = match d1.prepare(include_str!("sql/import_progress.sql")).all().await {
     Ok(res) => res,
+    Err(e) if crate::is_d1_row_read_limit(&e.to_string()) => return crate::d1_row_read_limit_response(),
     Err(e) => return Response::error(format!("Database error: {}", e), 500),
   };
 
@@ -54,7 +57,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   };
 
   let mut response = Response::from_json(&details)?;
-  response.headers_mut().set("Cache-Control", "public, max-age=60")?;
+  response.headers_mut().set("Cache-Control", &cache_control)?;
   let cached_response = response.cloned()?;
   ctx.wait_until(async move {
     let _ = Cache::default().put(cache_key, cached_response).await;
@@ -63,30 +66,5 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
 }
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn canonical_cache_key_strips_query_and_lowercases_provider() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let first = canonical_cache_key(&Url::parse("https://example.com/KTMB/status/?limit=1")?, "KTMB");
-    let second = canonical_cache_key(&Url::parse("https://example.com/ktmb/status")?, "ktmb");
-    assert_eq!(first, "https://example.com/ktmb/status");
-    assert_eq!(first, second);
-    Ok(())
-  }
-
-  #[test]
-  fn import_progress_round_trips_pascal_case_and_crc() -> std::result::Result<(), serde_json::Error> {
-    let row = serde_json::json!({
-      "FileName": "stops.txt",
-      "CRC": "a1b2c3d4",
-      "LastProcessedLine": 42,
-      "LastProcessedByte": 1024,
-      "Status": 0,
-      "UpdatedAt": "2026-09-24 00:00:00"
-    });
-    let progress: ImportProgress = serde_json::from_value(row.clone())?;
-    assert_eq!(serde_json::to_value(progress)?, row);
-    Ok(())
-  }
-}
+#[path = "../../../test/unit/worker/status/mod.rs"]
+mod tests;

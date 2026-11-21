@@ -11,11 +11,11 @@ authors = ["henius"]
 worker = { version = "0.9.0", features = ["d1"] }
 console_error_panic_hook = "0.1.7"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 thiserror = "2.0.21"
 chrono = "0.4.45"
-reqwest = { version = "0.13.5", features = ["json", "query"] }
-tokio = { version = "1.53.1", features = [
+reqwest = { version = "0.13.5", features = ["json"] }
+tokio = { version = "1.54.1", features = [
   "fs",
   "io-util",
   "macros",
@@ -23,8 +23,7 @@ tokio = { version = "1.53.1", features = [
   "sync",
   "time",
 ] }
-toml = "1.1.6"
-zip = { version = "8.6.0", default-features = false, features = [
+zip = { version = "9.8.1", default-features = false, features = [
   "deflate-flate2-zlib-rs",
 ] }
 csv = "1.4.0"

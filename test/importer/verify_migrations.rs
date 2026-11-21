@@ -1,11 +1,9 @@
 //! Validate live GTFS headers against every active provider's schema and migration chain.
 
-use gtfs_checks::{
-  CheckResult, Provider, providers, root,
-  sql_queries::{provider_maintenance_queries, quote_identifier},
-};
+use gtfs_checks::{CheckResult, Provider, providers, root};
+use importer::schema::SchemaCatalog;
 use reqwest::blocking::Client;
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::{Connection, params};
 use std::{
   collections::{BTreeMap, BTreeSet},
   fs,
@@ -15,7 +13,6 @@ use std::{
 };
 use zip::ZipArchive;
 
-const INFRASTRUCTURE_TABLES: [&str; 4] = ["departure_cache", "0_daily_import_budget", "0_dataset_versions", "0_import_progress"];
 type Schema = BTreeMap<String, Vec<String>>;
 
 fn table_names(db: &Connection) -> CheckResult<BTreeSet<String>> {
@@ -24,43 +21,39 @@ fn table_names(db: &Connection) -> CheckResult<BTreeSet<String>> {
 }
 
 fn columns(db: &Connection, table: &str) -> CheckResult<Vec<String>> {
-  let mut statement = db.prepare(&format!("PRAGMA table_info({})", quote_identifier(table)))?;
+  let mut statement = db.prepare(&format!("PRAGMA table_info({})", SchemaCatalog::quote_identifier(table)))?;
   Ok(statement.query_map([], |row| row.get(1))?.collect::<Result<_, _>>()?)
 }
 
-fn schema(path: &Path) -> CheckResult<Schema> {
+fn schema_from_base_statements(provider_name: &str) -> CheckResult<Schema> {
+  let statements = SchemaCatalog::base_schema_statements(provider_name).ok_or_else(|| format!("no compiled base schema statements for {provider_name}"))?;
   let db = Connection::open_in_memory()?;
-  db.execute_batch(&fs::read_to_string(path)?)?;
+  for statement in statements {
+    db.execute(statement, [])?;
+  }
   let mut tables = Schema::new();
   for table in table_names(&db)? {
-    if !INFRASTRUCTURE_TABLES.contains(&table.as_str()) {
+    if !SchemaCatalog::is_infrastructure_table(&table) {
       tables.insert(table.clone(), columns(&db, &table)?);
     }
   }
   Ok(tables)
 }
 
-fn migration_files(directory: &Path) -> CheckResult<Vec<PathBuf>> {
-  let mut files = fs::read_dir(directory)?.map(|entry| entry.map(|entry| entry.path())).collect::<Result<Vec<_>, _>>()?;
-  files.retain(|path| path.extension().is_some_and(|extension| extension == "sql"));
-  files.sort_by_key(|path| {
-    let name = path.file_name().map(|value| value.to_string_lossy().into_owned()).unwrap_or_default();
-    let number = name.split('_').next().and_then(|value| value.parse::<u64>().ok()).unwrap_or(u64::MAX);
-    (number, name)
-  });
-  Ok(files)
-}
-
 fn validate_replay_cleanup_migrations() -> CheckResult {
   let db_johor = Connection::open_in_memory()?;
-  db_johor.execute_batch(&fs::read_to_string(root().join("migrations/mybas-johor/0_gtfs_schema.sql"))?)?;
+  for statement in SchemaCatalog::base_schema_statements("mybas-johor").ok_or("missing mybas-johor base schema")? {
+    db_johor.execute(statement, [])?;
+  }
   let fare = ["leg", "from", "to", "product"];
   db_johor.execute("INSERT OR REPLACE INTO fare_leg_rules (leg_group_id, from_area_id, to_area_id, fare_product_id) VALUES (?1, ?2, ?3, ?4)", fare)?;
   db_johor.execute("INSERT OR REPLACE INTO fare_leg_rules (leg_group_id, from_area_id, to_area_id, fare_product_id) VALUES (?1, ?2, ?3, ?4)", fare)?;
   let fare_count: i64 = db_johor.query_row("SELECT COUNT(*) FROM fare_leg_rules", [], |row| row.get(0))?;
 
   let db_agency = Connection::open_in_memory()?;
-  db_agency.execute_batch(&fs::read_to_string(root().join("migrations/rapid-bus-mrtfeeder/0_gtfs_schema.sql"))?)?;
+  for statement in SchemaCatalog::base_schema_statements("rapid-bus-mrtfeeder").ok_or("missing rapid-bus-mrtfeeder base schema")? {
+    db_agency.execute(statement, [])?;
+  }
   db_agency.execute("INSERT OR REPLACE INTO agency (agency_name, agency_url, agency_timezone, agency_phone, agency_lang) VALUES ('old', 'url', 'zone', 'phone', 'en')", [])?;
   db_agency.execute("INSERT OR REPLACE INTO agency (agency_name, agency_url, agency_timezone, agency_phone, agency_lang) VALUES ('latest', 'url', 'zone', 'phone', 'en')", [])?;
   let agency_names = {
@@ -74,8 +67,13 @@ fn validate_replay_cleanup_migrations() -> CheckResult {
 }
 
 fn validate_legacy_progress_upgrade(directory: &Path) -> CheckResult {
-  let prefix_files =
-    migration_files(directory)?.into_iter().filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().ends_with("_prefix_infrastructure_tables.sql"))).collect::<Vec<_>>();
+  let mut prefix_files = fs::read_dir(directory)?
+    .map(|entry| entry.map(|entry| entry.path()))
+    .collect::<Result<Vec<_>, _>>()?
+    .into_iter()
+    .filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().ends_with("_prefix_infrastructure_tables.sql")))
+    .collect::<Vec<_>>();
+  prefix_files.sort();
   let Some(prefix_file) = prefix_files.first() else {
     return Ok(());
   };
@@ -100,13 +98,38 @@ fn validate_legacy_progress_upgrade(directory: &Path) -> CheckResult {
   Ok(())
 }
 
+fn validate_staged_status_migration(directory: &Path) -> CheckResult {
+  let migration_file = directory.join("20261121_add_staged_import_status.sql");
+  if !migration_file.is_file() {
+    return Err(format!("missing staged status migration: {}", migration_file.display()).into());
+  }
+  let db = Connection::open_in_memory()?;
+  db.execute_batch(
+    "CREATE TABLE \"0_import_progress\" (FileName TEXT PRIMARY KEY, CRC TEXT, LastProcessedLine INTEGER, LastProcessedByte INTEGER NOT NULL DEFAULT 0 CHECK (LastProcessedByte >= 0), Status TINYINT CHECK (Status IN (0, 1)), UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP) WITHOUT ROWID; INSERT INTO \"0_import_progress\" (FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt) VALUES ('stops.txt', 'done-crc', 10, 200, 0, '2026-11-20 00:00:00'), ('stop_times.txt', 'partial-crc', 50, 1024, 1, '2026-11-20 00:00:00');",
+  )?;
+  db.execute_batch(&fs::read_to_string(&migration_file)?)?;
+  let remaining = {
+    let mut statement = db.prepare("SELECT FileName, Status FROM \"0_import_progress\" ORDER BY FileName")?;
+    statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?.collect::<Result<Vec<_>, _>>()?
+  };
+  if remaining != vec![("stops.txt".to_owned(), 0)] {
+    return Err(format!("20261121_add_staged_import_status.sql must preserve Status=0 and drop legacy Status=1 rows; got {remaining:?}").into());
+  }
+  db.execute("INSERT INTO \"0_import_progress\" (FileName, CRC, LastProcessedLine, LastProcessedByte, Status) VALUES ('routes.txt', 'staged-crc', 5, 120, 2)", [])?;
+  Ok(())
+}
+
 fn validate_local_migrations(provider_name: &str, directory: &Path, expected: &Schema) -> CheckResult {
   validate_legacy_progress_upgrade(directory)?;
+  validate_staged_status_migration(directory)?;
+  let migrations = SchemaCatalog::provider_migrations(provider_name).ok_or_else(|| format!("no compiled migrations for {provider_name}"))?;
   let db = Connection::open_in_memory()?;
-  for migration in migration_files(directory)? {
-    db.execute_batch(&fs::read_to_string(migration)?)?;
+  for migration in migrations {
+    for statement in *migration {
+      db.execute(statement, [])?;
+    }
   }
-  let runtime_tables = table_names(&db)?.into_iter().filter(|name| !INFRASTRUCTURE_TABLES.contains(&name.as_str())).collect::<BTreeSet<_>>();
+  let runtime_tables = table_names(&db)?.into_iter().filter(|name| !SchemaCatalog::is_infrastructure_table(name)).collect::<BTreeSet<_>>();
   let expected_tables = expected.keys().cloned().collect::<BTreeSet<_>>();
   if runtime_tables != expected_tables {
     return Err(
@@ -127,10 +150,14 @@ fn validate_local_migrations(provider_name: &str, directory: &Path, expected: &S
   if checkpoint != (7, 0) {
     return Err(format!("byte checkpoint default returned {checkpoint:?} instead of (7, 0)").into());
   }
-  db.execute("UPDATE \"0_import_progress\" SET LastProcessedLine = 8, LastProcessedByte = 321 WHERE FileName = 'stops.txt'", [])?;
-  let checkpoint: (i64, i64) = db.query_row("SELECT LastProcessedLine, LastProcessedByte FROM \"0_import_progress\" WHERE FileName = 'stops.txt'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
-  if checkpoint != (8, 321) {
-    return Err(format!("byte checkpoint update returned {checkpoint:?} instead of (8, 321)").into());
+  db.execute("UPDATE \"0_import_progress\" SET LastProcessedLine = 8, LastProcessedByte = 321, Status = 2 WHERE FileName = 'stops.txt'", [])?;
+  let checkpoint: (i64, i64, i64) =
+    db.query_row("SELECT LastProcessedLine, LastProcessedByte, Status FROM \"0_import_progress\" WHERE FileName = 'stops.txt'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+  if checkpoint != (8, 321, 2) {
+    return Err(format!("staged checkpoint update returned {checkpoint:?} instead of (8, 321, 2)").into());
+  }
+  if db.execute("UPDATE \"0_import_progress\" SET Status = 3 WHERE FileName = 'stops.txt'", []).is_ok() {
+    return Err("0_import_progress accepted invalid Status = 3".into());
   }
   db.execute("DELETE FROM \"0_import_progress\" WHERE FileName = 'stops.txt'", [])?;
 
@@ -139,45 +166,48 @@ fn validate_local_migrations(provider_name: &str, directory: &Path, expected: &S
     if &actual_columns != expected_columns {
       return Err(format!("runtime columns for `{table}` differ from compile-time schema: runtime={actual_columns:?}, compile_time={expected_columns:?}").into());
     }
+    let staging_table = SchemaCatalog::staging_table_name(table);
+    let staging_create_sql = SchemaCatalog::staging_create_sql(provider_name, table).ok_or_else(|| format!("missing staging DDL for {provider_name}.{table}"))?;
+    let column_refs = actual_columns.iter().map(String::as_str).collect::<Vec<_>>();
+    let sql = SchemaCatalog::positional_insert_sql(&staging_table, &column_refs, SchemaCatalog::primary_keys(provider_name, table));
+    let count_sql = format!("SELECT COUNT(*) FROM {}", SchemaCatalog::quote_identifier(table));
+    db.execute_batch("SAVEPOINT replay_probe")?;
+    db.execute(&SchemaCatalog::drop_table_if_exists_sql(&staging_table), [])?;
+    db.execute(staging_create_sql, [])?;
     let has_primary_key = {
-      let mut statement = db.prepare(&format!("PRAGMA table_info({})", quote_identifier(table)))?;
+      let mut statement = db.prepare(&format!("PRAGMA table_info({})", SchemaCatalog::quote_identifier(&staging_table)))?;
       statement.query_map([], |row| row.get::<_, i64>(5))?.collect::<Result<Vec<_>, _>>()?.into_iter().any(|key| key != 0)
     };
     let indexes = {
-      let mut statement = db.prepare(&format!("PRAGMA index_list({})", quote_identifier(table)))?;
+      let mut statement = db.prepare(&format!("PRAGMA index_list({})", SchemaCatalog::quote_identifier(&staging_table)))?;
       statement.query_map([], |row| row.get::<_, i64>(2))?.collect::<Result<Vec<_>, _>>()?
     };
     if !has_primary_key && indexes.iter().all(|unique| *unique == 0) {
-      return Err(format!("`{table}` has no uniqueness constraint; checkpoint replay would append duplicate rows").into());
+      return Err(format!("`{staging_table}` has no uniqueness constraint; checkpoint replay would append duplicate rows").into());
     }
     let max_allowed_indexes = 1;
     if indexes.len() > max_allowed_indexes {
-      return Err(format!("`{table}` has {} indexes; write-budget reservation assumes at most {} index writes per row", indexes.len(), max_allowed_indexes).into());
+      return Err(format!("`{staging_table}` has {} indexes; write-budget reservation assumes at most {} index writes per row", indexes.len(), max_allowed_indexes).into());
     }
-    let quoted_columns = actual_columns.iter().map(|column| quote_identifier(column)).collect::<Vec<_>>().join(", ");
-    let placeholders = vec!["?"; actual_columns.len()].join(", ");
-    let assignments = actual_columns.iter().map(|column| format!("{} = excluded.{}", quote_identifier(column), quote_identifier(column))).collect::<Vec<_>>().join(", ");
-    let changed = actual_columns.iter().map(|column| format!("{}.{} IS NOT excluded.{}", quote_identifier(table), quote_identifier(column), quote_identifier(column))).collect::<Vec<_>>().join(" OR ");
-    let sql = format!("INSERT INTO {} ({quoted_columns}) VALUES ({placeholders}) ON CONFLICT DO UPDATE SET {assignments} WHERE {changed}", quote_identifier(table));
-    let count_sql = format!("SELECT COUNT(*) FROM {}", quote_identifier(table));
-    let initial_count: i64 = db.query_row(&count_sql, [], |row| row.get(0))?;
-    db.execute_batch("SAVEPOINT replay_probe")?;
-    let probe = (0..actual_columns.len()).map(|index| format!("replay-probe-{index}")).collect::<Vec<_>>();
-    db.execute(&sql, params_from_iter(probe.iter()))?;
+    let probe = actual_columns.iter().enumerate().map(|(index, column)| if column == "id" { serde_json::json!(1) } else { serde_json::json!(format!("replay-probe-{index}")) }).collect::<Vec<_>>();
+    let payload = serde_json::to_string(&vec![probe])?;
+    db.execute(&sql, params![payload])?;
     let before = db.total_changes();
-    db.execute(&sql, params_from_iter(probe.iter()))?;
+    db.execute(&sql, params![payload])?;
     let replay_writes = db.total_changes() - before;
-    let after_count: i64 = db.query_row(&count_sql, [], |row| row.get(0))?;
-    let replay_count = after_count - initial_count;
+    db.execute(&SchemaCatalog::drop_table_if_exists_sql(table), [])?;
+    db.execute(&SchemaCatalog::rename_table_sql(&staging_table, table), [])?;
+    let swapped_count: i64 = db.query_row(&count_sql, [], |row| row.get(0))?;
     db.execute_batch("ROLLBACK TO replay_probe; RELEASE replay_probe;")?;
-    if replay_count != 1 || replay_writes != 0 {
-      return Err(format!("`{table}` retained {replay_count} rows after identical UPSERT and reported {replay_writes} unnecessary writes").into());
+    if swapped_count != 1 || replay_writes != 0 {
+      return Err(format!("`{table}` retained {swapped_count} rows after staging UPSERT + swap and reported {replay_writes} unnecessary writes").into());
     }
-  }
-  for sql in provider_maintenance_queries(provider_name) {
-    db.execute(sql, [])?;
   }
   Ok(())
+}
+
+fn is_allowed_synthetic_db_column(provider_name: &str, table: &str, column: &str) -> bool {
+  provider_name == "rapid-bus-mrtfeeder" && table == "agency" && column == "id"
 }
 
 fn validate_provider(provider: &Provider, client: &Client) -> (Vec<String>, usize) {
@@ -188,17 +218,23 @@ fn validate_provider(provider: &Provider, client: &Client) -> (Vec<String>, usiz
     lines.push(format!("- ❌ Migration file not found: `{}`", migration.display()));
     return (lines, 1);
   }
-  let expected = match schema(&migration) {
+  let expected = match schema_from_base_statements(name) {
     Ok(expected) => expected,
     Err(error) => {
-      lines.push(format!("- ❌ Cannot read base schema: {error}"));
+      lines.push(format!("- ❌ Cannot read compiled base schema: {error}"));
       return (lines, 1);
     }
   };
   let mut errors = 0;
   match validate_local_migrations(name, migration.parent().unwrap_or(Path::new(".")), &expected) {
-    Ok(()) => lines.push("- ✅ Local migration chain matches the compile-time schema and uses one progress table; identical UPSERT replay is idempotent with zero changed rows and every table satisfies the two-write reservation bound.".into()),
-    Err(error) => { lines.push(format!("- ❌ Local migration chain failed: {error}")); errors += 1; }
+    Ok(()) => lines.push(
+      "- ✅ Local migration chain and pre-split base schema match; production positional UPSERT replay is idempotent with zero changed rows and every table satisfies the two-write reservation bound."
+        .into(),
+    ),
+    Err(error) => {
+      lines.push(format!("- ❌ Local migration chain failed: {error}"));
+      errors += 1;
+    }
   }
   let url = format!("{}{}", provider.static_url, provider.static_provider);
   // Network failures must enter the report.
@@ -218,8 +254,17 @@ fn validate_provider(provider: &Provider, client: &Client) -> (Vec<String>, usiz
     }
   };
   let mut matched = BTreeSet::new();
-  let mut filenames =
-    archive.file_names().map(str::to_owned).filter(|name| name.ends_with(".txt") && !name.contains("__MACOSX") && !name.rsplit('/').next().unwrap_or_default().starts_with("._")).collect::<Vec<_>>();
+  let mut filenames = match archive.file_names().collect::<Result<Vec<_>, _>>() {
+    Ok(names) => names
+      .into_iter()
+      .map(std::borrow::Cow::into_owned)
+      .filter(|name| name.ends_with(".txt") && !name.contains("__MACOSX") && !name.rsplit('/').next().unwrap_or_default().starts_with("._"))
+      .collect::<Vec<_>>(),
+    Err(error) => {
+      lines.push(format!("- ❌ Failed to read feed ZIP entry names: {error}"));
+      return (lines, errors + 1);
+    }
+  };
   filenames.sort();
   for filename in filenames {
     let table = filename.rsplit('/').next().unwrap_or_default().trim_end_matches(".txt");
@@ -242,16 +287,17 @@ fn validate_provider(provider: &Provider, client: &Client) -> (Vec<String>, usiz
         continue;
       }
     };
-    if &csv_columns == db_columns {
+    let expected_csv_columns = db_columns.iter().filter(|column| !is_allowed_synthetic_db_column(name, table, column)).cloned().collect::<Vec<_>>();
+    if csv_columns == expected_csv_columns {
       lines.push(format!("- ✅ `{table}` matches exactly."));
       continue;
     }
     let csv_set = csv_columns.iter().cloned().collect::<BTreeSet<_>>();
-    let db_set = db_columns.iter().cloned().collect::<BTreeSet<_>>();
+    let db_set = expected_csv_columns.iter().cloned().collect::<BTreeSet<_>>();
     let missing = csv_set.difference(&db_set).collect::<Vec<_>>();
     let extra = db_set.difference(&csv_set).collect::<Vec<_>>();
     if missing.is_empty() && extra.is_empty() {
-      lines.push(format!("- ❌ `{table}` has a column-order mismatch: migration={db_columns:?}, feed={csv_columns:?}"));
+      lines.push(format!("- ❌ `{table}` has a column-order mismatch: migration={expected_csv_columns:?}, feed={csv_columns:?}"));
     } else {
       lines.push(format!("- ❌ `{table}` differs: missing_in_db={missing:?}, extra_in_db={extra:?}"));
     }
@@ -306,11 +352,11 @@ mod tests {
   use super::*;
 
   #[test]
-  fn local_migrations_and_maintenance_queries_succeed() -> CheckResult {
+  fn local_migrations_and_staging_swaps_succeed() -> CheckResult {
     validate_replay_cleanup_migrations()?;
     for provider in providers()?.into_iter().filter(|provider| provider.is_active) {
       let directory = root().join("migrations").join(&provider.name);
-      let expected = schema(&directory.join("0_gtfs_schema.sql"))?;
+      let expected = schema_from_base_statements(&provider.name)?;
       validate_local_migrations(&provider.name, &directory, &expected)?;
     }
     Ok(())

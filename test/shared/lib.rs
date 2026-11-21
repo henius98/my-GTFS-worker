@@ -1,35 +1,18 @@
-use serde::Deserialize;
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
-#[path = "../../importer/src/budget_limits.rs"]
-pub mod budget_limits;
 #[path = "../../scripts/schema_parser.rs"]
 pub mod schema_parser;
-#[path = "../../importer/src/sql_queries.rs"]
-pub mod sql_queries;
+
+pub use importer::config::ProviderConfig as Provider;
 
 pub type CheckResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
-#[derive(Deserialize)]
-pub struct Provider {
-  pub name: String,
-  #[serde(default)]
-  pub is_active: bool,
-  pub static_url: String,
-  pub static_provider: String,
-}
-
-#[derive(Deserialize)]
-struct ProviderFile {
-  providers: Vec<Provider>,
-}
 
 pub fn root() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
 pub fn providers() -> CheckResult<Vec<Provider>> {
-  Ok(toml::from_str::<ProviderFile>(&fs::read_to_string(root().join("providers.toml"))?)?.providers)
+  Ok(importer::config::load_config(root().join("providers.toml"))?.providers)
 }
 
 pub fn benchmark_options(default_rows: usize, default_iterations: usize) -> CheckResult<(usize, usize)> {

@@ -8,6 +8,8 @@
     "build": "bash ./scripts/build.sh",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "import:local": "node scripts/local-d1-importer.mjs",
+    "test:importer:local": "pnpm build && node --test test/importer/local_d1.test.mjs",
     "test:worker": "pnpm build && node --test test/worker/*.test.mjs"
   },
   "devDependencies": {

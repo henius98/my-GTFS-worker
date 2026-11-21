@@ -55,7 +55,7 @@ pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Resp
   };
 
   // A subquery accepts SELECT statements (including WITH ... SELECT) but rejects writes. Cap returned rows as in /data.
-  let query = format!("SELECT * FROM (\n{}\n) LIMIT {}", sql, super::max_rows(env));
+  let query = format!("SELECT * FROM (\n{}\n) LIMIT {}", sql, super::max_rows(env)?);
   let statement = d1.prepare(query);
   let data_results = match statement.inner().all() {
     Ok(promise) => match JsFuture::from(promise).await {
@@ -102,31 +102,5 @@ fn strip_sql_strings(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn test_strip_sql_strings_replaces_literals_with_whitespace() {
-    let sql = "SELECT * FROM routes WHERE desc = 'Express -- Non-stop; /* test */'";
-    let stripped = strip_sql_strings(sql);
-    assert!(!stripped.contains("--"));
-    assert!(!stripped.contains(';'));
-    assert!(!stripped.contains("/*"));
-    assert!(stripped.starts_with("SELECT * FROM routes WHERE desc = "));
-  }
-
-  #[test]
-  fn test_strip_sql_strings_escaped_quotes() {
-    let sql = "SELECT * FROM routes WHERE desc = 'it''s a -- test'";
-    let stripped = strip_sql_strings(sql);
-    assert!(!stripped.contains("--"));
-  }
-
-  #[test]
-  fn test_delimiters_outside_string_literals_detected() {
-    let sql = "SELECT * FROM routes WHERE desc = 'safe'; DROP TABLE routes; --";
-    let stripped = strip_sql_strings(sql);
-    assert!(stripped.contains(';'));
-    assert!(stripped.contains("--"));
-  }
-}
+#[path = "../../../test/unit/worker/sql/mod.rs"]
+mod tests;

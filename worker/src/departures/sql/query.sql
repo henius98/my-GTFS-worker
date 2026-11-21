@@ -11,7 +11,7 @@
 --
 -- Note on timezone fallback:
 -- SQLite returns agency_timezone as NULL when no agency matches or column is absent;
--- caller falls back to "Asia/Kuala_Lumpur".
+-- caller falls back to WORKER_DEFAULT_TIMEZONE.
 --
 -- Performance note:
 -- Query plan relies on stop_times(stop_id, trip_id, stop_sequence) primary key index for stop_id lookup.

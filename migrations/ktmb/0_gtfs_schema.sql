@@ -3,7 +3,8 @@
 -- ============================================================================
 -- Infrastructure Tables
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS "0_daily_import_budget" (Id INTEGER PRIMARY KEY CHECK (Id = 1), DAY TEXT NOT NULL, Reserved INTEGER NOT NULL CHECK (Reserved >= 0));
+CREATE TABLE IF NOT EXISTS "0_daily_import_budget" (Id INTEGER PRIMARY KEY CHECK (Id = 1), DAY TEXT NOT NULL, Reserved INTEGER NOT NULL CHECK (Reserved >= 0)) WITHOUT ROWID,
+STRICT;
 
 INSERT OR IGNORE INTO
   "0_daily_import_budget" (Id, DAY, Reserved)
@@ -15,9 +16,9 @@ CREATE TABLE IF NOT EXISTS "0_import_progress" (
   CRC TEXT,
   LastProcessedLine INTEGER,
   LastProcessedByte INTEGER NOT NULL DEFAULT 0 CHECK (LastProcessedByte >= 0),
-  Status TINYINT CHECK (Status IN (0, 1)), -- 0 = COMPLETED, 1 = IN_PROGRESS
+  Status TINYINT CHECK (Status IN (0, 1, 2)), -- 0 = COMPLETED, 1 = IN_PROGRESS, 2 = STAGED
   UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS "0_dataset_versions" (ETag TEXT, UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP);
 
@@ -31,10 +32,10 @@ CREATE TABLE IF NOT EXISTS trips (
   direction_id INTEGER
   -- FOREIGN KEY (route_id) REFERENCES routes(route_id),
   -- FOREIGN KEY (service_id) REFERENCES calendar(service_id)
-);
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS calendar (
-  service_id TEXT,
+  service_id TEXT PRIMARY KEY,
   monday BOOLEAN,
   tuesday BOOLEAN,
   wednesday BOOLEAN,
@@ -43,17 +44,16 @@ CREATE TABLE IF NOT EXISTS calendar (
   saturday BOOLEAN,
   sunday BOOLEAN,
   start_date INTEGER,
-  end_date INTEGER,
-  PRIMARY KEY (service_id, start_date)
-);
+  end_date INTEGER
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS calendar_dates (
   service_id TEXT,
   date INTEGER,
-  exception_type INTEGER,
+  exception_type INTEGER, -- (1 = add, 2 = remove)
   PRIMARY KEY (service_id, date)
   -- FOREIGN KEY (service_id) REFERENCES calendar(service_id)
-);
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS routes (
   agency_id TEXT,
@@ -66,9 +66,9 @@ CREATE TABLE IF NOT EXISTS routes (
   route_color TEXT,
   route_text_color TEXT
   -- FOREIGN KEY (agency_id) REFERENCES agency(agency_id)
-);
+) WITHOUT ROWID;
 
-CREATE TABLE IF NOT EXISTS stops (stop_id TEXT PRIMARY KEY, stop_name TEXT, stop_lat REAL, stop_lon REAL);
+CREATE TABLE IF NOT EXISTS stops (stop_id TEXT PRIMARY KEY, stop_name TEXT, stop_lat REAL, stop_lon REAL) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS stop_times (
   trip_id TEXT,
@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS stop_times (
   PRIMARY KEY (stop_id, trip_id, stop_sequence)
   -- FOREIGN KEY (trip_id) REFERENCES trips(trip_id),
   -- FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
-);
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS agency (
   agency_id TEXT PRIMARY KEY,
@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS agency (
   agency_timezone TEXT,
   agency_phone TEXT,
   agency_lang TEXT
-);
+) WITHOUT ROWID;
 
 -- Calculated departures; empty route_id and direction_id -1 mean no filter.
 CREATE TABLE IF NOT EXISTS departure_cache (

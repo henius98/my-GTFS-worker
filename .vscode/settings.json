@@ -1,3 +1,8 @@
 {
-  "antigravity.enableInlineDiff": true
+  "antigravity.enableInlineDiff": true,
+  "rust-analyzer.inlayHints.implicitDrops.enable": true,
+  "rust-analyzer.vfs.extraIncludes": [
+    "${workspaceFolder}/test",
+    "${workspaceFolder}/scripts"
+  ]
 }

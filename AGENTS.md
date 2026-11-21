@@ -9,10 +9,11 @@ The application is a Cargo Workspace containing two distinct environments:
 - **`worker/`**: Cloudflare Worker (Wasm). A unified worker that dynamically routes to specific databases via the `/<provider>/status` API endpoints.
 - **`importer/`**: GitHub Actions standalone CLI. Connects directly to Cloudflare D1 via HTTP APIs to ingest ZIP/CSV GTFS files concurrently.
 
-## 2. Eval-Driven Development (EDD)
+## 2. Eval-Driven Development (EDD) & Test Organization
 
 - To verify logic, all Rust refactoring must pass an LLM-as-a-Judge code-verification stage before merging.
 - Any manual compilation validation must be flagged to the human user for out-of-band execution.
+- **Single Source of Truth for Tests (`test/`)**: All test code, test doubles, and test helpers MUST live under `test/` (`test/unit/{importer,worker,scripts}/` for out-of-line unit tests, `test/{importer,worker,shared}/` for integration suites, benchmarks, and Wrangler e2e tests). Application files in `importer/src/`, `worker/src/`, and `scripts/` may only contain a 3-line `#[cfg(test)] #[path = "..."] mod tests;` stub (or `pub(crate) mod tests;` when sharing mocks across modules). Never place `#[test]`, `#[tokio::test]`, inline `mod tests { ... }`, or `#[cfg(test)]` helper blocks in application files.
 
 ## 3. Multi-Tenant Deployment & Schemas
 

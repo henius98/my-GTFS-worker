@@ -8,9 +8,9 @@ CREATE TABLE IF NOT EXISTS "0_import_progress" (
   CRC TEXT,
   LastProcessedLine INTEGER,
   LastProcessedByte INTEGER NOT NULL DEFAULT 0 CHECK (LastProcessedByte >= 0),
-  Status TINYINT CHECK (Status IN (0, 1)), -- 0 = COMPLETED, 1 = IN_PROGRESS
+  Status TINYINT CHECK (Status IN (0, 1, 2)), -- 0 = COMPLETED, 1 = IN_PROGRESS, 2 = STAGED
   UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS "0_dataset_versions" (ETag TEXT, UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP);
 
@@ -27,10 +27,10 @@ CREATE TABLE IF NOT EXISTS trips (
   -- FOREIGN KEY (route_id) REFERENCES routes(route_id),
   -- FOREIGN KEY (service_id) REFERENCES calendar(service_id),
   -- FOREIGN KEY (shape_id) REFERENCES shapes(shape_id)
-);
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS calendar (
-  service_id TEXT,
+  service_id TEXT PRIMARY KEY,
   monday BOOLEAN,
   tuesday BOOLEAN,
   wednesday BOOLEAN,
@@ -39,9 +39,8 @@ CREATE TABLE IF NOT EXISTS calendar (
   saturday BOOLEAN,
   sunday BOOLEAN,
   start_date INTEGER,
-  end_date INTEGER,
-  PRIMARY KEY (service_id, start_date)
-);
+  end_date INTEGER
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS routes (
   route_id TEXT PRIMARY KEY,
@@ -50,7 +49,7 @@ CREATE TABLE IF NOT EXISTS routes (
   route_long_name TEXT,
   route_type INTEGER
   -- FOREIGN KEY (agency_id) REFERENCES agency(agency_id)
-);
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS shapes (
   shape_id TEXT,
@@ -59,9 +58,9 @@ CREATE TABLE IF NOT EXISTS shapes (
   shape_pt_sequence INTEGER,
   shape_dist_traveled REAL,
   PRIMARY KEY (shape_id, shape_pt_sequence)
-);
+) WITHOUT ROWID;
 
-CREATE TABLE IF NOT EXISTS stops (stop_id TEXT PRIMARY KEY, stop_code TEXT, stop_name TEXT, stop_lat REAL, stop_lon REAL);
+CREATE TABLE IF NOT EXISTS stops (stop_id TEXT PRIMARY KEY, stop_code TEXT, stop_name TEXT, stop_lat REAL, stop_lon REAL) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS stop_times (
   trip_id TEXT,
@@ -74,7 +73,7 @@ CREATE TABLE IF NOT EXISTS stop_times (
   PRIMARY KEY (stop_id, trip_id, stop_sequence)
   -- FOREIGN KEY (trip_id) REFERENCES trips(trip_id),
   -- FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
-);
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS agency (
   agency_name TEXT,
@@ -83,7 +82,7 @@ CREATE TABLE IF NOT EXISTS agency (
   agency_phone TEXT,
   agency_lang TEXT,
   agency_id TEXT PRIMARY KEY
-);
+) WITHOUT ROWID;
 
 -- Calculated departures; empty route_id and direction_id -1 mean no filter.
 CREATE TABLE IF NOT EXISTS departure_cache (

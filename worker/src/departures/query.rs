@@ -10,6 +10,8 @@ use super::schedule::{Calendar, Exception, ParsedService, Template};
 use crate::data::schema;
 
 const QUERY: &str = include_str!("sql/query.sql");
+const CALENDAR_QUERY: &str = include_str!("sql/calendar.sql");
+const CALENDAR_DATES_QUERY: &str = include_str!("sql/calendar_dates.sql");
 
 fn decode<T: DeserializeOwned>(result: D1Result) -> Result<Vec<T>> {
   if !result.success() {
@@ -72,17 +74,12 @@ pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -
   }
   let service_ids = serde_json::to_string(&templates.iter().map(|template| &template.service_id).collect::<HashSet<_>>())?;
   let (calendars_result, exceptions_result) = if has("calendar_dates", "service_id") {
-    let mut results = db
-      .batch(vec![
-        db.prepare("SELECT * FROM calendar WHERE service_id IN (SELECT value FROM json_each(?1))").bind(&[service_ids.clone().into()])?,
-        db.prepare("SELECT * FROM calendar_dates WHERE service_id IN (SELECT value FROM json_each(?1))").bind(&[service_ids.into()])?,
-      ])
-      .await?;
+    let mut results = db.batch(vec![db.prepare(CALENDAR_QUERY).bind(&[service_ids.clone().into()])?, db.prepare(CALENDAR_DATES_QUERY).bind(&[service_ids.into()])?]).await?;
     let exceptions = results.pop().ok_or_else(|| worker::Error::RustError("Missing calendar_dates result".into()))?;
     let calendars = results.pop().ok_or_else(|| worker::Error::RustError("Missing calendar result".into()))?;
     (calendars, Some(exceptions))
   } else {
-    let calendars = db.prepare("SELECT * FROM calendar WHERE service_id IN (SELECT value FROM json_each(?1))").bind(&[service_ids.into()])?.all().await?;
+    let calendars = db.prepare(CALENDAR_QUERY).bind(&[service_ids.into()])?.all().await?;
     (calendars, None)
   };
   let calendars: Vec<Calendar> = decode(calendars_result)?;

@@ -1,0 +1,1 @@
+SELECT route_id, __ROUTE_COLUMNS__ FROM routes__WHERE_CLAUSE__

@@ -3,7 +3,16 @@
   "main": "../../worker/build/worker/shim.mjs",
   "compatibility_date": "2026-09-08",
   "vars": {
-    "WORKER_TEST_NOW": "2026-09-24T00:00:00Z"
+    "WORKER_TEST_NOW": "2026-09-24T00:00:00Z",
+    "WORKER_CORS_ALLOW_ORIGIN": "*",
+    "WORKER_SQL_MAX_ROWS": "1000",
+    "WORKER_API_CACHE_TTL_SECONDS": "60",
+    "WORKER_FEED_CACHE_TTL_SECONDS": "86400",
+    "WORKER_DEPARTURE_CACHE_WINDOW_SECONDS": "300",
+    "WORKER_DEPARTURES_MAX_LIMIT": "100",
+    "WORKER_DEPARTURES_DEFAULT_LIMIT": "5",
+    "WORKER_DEPARTURES_SEARCH_DAYS": "7",
+    "WORKER_DEFAULT_TIMEZONE": "Asia/Kuala_Lumpur"
   },
   "d1_databases": [
     {

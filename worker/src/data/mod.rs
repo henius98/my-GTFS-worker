@@ -171,12 +171,14 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
     }
   }
 
+  let configured_max_rows = super::max_rows(env)?;
+  let cache_control = crate::api_cache_control(env)?;
   let limit: u32 = match url.query_pairs().find(|(k, _)| k == "limit") {
     Some((_, v)) => match v.parse::<u32>() {
-      Ok(val) => val.min(super::max_rows(env)), // Enforce the configured maximum limit
+      Ok(val) => val.min(configured_max_rows), // Enforce the configured maximum limit
       Err(_) => return Response::error("Invalid limit parameter", 400),
     },
-    None => super::max_rows(env), // Enforce the configured maximum limit
+    None => configured_max_rows, // Enforce the configured maximum limit
   };
 
   let offset: u32 = match url.query_pairs().find(|(k, _)| k == "offset") {
@@ -352,9 +354,21 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
   let data_results = match statement.inner().all() {
     Ok(promise) => match JsFuture::from(promise).await {
       Ok(result) => result,
-      Err(error) => return Response::error(format!("Query error: {:?}", error), 500),
+      Err(error) => {
+        let message = format!("Query error: {:?}", error);
+        if crate::is_d1_row_read_limit(&message) {
+          return crate::d1_row_read_limit_response();
+        }
+        return Response::error(message, 500);
+      }
     },
-    Err(error) => return Response::error(format!("Query error: {:?}", error), 500),
+    Err(error) => {
+      let message = format!("Query error: {:?}", error);
+      if crate::is_d1_row_read_limit(&message) {
+        return crate::d1_row_read_limit_response();
+      }
+      return Response::error(message, 500);
+    }
   };
   let details = match Reflect::get(&data_results, &JsValue::from_str("results")) {
     Ok(d) => d,
@@ -374,56 +388,10 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
   };
   let mut response = Response::ok(body)?;
   response.headers_mut().set("Content-Type", "application/json")?;
-  response.headers_mut().set("Cache-Control", "public, max-age=60")?;
+  response.headers_mut().set("Cache-Control", &cache_control)?;
   Ok(response)
 }
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn test_parse_filter_items_single_and_escaped() {
-    assert_eq!(parse_filter_items(""), vec![""]);
-    assert_eq!(parse_filter_items("   "), vec!["   "]);
-    assert_eq!(parse_filter_items("val@col"), vec!["val@col"]);
-    assert_eq!(parse_filter_items(r"val1\,val2@col"), vec!["val1,val2@col"]);
-    assert_eq!(parse_filter_items("val1@col1,val2@col2"), vec!["val1@col1", "val2@col2"]);
-  }
-
-  #[test]
-  fn test_parse_range_bounds_valid_cases() {
-    for (input, begin, end) in [
-      ("1:10", Some("1"), Some("10")),
-      ("1..10", Some("1"), Some("10")),
-      (":10", None, Some("10")),
-      ("5:", Some("5"), None),
-      ("08:00:10:00", Some("08:00"), Some("10:00")),
-      ("08:00:00:10:00:00", Some("08:00:00"), Some("10:00:00")),
-      ("08:00:00..10:00:00", Some("08:00:00"), Some("10:00:00")),
-      ("08:00:00:10:00", Some("08:00:00"), Some("10:00")),
-      ("08:00:10:00:00", Some("08:00"), Some("10:00:00")),
-      (":10:00:00", None, Some("10:00:00")),
-      ("08:00:00:", Some("08:00:00"), None),
-    ] {
-      assert_eq!(parse_range_bounds(input), Ok(RangeBounds { begin, end }), "{input}");
-    }
-  }
-
-  #[test]
-  fn test_parse_range_bounds_invalid_cases() {
-    for input in [":", "::", "0:1:2", "08:00:00", ":5:", "..5..", "1..5..10", "5....", ":5..10", "5..10:", "1...10", "...", "1...", "...10"] {
-      assert!(parse_range_bounds(input).is_err(), "{input}");
-    }
-  }
-
-  #[test]
-  fn test_parse_range_part_validation() {
-    assert_eq!(parse_range_part("Status[1:10]"), Ok(RangeFilter { column: "Status", bounds: RangeBounds { begin: Some("1"), end: Some("10") } }));
-    for invalid in ["", "Status", "Status[1:10", "[1:10]"] {
-      assert!(parse_range_part(invalid).is_err(), "{invalid}");
-    }
-    assert_eq!(parse_range_part("Status[0:1:2]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
-    assert_eq!(parse_range_part("Status[::]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
-  }
-}
+#[path = "../../../test/unit/worker/data/mod.rs"]
+mod tests;
