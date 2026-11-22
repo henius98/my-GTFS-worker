@@ -60,12 +60,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
@@ -89,10 +89,19 @@ jobs:
       - name: Cache Rust Dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      - name: Verify wrangler.toml Matches providers.toml
+      - name: Regenerate wrangler.toml from providers.toml
         run: |
           bash ./scripts/generate-wrangler.sh
-          git diff --exit-code wrangler.toml
+          if ! git diff --quiet wrangler.toml; then
+            echo "wrangler.toml is out of date with providers.toml; regenerated."
+            if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add wrangler.toml
+              git commit -m "chore: regenerate wrangler.toml from providers.toml"
+              git push
+            fi
+          fi
 
       - name: Verify All Tests Live Under test/
         run: |

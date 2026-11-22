@@ -1,0 +1,3 @@
+SELECT * FROM (
+__SQL__
+) LIMIT __LIMIT__

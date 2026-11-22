@@ -24,3 +24,8 @@ fn test_delimiters_outside_string_literals_detected() {
   assert!(stripped.contains(';'));
   assert!(stripped.contains("--"));
 }
+
+#[test]
+fn test_build_wrapped_query_preserves_sql_and_applies_limit() {
+  assert_eq!(build_wrapped_query("SELECT '__LIMIT__'", 500), "SELECT * FROM (\nSELECT '__LIMIT__'\n) LIMIT 500");
+}

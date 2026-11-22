@@ -10,6 +10,8 @@ use super::schedule::{Calendar, Exception, ParsedService, Template};
 use crate::data::schema;
 
 const QUERY: &str = include_str!("sql/query.sql");
+const FREQUENCIES_QUERY: &str = include_str!("sql/query_frequencies.sql");
+const AGENCY_JOIN_SQL: &str = include_str!("sql/agency_join.sql");
 const CALENDAR_QUERY: &str = include_str!("sql/calendar.sql");
 const CALENDAR_DATES_QUERY: &str = include_str!("sql/calendar_dates.sql");
 
@@ -25,15 +27,6 @@ fn decode<T: DeserializeOwned>(result: D1Result) -> Result<Vec<T>> {
 pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -> Result<Vec<Template>> {
   let has = |table: &str, column: &str| schema::has_column(provider, table, column);
   let frequencies = has("frequencies", "trip_id");
-  let frequency_columns = if frequencies {
-    format!(
-      "(SELECT departure_time FROM stop_times first WHERE first.trip_id = st.trip_id ORDER BY stop_sequence LIMIT 1) AS first_departure_time, \
-       f.start_time, f.end_time, f.headway_secs, f.trip_id AS frequency_trip_id, {} AS exact_times",
-      if has("frequencies", "exact_times") { "f.exact_times" } else { "NULL" },
-    )
-  } else {
-    "NULL AS first_departure_time, NULL AS start_time, NULL AS end_time, NULL AS headway_secs, NULL AS frequency_trip_id, NULL AS exact_times".into()
-  };
   let stop_headsign = has("stop_times", "stop_headsign");
   let trip_headsign = has("trips", "trip_headsign");
   let headsign = match (stop_headsign, trip_headsign) {
@@ -49,19 +42,12 @@ pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -
     if has("routes", "route_color") { "r.route_color" } else { "NULL AS route_color" },
     if has("routes", "route_text_color") { "r.route_text_color" } else { "NULL AS route_text_color" },
   );
-  let sql = QUERY
+  let base_sql = if frequencies { FREQUENCIES_QUERY } else { QUERY };
+  let sql = base_sql
     .replace("__ROUTE_COLUMNS__", &route_columns)
     .replace("__HEADSIGN__", headsign)
-    .replace("__FREQUENCY_COLUMNS__", &frequency_columns)
-    .replace("__FREQUENCY_JOIN__", if frequencies { "LEFT JOIN frequencies f ON f.trip_id = t.trip_id" } else { "" })
-    .replace(
-      "__AGENCY_JOIN__",
-      if has("agency", "agency_id") {
-        "LEFT JOIN agency a ON a.agency_id = r.agency_id OR ((r.agency_id IS NULL OR r.agency_id = '') AND (SELECT COUNT(*) FROM agency) = 1)"
-      } else {
-        "LEFT JOIN agency a ON 1 = 1"
-      },
-    )
+    .replace("__EXACT_TIMES__", if has("frequencies", "exact_times") { "f.exact_times" } else { "NULL" })
+    .replace("__AGENCY_JOIN__", if has("agency", "agency_id") { AGENCY_JOIN_SQL.trim_end() } else { "LEFT JOIN agency a ON 1 = 1" })
     .replace("__PICKUP_FILTER__", if has("stop_times", "pickup_type") { "AND COALESCE(st.pickup_type, 0) <> 1" } else { "" });
   let result = db
     .prepare(sql)

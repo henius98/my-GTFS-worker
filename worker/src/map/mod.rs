@@ -54,6 +54,7 @@ const ROUTES_SQL: &str = include_str!("sql/routes.sql");
 const SHAPES_SQL: &str = include_str!("sql/shapes.sql");
 const SEGMENTS_SQL: &str = include_str!("sql/segments.sql");
 const STOPS_SQL: &str = include_str!("sql/stops.sql");
+const STOPS_BY_ROUTE_SQL: &str = include_str!("sql/stops_by_route.sql");
 
 fn route_select_sql(provider: &str, filter_by_route: bool) -> String {
   let has = |column: &str| crate::data::schema::has_column(provider, "routes", column);
@@ -163,8 +164,8 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     segments = segment_result.results::<Value>()?.into_iter().map(serde_json::from_value).collect::<std::result::Result<Vec<StopSegment>, _>>()?;
   }
 
-  let stop_sql = STOPS_SQL.replace("__TRIP_FILTER__", trip_filter);
-  let stop_result = query_all(&db, &stop_sql, filter.as_ref()).await?;
+  let stop_sql = if route_id.is_some() { STOPS_BY_ROUTE_SQL } else { STOPS_SQL };
+  let stop_result = query_all(&db, stop_sql, filter.as_ref()).await?;
   if !stop_result.success() {
     return json_error(503, "Map data is unavailable");
   }

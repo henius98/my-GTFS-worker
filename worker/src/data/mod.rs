@@ -7,6 +7,19 @@ use crate::database;
 
 pub(crate) mod schema;
 
+const SELECT_SQL: &str = include_str!("sql/select.sql");
+
+fn build_select_sql(columns: &str, table: &str, where_clause: &str, order_clause: &str, limit_param: usize, offset_param: usize) -> String {
+  SELECT_SQL
+    .trim_end()
+    .replace("__COLUMNS__", columns)
+    .replace("__TABLE__", table)
+    .replace("__WHERE_CLAUSE__", where_clause)
+    .replace("__ORDER_CLAUSE__", order_clause)
+    .replace("__LIMIT_PARAM__", &limit_param.to_string())
+    .replace("__OFFSET_PARAM__", &offset_param.to_string())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RangeBounds<'a> {
   pub begin: Option<&'a str>,
@@ -331,13 +344,13 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
     }
   }
 
-  let where_clause = if filter_clauses.is_empty() { "".to_string() } else { format!("WHERE {}", filter_clauses.join(" AND ")) };
+  let where_clause = if filter_clauses.is_empty() { String::new() } else { format!("\nWHERE {}", filter_clauses.join(" AND ")) };
 
-  let order_clause = if sort_clauses.is_empty() { "".to_string() } else { format!("ORDER BY {}", sort_clauses.join(", ")) };
+  let order_clause = if sort_clauses.is_empty() { String::new() } else { format!("\nORDER BY {}", sort_clauses.join(", ")) };
 
   // Execute the paginated query
   let normalized_table_name = table_name.to_ascii_lowercase();
-  let query = format!("SELECT {} FROM \"{}\" {} {} LIMIT ?{} OFFSET ?{}", selected_columns, normalized_table_name, where_clause, order_clause, filter_clauses.len() + 1, filter_clauses.len() + 2);
+  let query = build_select_sql(&selected_columns, &normalized_table_name, &where_clause, &order_clause, filter_clauses.len() + 1, filter_clauses.len() + 2);
 
   let mut params: Vec<worker::wasm_bindgen::JsValue> = Vec::new();
   for v in filter_values {

@@ -5,6 +5,12 @@ use worker::{Env, Method, Request, Response, Result};
 
 use crate::database;
 
+const QUERY_SQL: &str = include_str!("query.sql");
+
+fn build_wrapped_query(sql: &str, max_rows: u32) -> String {
+  QUERY_SQL.trim_end().replace("__LIMIT__", &max_rows.to_string()).replace("__SQL__", sql)
+}
+
 pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Response> {
   if req.method() != Method::Post {
     return Response::error("Method Not Allowed", 405);
@@ -55,7 +61,7 @@ pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Resp
   };
 
   // A subquery accepts SELECT statements (including WITH ... SELECT) but rejects writes. Cap returned rows as in /data.
-  let query = format!("SELECT * FROM (\n{}\n) LIMIT {}", sql, super::max_rows(env)?);
+  let query = build_wrapped_query(sql, super::max_rows(env)?);
   let statement = d1.prepare(query);
   let data_results = match statement.inner().all() {
     Ok(promise) => match JsFuture::from(promise).await {
