@@ -31,41 +31,35 @@ command = "bash ./scripts/build.sh"
 # ── mybas-johor ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_MYBAS_JOHOR"
-database_name = "gtfs-mybas-johor-db-20261117"
-database_id = "11578d7b-8e95-4cd2-a9eb-b79c0a34969c"
+database_id = "c617037b-5f08-43b1-8a68-9e674bbd2a03"
 migrations_dir = "migrations/mybas-johor"
 
 # ── ktmb ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_KTMB"
-database_name = "gtfs-ktmb-db-20261117"
-database_id = "d7e59044-ef3b-469c-8522-abc18c2304d5"
+database_id = "6588b1c2-18c2-461b-908f-b26f4c3be298"
 migrations_dir = "migrations/ktmb"
 
 # ── rapid-bus-mrtfeeder ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_BUS_MRTFEEDER"
-database_name = "gtfs-rapid-bus-mrtfeeder-db-20261117"
-database_id = "5554680f-2629-4ffe-87d9-98e11ce68b6c"
+database_id = "4834f12b-7894-4a89-8405-d632aaeff5d6"
 migrations_dir = "migrations/rapid-bus-mrtfeeder"
 
 # ── rapid-rail-kl ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_RAIL_KL"
-database_name = "gtfs-rapid-rail-kl-db-20261117"
-database_id = "f2ac7f44-6947-4de3-ad31-2f6eba264f09"
+database_id = "2dab4d70-cb49-405b-89a2-82117ca288b8"
 migrations_dir = "migrations/rapid-rail-kl"
 
 # ── rapid-bus-kl ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_BUS_KL"
-database_name = "gtfs-rapid-bus-kl-db-20261117"
-database_id = "fe6b7fae-09ae-407e-83a7-f3ddc33846c1"
+database_id = "5bc9bf7f-05cf-458b-96e9-27f1833e0774"
 migrations_dir = "migrations/rapid-bus-kl"
 
 # ── rapid-bus-penang ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_BUS_PENANG"
-database_name = "gtfs-rapid-bus-penang-db-20261121"
-database_id = "e1f9a85f-152f-41c3-a5d9-08a54509e915"
+database_id = "5e0f6c68-0cd4-4360-8a40-8156256ad9e3"
 migrations_dir = "migrations/rapid-bus-penang"

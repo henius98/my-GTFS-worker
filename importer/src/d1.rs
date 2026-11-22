@@ -46,22 +46,33 @@ pub enum D1Error {
   WriteBudgetExhausted { requested: u64, remaining: u64 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetrySafety {
+  Never,
+  ReadOnly,
+  SafeForWrites,
+}
+
 #[derive(Debug)]
 pub struct D1AttemptError {
   pub error: D1Error,
-  pub retryable: bool,
+  pub retry_safety: RetrySafety,
   pub retry_after: Option<Duration>,
 }
 
 impl D1AttemptError {
   pub fn retryable(error: D1Error, retry_after: Option<Duration>) -> Self {
-    Self { error, retryable: true, retry_after }
+    Self { error, retry_safety: RetrySafety::ReadOnly, retry_after }
+  }
+
+  pub fn retryable_for_writes(error: D1Error, retry_after: Option<Duration>) -> Self {
+    Self { error, retry_safety: RetrySafety::SafeForWrites, retry_after }
   }
 }
 
 impl From<D1Error> for D1AttemptError {
   fn from(error: D1Error) -> Self {
-    Self { error, retryable: false, retry_after: None }
+    Self { error, retry_safety: RetrySafety::Never, retry_after: None }
   }
 }
 
@@ -229,11 +240,18 @@ impl HttpD1Transport {
         let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER));
         let error_text = response.text().await.unwrap_or_default();
         let error = D1Error::ApiError(format!("HTTP {status}: {error_text}"));
-        if is_retryable_status(status) { Err(D1AttemptError::retryable(error, retry_after)) } else { Err(D1AttemptError::from(error)) }
+        let retry_safety = classify_http_status(status);
+        Err(D1AttemptError { error, retry_safety, retry_after })
       }
       Err(error) => {
-        let retryable = !error.is_builder();
-        Err(D1AttemptError { error: D1Error::Reqwest(error), retryable, retry_after: None })
+        let retry_safety = if error.is_connect() {
+          RetrySafety::SafeForWrites
+        } else if !error.is_builder() {
+          RetrySafety::ReadOnly
+        } else {
+          RetrySafety::Never
+        };
+        Err(D1AttemptError { error: D1Error::Reqwest(error), retry_safety, retry_after: None })
       }
     }
   }
@@ -365,7 +383,7 @@ impl D1Client {
       return Err(D1Error::ApiError("Workflow budget exceeds daily write limit".into()));
     }
     let query = D1Query { sql: ACQUIRE_DAILY_BUDGET_SQL, params: vec![requested.into(), daily_write_limit.into(), day.clone().into(), (METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE).into()] };
-    let results = self.execute_single_query(database_id, &query, 0).await?;
+    let results = self.execute_single_query(database_id, &query, self.max_query_retries, false).await?;
     let Some(row) = results.first().and_then(|result| result.results.first()) else {
       println!("Daily D1 budget cannot cover another workflow's metadata and ledger writes; deferring until the next UTC day.");
       return Ok(false);
@@ -385,9 +403,12 @@ impl D1Client {
       return Ok(());
     };
     let unused = self.budget.unused_writes();
+    if unused == 0 {
+      return Ok(());
+    }
     let query = D1Query { sql: RELEASE_DAILY_BUDGET_SQL, params: vec![unused.into(), lease.day.clone().into(), unused.into()] };
     // Never retry this subtraction: a lost response leaves a conservative lease.
-    self.execute_single_query(&lease.database_id, &query, 0).await?;
+    self.execute_single_query(&lease.database_id, &query, 0, false).await?;
     Ok(())
   }
 
@@ -399,8 +420,12 @@ impl D1Client {
     D1Usage { rows_read: self.rows_read.load(Ordering::Relaxed), rows_written: self.rows_written.load(Ordering::Relaxed) }
   }
 
+  pub(crate) fn remaining_data_writes(&self) -> u64 {
+    self.budget.data_remaining()
+  }
+
   async fn query_rows(&self, db_id: &str, query: D1Query<'_>) -> Result<Vec<D1Result>, D1Error> {
-    let results = self.execute_single_query(db_id, &query, self.max_query_retries).await?;
+    let results = self.execute_single_query(db_id, &query, self.max_query_retries, true).await?;
     validate_result_count(results, 1)
   }
 
@@ -419,7 +444,8 @@ impl D1Client {
     }
     // A terminal transport failure may be ambiguous. Dropping `write_reservation`
     // unsettled consumes the estimated write upper bound so later work cannot spend it again.
-    let results = self.execute_batch_queries(db_id, queries, 0).await?;
+    // Only pre-execution failures (429 / connect errors) retry under this reservation.
+    let results = self.execute_batch_queries(db_id, queries, self.max_query_retries, false).await?;
     let results = validate_result_count(results, queries.len())?;
     let rows_written = sum_rows_written(&results).ok_or_else(|| D1Error::ApiError("D1 response omitted or overflowed rows_written metadata; consumed the estimated write upper bound".to_owned()))?;
     let rows_read: u64 = results.iter().filter_map(|result| result.meta.as_ref()).map(|meta| meta.rows_read).sum();
@@ -441,7 +467,7 @@ impl D1Client {
   }
 
   async fn reserved_metadata_batch(&self, db_id: &str, queries: &[D1Query<'_>], reservation: WriteReservation) -> Result<Vec<D1Result>, D1Error> {
-    let results = self.execute_batch_queries(db_id, queries, 0).await?;
+    let results = self.execute_batch_queries(db_id, queries, self.max_query_retries, false).await?;
     let results = validate_result_count(results, queries.len())?;
     let actual = sum_rows_written(&results).ok_or_else(|| D1Error::ApiError("Missing metadata write accounting".into()))?;
     let claimed = reservation.claimed();
@@ -451,15 +477,15 @@ impl D1Client {
     Ok(results)
   }
 
-  async fn execute_single_query(&self, db_id: &str, query: &D1Query<'_>, max_retries: u32) -> Result<Vec<D1Result>, D1Error> {
-    self.execute_with_retries(max_retries, || self.transport.query(db_id, query)).await
+  async fn execute_single_query(&self, db_id: &str, query: &D1Query<'_>, max_retries: u32, allow_ambiguous_retry: bool) -> Result<Vec<D1Result>, D1Error> {
+    self.execute_with_retries(max_retries, allow_ambiguous_retry, || self.transport.query(db_id, query)).await
   }
 
-  async fn execute_batch_queries(&self, db_id: &str, queries: &[D1Query<'_>], max_retries: u32) -> Result<Vec<D1Result>, D1Error> {
-    self.execute_with_retries(max_retries, || self.transport.query_batch(db_id, queries)).await
+  async fn execute_batch_queries(&self, db_id: &str, queries: &[D1Query<'_>], max_retries: u32, allow_ambiguous_retry: bool) -> Result<Vec<D1Result>, D1Error> {
+    self.execute_with_retries(max_retries, allow_ambiguous_retry, || self.transport.query_batch(db_id, queries)).await
   }
 
-  async fn execute_with_retries<'a, F>(&self, max_retries: u32, mut send: F) -> Result<Vec<D1Result>, D1Error>
+  async fn execute_with_retries<'a, F>(&self, max_retries: u32, allow_ambiguous_retry: bool, mut send: F) -> Result<Vec<D1Result>, D1Error>
   where
     F: FnMut() -> BoxFuture<'a, Result<Vec<D1Result>, D1AttemptError>>,
   {
@@ -478,7 +504,12 @@ impl D1Client {
           return Ok(results);
         }
         Err(attempt_error) => {
-          if !attempt_error.retryable || retries >= max_retries {
+          let can_retry = match attempt_error.retry_safety {
+            RetrySafety::SafeForWrites => true,
+            RetrySafety::ReadOnly => allow_ambiguous_retry,
+            RetrySafety::Never => false,
+          };
+          if !can_retry || retries >= max_retries {
             return Err(attempt_error.error);
           }
           let delay = attempt_error.retry_after.unwrap_or(backoff).min(self.max_retry_delay);
@@ -655,8 +686,14 @@ fn validate_result_count(results: Vec<D1Result>, expected: usize) -> Result<Vec<
   Ok(results)
 }
 
-fn is_retryable_status(status: StatusCode) -> bool {
-  status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::REQUEST_TIMEOUT
+fn classify_http_status(status: StatusCode) -> RetrySafety {
+  if status == StatusCode::TOO_MANY_REQUESTS {
+    RetrySafety::SafeForWrites
+  } else if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT {
+    RetrySafety::ReadOnly
+  } else {
+    RetrySafety::Never
+  }
 }
 
 fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {

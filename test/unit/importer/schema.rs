@@ -98,3 +98,18 @@ fn staging_create_sql_covers_all_gtfs_tables_and_excludes_infrastructure_tables(
   }
   assert!(SchemaCatalog::staging_create_sql("unknown-provider", "stops").is_none());
 }
+
+#[test]
+fn max_writes_per_staging_row_uses_1_for_without_rowid_tables_and_2_as_fallback() {
+  let providers = ["mybas-johor", "ktmb", "rapid-bus-mrtfeeder", "rapid-rail-kl", "rapid-bus-kl", "rapid-bus-penang"];
+  for provider in providers {
+    let schemas = SchemaCatalog::provider_schemas(provider).unwrap_or_default();
+    for &(table_name, _) in schemas {
+      if !SchemaCatalog::is_infrastructure_table(table_name) {
+        assert_eq!(SchemaCatalog::max_writes_per_staging_row(provider, table_name), 1, "{provider}.{table_name} should reserve 1 write per row");
+      }
+    }
+  }
+  assert_eq!(SchemaCatalog::max_writes_per_staging_row("ktmb", "departure_cache"), 2);
+  assert_eq!(SchemaCatalog::max_writes_per_staging_row("unknown-provider", "stops"), 2);
+}

@@ -4,6 +4,7 @@ use std::{env, fs, path::Path, time::Duration};
 use thiserror::Error;
 
 const D1_MAX_VALUE_BYTES: u64 = 2_000_000;
+const DEFAULT_D1_DATABASE_CONCURRENCY_LIMIT: usize = 4;
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -70,6 +71,7 @@ pub struct RuntimeConfig {
   pub d1_query_timeout: Duration,
   pub d1_max_query_retries: u32,
   pub d1_max_retry_delay: Duration,
+  pub workflow_max_duration: Option<Duration>,
 }
 
 impl RuntimeConfig {
@@ -80,7 +82,13 @@ impl RuntimeConfig {
   fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, ConfigError> {
     let d1_global_concurrency_limit = bounded_usize(&mut lookup, "D1_CONCURRENCY_LIMIT", 64)?;
     let csv_concurrency_limit = d1_global_concurrency_limit.saturating_mul(2);
-    let d1_database_concurrency_limit = d1_global_concurrency_limit;
+    let d1_database_concurrency_limit = match optional_bounded_usize(&mut lookup, "D1_DATABASE_CONCURRENCY_LIMIT", 64)? {
+      Some(limit) if limit > d1_global_concurrency_limit => {
+        return Err(ConfigError::InvalidEnvironment { name: "D1_DATABASE_CONCURRENCY_LIMIT", value: limit.to_string(), requirement: "must not exceed D1_CONCURRENCY_LIMIT" });
+      }
+      Some(limit) => limit,
+      None => d1_global_concurrency_limit.min(DEFAULT_D1_DATABASE_CONCURRENCY_LIMIT),
+    };
     let d1_max_databases = bounded_usize(&mut lookup, "D1_MAX_DATABASES", 50_000)?;
     let query_statement_batch_size = bounded_usize(&mut lookup, "QUERY_STATEMENT_BATCH_SIZE", 10_000)?;
     let d1_statements_per_request = bounded_usize(&mut lookup, "D1_STATEMENTS_PER_REQUEST", 16)?;
@@ -118,6 +126,7 @@ impl RuntimeConfig {
     let d1_query_timeout = Duration::from_secs(positive_u64(&mut lookup, "D1_QUERY_TIMEOUT_SECS")?);
     let d1_max_query_retries = bounded_u32_allowing_zero(&mut lookup, "D1_MAX_QUERY_RETRIES", 16)?;
     let d1_max_retry_delay = Duration::from_secs(positive_u64(&mut lookup, "D1_MAX_RETRY_DELAY_SECS")?);
+    let workflow_max_duration = optional_positive_u64(&mut lookup, "WORKFLOW_MAX_DURATION_SECS")?.map(Duration::from_secs);
 
     Ok(Self {
       csv_concurrency_limit,
@@ -140,12 +149,17 @@ impl RuntimeConfig {
       d1_query_timeout,
       d1_max_query_retries,
       d1_max_retry_delay,
+      workflow_max_duration,
     })
   }
 }
 
+fn optional_environment_value(lookup: &mut impl FnMut(&str) -> Option<String>, name: &'static str) -> Option<String> {
+  lookup(name).map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+}
+
 fn required_environment_value(lookup: &mut impl FnMut(&str) -> Option<String>, name: &'static str) -> Result<String, ConfigError> {
-  lookup(name).map(|value| value.trim().to_owned()).filter(|value| !value.is_empty()).ok_or(ConfigError::MissingEnvironment { name })
+  optional_environment_value(lookup, name).ok_or(ConfigError::MissingEnvironment { name })
 }
 
 fn parse_env<T: std::str::FromStr>(lookup: &mut impl FnMut(&str) -> Option<String>, name: &'static str, requirement: &'static str) -> Result<(T, String), ConfigError> {
@@ -154,6 +168,32 @@ fn parse_env<T: std::str::FromStr>(lookup: &mut impl FnMut(&str) -> Option<Strin
     return Err(ConfigError::InvalidEnvironment { name, value, requirement });
   };
   Ok((parsed, value))
+}
+
+fn optional_bounded_usize(lookup: &mut impl FnMut(&str) -> Option<String>, name: &'static str, maximum: usize) -> Result<Option<usize>, ConfigError> {
+  let Some(value) = optional_environment_value(lookup, name) else {
+    return Ok(None);
+  };
+  let Ok(parsed) = value.parse::<usize>() else {
+    return Err(ConfigError::InvalidEnvironment { name, value, requirement: "must be a positive integer" });
+  };
+  if parsed == 0 || parsed > maximum {
+    return Err(ConfigError::InvalidEnvironment { name, value, requirement: "is outside the supported positive range" });
+  }
+  Ok(Some(parsed))
+}
+
+fn optional_positive_u64(lookup: &mut impl FnMut(&str) -> Option<String>, name: &'static str) -> Result<Option<u64>, ConfigError> {
+  let Some(value) = optional_environment_value(lookup, name) else {
+    return Ok(None);
+  };
+  let Ok(parsed) = value.parse::<u64>() else {
+    return Err(ConfigError::InvalidEnvironment { name, value, requirement: "must be a positive integer" });
+  };
+  if parsed == 0 {
+    return Err(ConfigError::InvalidEnvironment { name, value, requirement: "must be greater than zero" });
+  }
+  Ok(Some(parsed))
 }
 
 fn bounded_usize(lookup: &mut impl FnMut(&str) -> Option<String>, name: &'static str, maximum: usize) -> Result<usize, ConfigError> {

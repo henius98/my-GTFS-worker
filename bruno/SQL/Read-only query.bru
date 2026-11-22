@@ -13,6 +13,7 @@ post {
 headers {
   Content-Type: text/plain
   Accept: application/json
+  ~X-Admin-Key: 
 }
 
 body:text {
@@ -21,7 +22,9 @@ body:text {
 
 docs {
   Send one SELECT query or a WITH ... SELECT query as plain text.
+  Requires WORKER_ADMIN_KEY via Authorization: Bearer <key> or X-Admin-Key: <key>
+  unless WORKER_ALLOW_ANONYMOUS_SQL=true is enabled locally.
   SQL comments and multiple statements are rejected. A trailing semicolon is allowed.
-  Returns { data } with at most the configured row cap (1000 by default).
-  Invalid queries return 400. Other methods return 405.
+  Returns { data } capped at WORKER_SQL_MAX_ROWS (1000 in .env.example).
+  Errors: 400 invalid query, 401 unauthorized, 403 admin key unconfigured, 404 unknown provider, 405 wrong method.
 }

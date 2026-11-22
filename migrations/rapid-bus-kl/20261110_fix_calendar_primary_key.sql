@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS "calendar_new" (
   sunday BOOLEAN,
   start_date INTEGER,
   end_date INTEGER
-);
+) WITHOUT ROWID;
 
 INSERT OR REPLACE INTO
   "calendar_new" (service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date)

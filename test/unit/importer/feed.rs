@@ -27,6 +27,17 @@ impl TemporaryFeed {
   pub(crate) fn from_zip_entry(label: &str, entry_name: &str, content: &[u8]) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
     Self::from_zip_entries(label, &[(entry_name, content)])
   }
+
+  pub(crate) fn from_zip_entry_with_headroom(label: &str, entry_name: &str, content: &[u8], headroom_bytes: u64) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+    let archive = zip_bytes(&[(entry_name, content)])?;
+    let seq = TEMP_FEED_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("my-gtfs-worker-{label}-{}-{seq}.zip", std::process::id()));
+    std::fs::write(&path, archive)?;
+    let reserved_bytes = std::fs::metadata(&path)?.len();
+    let storage = Arc::new(TempFeedStorage::new(reserved_bytes.saturating_add(headroom_bytes)));
+    storage.reserve(reserved_bytes)?;
+    Ok(Arc::new(Self { path, storage, reserved_bytes }))
+  }
 }
 
 pub(crate) struct InMemoryFeedBody(VecDeque<Result<Vec<u8>, ProcessorError>>);
@@ -173,6 +184,33 @@ async fn download_enforces_size_limits_and_reclaims_temp_storage_on_streaming_ab
 
   let stream_err = store.download("https://example.invalid/ktmb", None).await;
   assert!(stream_err.is_err());
+  assert_eq!(storage.used_bytes(), 0);
+  Ok(())
+}
+
+#[test]
+fn try_extract_zip_entry_caches_csv_within_temp_storage_and_falls_back_when_full() -> Result<(), Box<dyn std::error::Error>> {
+  let csv_content = b"stop_id,stop_name\nS1,Alpha\nS2,Beta\n";
+  let archive = zip_bytes(&[("stops.txt", csv_content)])?;
+  let seq = TEMP_FEED_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+  let path = std::env::temp_dir().join(format!("my-gtfs-worker-extract-cache-test-{}-{seq}.zip", std::process::id()));
+  std::fs::write(&path, &archive)?;
+  let zip_size = std::fs::metadata(&path)?.len();
+  let storage = Arc::new(TempFeedStorage::new(zip_size + u64::try_from(csv_content.len())?));
+  storage.reserve(zip_size)?;
+  let feed = Arc::new(TemporaryFeed { path, storage: storage.clone(), reserved_bytes: zip_size });
+
+  let extracted = feed.try_extract_zip_entry("stops.txt", 1024)?.ok_or("expected extracted csv")?;
+  assert_eq!(std::fs::read(extracted.path())?, csv_content);
+  assert_eq!(storage.used_bytes(), zip_size + u64::try_from(csv_content.len())?);
+  // Temp storage is now full; a second extraction gracefully returns None instead of failing.
+  assert!(feed.try_extract_zip_entry("stops.txt", 1024)?.is_none());
+
+  let extracted_path = extracted.path().to_path_buf();
+  drop(extracted);
+  assert!(!extracted_path.exists());
+  assert_eq!(storage.used_bytes(), zip_size);
+  drop(feed);
   assert_eq!(storage.used_bytes(), 0);
   Ok(())
 }

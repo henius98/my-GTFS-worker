@@ -26,7 +26,7 @@ fn runtime_config_requires_every_server_env_var_without_defaults() -> Result<(),
   let config = RuntimeConfig::from_lookup(|name| map.get(name).map(|value| (*value).to_owned()))?;
   assert_eq!(config.csv_concurrency_limit, 20);
   assert_eq!(config.d1_global_concurrency_limit, 10);
-  assert_eq!(config.d1_database_concurrency_limit, 10);
+  assert_eq!(config.d1_database_concurrency_limit, 4);
   assert_eq!(config.d1_max_databases, 10);
   assert_eq!(config.query_statement_batch_size, 2000);
   assert_eq!(config.d1_statements_per_request, 8);
@@ -44,17 +44,50 @@ fn runtime_config_requires_every_server_env_var_without_defaults() -> Result<(),
   assert_eq!(config.d1_query_timeout, Duration::from_secs(35));
   assert_eq!(config.d1_max_query_retries, 3);
   assert_eq!(config.d1_max_retry_delay, Duration::from_secs(30));
+  assert_eq!(config.workflow_max_duration, None);
 
   for (missing_key, _) in entries {
-    let result = RuntimeConfig::from_lookup(|name| (name != missing_key).then(|| map[name].to_owned()));
+    let result = RuntimeConfig::from_lookup(|name| (name != missing_key).then(|| map.get(name).copied()).flatten().map(str::to_owned));
     assert!(matches!(result, Err(ConfigError::MissingEnvironment { name }) if name == missing_key));
   }
 
-  let zero_retries = RuntimeConfig::from_lookup(|name| Some(if name == "D1_MAX_QUERY_RETRIES" { "0" } else { map[name] }.to_owned()))?;
+  let small_global = RuntimeConfig::from_lookup(|name| match name {
+    "D1_CONCURRENCY_LIMIT" => Some("2".to_owned()),
+    _ => map.get(name).map(|value| (*value).to_owned()),
+  })?;
+  assert_eq!(small_global.d1_database_concurrency_limit, 2);
+
+  let custom_optional = RuntimeConfig::from_lookup(|name| match name {
+    "D1_DATABASE_CONCURRENCY_LIMIT" => Some("6".to_owned()),
+    "WORKFLOW_MAX_DURATION_SECS" => Some("480".to_owned()),
+    _ => map.get(name).map(|value| (*value).to_owned()),
+  })?;
+  assert_eq!(custom_optional.d1_database_concurrency_limit, 6);
+  assert_eq!(custom_optional.workflow_max_duration, Some(Duration::from_secs(480)));
+
+  let db_above_global = RuntimeConfig::from_lookup(|name| match name {
+    "D1_DATABASE_CONCURRENCY_LIMIT" => Some("11".to_owned()),
+    _ => map.get(name).map(|value| (*value).to_owned()),
+  });
+  assert!(matches!(db_above_global, Err(ConfigError::InvalidEnvironment { name: "D1_DATABASE_CONCURRENCY_LIMIT", .. })));
+
+  let zero_duration = RuntimeConfig::from_lookup(|name| match name {
+    "WORKFLOW_MAX_DURATION_SECS" => Some("0".to_owned()),
+    _ => map.get(name).map(|value| (*value).to_owned()),
+  });
+  assert!(matches!(zero_duration, Err(ConfigError::InvalidEnvironment { name: "WORKFLOW_MAX_DURATION_SECS", .. })));
+
+  let zero_retries = RuntimeConfig::from_lookup(|name| match name {
+    "D1_MAX_QUERY_RETRIES" => Some("0".to_owned()),
+    _ => map.get(name).map(|value| (*value).to_owned()),
+  })?;
   assert_eq!(zero_retries.d1_max_query_retries, 0);
 
   let minimum_reserves = (METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE).to_string();
-  let daily_below_reserves = RuntimeConfig::from_lookup(|name| Some(if name == "D1_DAILY_WRITE_LIMIT" { minimum_reserves.as_str() } else { map[name] }.to_owned()));
+  let daily_below_reserves = RuntimeConfig::from_lookup(|name| match name {
+    "D1_DAILY_WRITE_LIMIT" => Some(minimum_reserves.clone()),
+    _ => map.get(name).map(|value| (*value).to_owned()),
+  });
   assert!(matches!(daily_below_reserves, Err(ConfigError::InvalidEnvironment { name: "D1_DAILY_WRITE_LIMIT", .. })));
   Ok(())
 }

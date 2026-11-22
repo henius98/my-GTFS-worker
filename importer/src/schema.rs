@@ -46,6 +46,10 @@ impl SchemaCatalog {
     include!(concat!(env!("OUT_DIR"), "/staging_schema_sql.rs"))
   }
 
+  pub fn max_writes_per_staging_row(provider_name: &str, table_name: &str) -> u64 {
+    include!(concat!(env!("OUT_DIR"), "/staging_writes_per_row.rs"))
+  }
+
   pub fn is_infrastructure_table(table_name: &str) -> bool {
     matches!(table_name, "departure_cache" | "0_daily_import_budget" | "0_import_progress" | "0_dataset_versions")
   }

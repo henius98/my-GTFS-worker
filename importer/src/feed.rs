@@ -123,6 +123,39 @@ impl TemporaryFeed {
     &self.path
   }
 
+  pub(crate) fn try_extract_zip_entry(&self, csv_file: &str, maximum_uncompressed_bytes: u64) -> Result<Option<Arc<Self>>, ProcessorError> {
+    let mut archive = ZipArchive::new(File::open(&self.path)?)?;
+    let entry = archive.by_name(csv_file)?;
+    let declared_size = entry.size();
+    if declared_size > maximum_uncompressed_bytes {
+      return Err(
+        io::Error::new(io::ErrorKind::InvalidData, format!("CSV entry {csv_file} declares {declared_size} uncompressed bytes, exceeding the configured {maximum_uncompressed_bytes}-byte limit"))
+          .into(),
+      );
+    }
+
+    if self.storage.reserve(declared_size).is_err() {
+      return Ok(None);
+    }
+    let (mut extracted, mut output) = match create_temporary_file_sync(self.storage.clone(), "csv", declared_size) {
+      Ok(created) => created,
+      Err(error) => {
+        self.storage.release(declared_size);
+        return Err(error);
+      }
+    };
+
+    let mut limited = std::io::Read::take(entry, declared_size.saturating_add(1));
+    let copied = io::copy(&mut limited, &mut output)?;
+    if copied != declared_size {
+      return Err(io::Error::new(io::ErrorKind::InvalidData, format!("CSV entry {csv_file} expanded to {copied} bytes instead of its declared {declared_size} bytes")).into());
+    }
+    std::io::Write::flush(&mut output)?;
+    drop(output);
+    extracted.reserved_bytes = declared_size;
+    Ok(Some(Arc::new(extracted)))
+  }
+
   fn reserve(&mut self, bytes: u64) -> Result<(), io::Error> {
     self.storage.reserve(bytes)?;
     match self.reserved_bytes.checked_add(bytes) {
@@ -204,6 +237,22 @@ impl FeedStore {
     let maximum_archive_entries = self.max_archive_entries;
     tokio::task::spawn_blocking(move || discover_supported_files_sync(&feed, &provider_name, schemas, maximum_uncompressed_bytes, maximum_archive_entries)).await?
   }
+}
+
+fn create_temporary_file_sync(storage: Arc<TempFeedStorage>, extension: &str, reserved_bytes: u64) -> Result<(TemporaryFeed, File), ProcessorError> {
+  for _ in 0..16 {
+    let sequence = TEMP_FEED_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_nanos()).unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("my-gtfs-worker-{}-{timestamp}-{sequence}.{extension}", std::process::id()));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+      Ok(file) => {
+        return Ok((TemporaryFeed { path, storage, reserved_bytes }, file));
+      }
+      Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+      Err(error) => return Err(error.into()),
+    }
+  }
+  Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not allocate a unique temporary feed path after 16 attempts").into())
 }
 
 async fn create_temporary_feed(storage: Arc<TempFeedStorage>) -> Result<(TemporaryFeed, tokio::fs::File), ProcessorError> {

@@ -25,6 +25,8 @@ fn extract_and_batch_csv_formats_unpadded_gtfs_times_for_stop_times_and_frequenc
   let outcome = extract_and_batch_csv(
     CsvExtractJob {
       feed: stop_times_feed,
+      extracted_csv: None,
+      cache_extracted_csv: false,
       provider_name: "rapid-rail-kl".to_owned(),
       csv_file: "stop_times.txt".to_owned(),
       table_name: "stop_times".to_owned(),
@@ -32,8 +34,12 @@ fn extract_and_batch_csv_formats_unpadded_gtfs_times_for_stop_times_and_frequenc
       checkpoint: Checkpoint::default(),
       batch_size: 10,
       max_rows: 10,
+      max_uncompressed_feed_bytes: 1024 * 1024,
       max_record_bytes: 1024,
       max_payload_bytes: 4096,
+      d1_client: None,
+      max_writes_per_row: 1,
+      shutdown: ShutdownSignal::new(),
     },
     Arc::new(AtomicU64::new(0)),
     plan_tx,
@@ -50,6 +56,8 @@ fn extract_and_batch_csv_formats_unpadded_gtfs_times_for_stop_times_and_frequenc
   let outcome = extract_and_batch_csv(
     CsvExtractJob {
       feed: frequencies_feed,
+      extracted_csv: None,
+      cache_extracted_csv: false,
       provider_name: "rapid-rail-kl".to_owned(),
       csv_file: "frequencies.txt".to_owned(),
       table_name: "frequencies".to_owned(),
@@ -57,8 +65,12 @@ fn extract_and_batch_csv_formats_unpadded_gtfs_times_for_stop_times_and_frequenc
       checkpoint: Checkpoint::default(),
       batch_size: 10,
       max_rows: 10,
+      max_uncompressed_feed_bytes: 1024 * 1024,
       max_record_bytes: 1024,
       max_payload_bytes: 4096,
+      d1_client: None,
+      max_writes_per_row: 1,
+      shutdown: ShutdownSignal::new(),
     },
     Arc::new(AtomicU64::new(0)),
     plan_tx,
@@ -80,6 +92,8 @@ fn byte_checkpoint_resumes_at_a_quoted_record_boundary() -> Result<(), Box<dyn s
     let outcome = extract_and_batch_csv(
       CsvExtractJob {
         feed: feed.clone(),
+        extracted_csv: None,
+        cache_extracted_csv: false,
         provider_name: "ktmb".to_owned(),
         csv_file: "stops.txt".to_owned(),
         table_name: "stops".to_owned(),
@@ -87,8 +101,12 @@ fn byte_checkpoint_resumes_at_a_quoted_record_boundary() -> Result<(), Box<dyn s
         checkpoint,
         batch_size: 10,
         max_rows,
+        max_uncompressed_feed_bytes: 1024 * 1024,
         max_record_bytes: 1024,
         max_payload_bytes,
+        d1_client: None,
+        max_writes_per_row: 1,
+        shutdown: ShutdownSignal::new(),
       },
       Arc::new(AtomicU64::new(0)),
       plan_tx,
@@ -194,8 +212,129 @@ fn write_budget_exhaustion_is_not_reported_as_a_batch_failure() {
 fn largest_fitting_prefix_shrinks_strictly_below_full_group() {
   let mk = |rows| SerializedBatch { payload: "[]".to_owned(), start: Checkpoint::default(), end: Checkpoint { line: rows, byte: rows }, rows };
   let group = vec![mk(2), mk(2), mk(2), mk(2)];
-  assert_eq!(largest_fitting_prefix(&group, 3), 0);
-  assert_eq!(largest_fitting_prefix(&group, 4), 1);
-  assert_eq!(largest_fitting_prefix(&group, 9), 2);
-  assert_eq!(largest_fitting_prefix(&group, 100), 3);
+  assert_eq!(largest_fitting_prefix(&group, 3, 2), 0);
+  assert_eq!(largest_fitting_prefix(&group, 4, 2), 1);
+  assert_eq!(largest_fitting_prefix(&group, 9, 2), 2);
+  assert_eq!(largest_fitting_prefix(&group, 100, 2), 3);
+
+  assert_eq!(largest_fitting_prefix(&group, 1, 1), 0);
+  assert_eq!(largest_fitting_prefix(&group, 2, 1), 1);
+  assert_eq!(largest_fitting_prefix(&group, 5, 1), 2);
+  assert_eq!(largest_fitting_prefix(&group, 100, 1), 3);
+}
+
+#[test]
+fn cached_extracted_csv_resumes_directly_without_reopening_zip() -> Result<(), Box<dyn std::error::Error>> {
+  let csv = "stop_id,stop_name\n1,alpha\n2,\"two\nlines\"\n3,gamma\n4,delta\n";
+  let feed = TemporaryFeed::from_zip_entry_with_headroom("cached-resume", "stops.txt", csv.as_bytes(), 4096)?;
+
+  let (plan_tx1, _plan_rx1) = tokio::sync::oneshot::channel();
+  let (tx1, mut rx1) = tokio::sync::mpsc::channel(4);
+  let first = extract_and_batch_csv(
+    CsvExtractJob {
+      feed: feed.clone(),
+      extracted_csv: None,
+      cache_extracted_csv: true,
+      provider_name: "ktmb".to_owned(),
+      csv_file: "stops.txt".to_owned(),
+      table_name: "stops".to_owned(),
+      db_columns: &["stop_id", "stop_name"],
+      checkpoint: Checkpoint::default(),
+      batch_size: 10,
+      max_rows: 2,
+      max_uncompressed_feed_bytes: 1024 * 1024,
+      max_record_bytes: 1024,
+      max_payload_bytes: 4096,
+      d1_client: None,
+      max_writes_per_row: 1,
+      shutdown: ShutdownSignal::new(),
+    },
+    Arc::new(AtomicU64::new(0)),
+    plan_tx1,
+    tx1,
+  )?;
+  assert!(!first.file_done);
+  assert_eq!(first.checkpoint.line, 2);
+  let extracted = first.extracted_csv.ok_or("expected cached extracted csv")?;
+  assert_eq!(rx1.try_recv()?.payload, "[[\"1\",\"alpha\"],[\"2\",\"two\\nlines\"]]");
+
+  // Delete the original ZIP to prove wave 2 reads strictly via seek() on the extracted plain CSV.
+  std::fs::remove_file(feed.path())?;
+
+  let (plan_tx2, _plan_rx2) = tokio::sync::oneshot::channel();
+  let (tx2, mut rx2) = tokio::sync::mpsc::channel(4);
+  let second = extract_and_batch_csv(
+    CsvExtractJob {
+      feed,
+      extracted_csv: Some(extracted),
+      cache_extracted_csv: true,
+      provider_name: "ktmb".to_owned(),
+      csv_file: "stops.txt".to_owned(),
+      table_name: "stops".to_owned(),
+      db_columns: &["stop_id", "stop_name"],
+      checkpoint: first.checkpoint,
+      batch_size: 10,
+      max_rows: 10,
+      max_uncompressed_feed_bytes: 1024 * 1024,
+      max_record_bytes: 1024,
+      max_payload_bytes: 4096,
+      d1_client: None,
+      max_writes_per_row: 1,
+      shutdown: ShutdownSignal::new(),
+    },
+    Arc::new(AtomicU64::new(0)),
+    plan_tx2,
+    tx2,
+  )?;
+  assert!(second.file_done);
+  assert_eq!(second.checkpoint, Checkpoint { line: 4, byte: u64::try_from(csv.len())? });
+  assert_eq!(rx2.try_recv()?.payload, "[[\"3\",\"gamma\"],[\"4\",\"delta\"]]");
+  Ok(())
+}
+
+#[test]
+fn extract_and_batch_csv_stops_immediately_when_shutdown_is_triggered() -> Result<(), Box<dyn std::error::Error>> {
+  let feed = TemporaryFeed::from_zip_entry("shutdown-extract", "stops.txt", b"stop_id,stop_name\n1,alpha\n2,beta\n")?;
+  let shutdown = ShutdownSignal::new();
+  shutdown.trigger();
+  let (plan_tx, mut plan_rx) = tokio::sync::oneshot::channel();
+  let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+  let outcome = extract_and_batch_csv(
+    CsvExtractJob {
+      feed,
+      extracted_csv: None,
+      cache_extracted_csv: false,
+      provider_name: "ktmb".to_owned(),
+      csv_file: "stops.txt".to_owned(),
+      table_name: "stops".to_owned(),
+      db_columns: &["stop_id", "stop_name"],
+      checkpoint: Checkpoint::default(),
+      batch_size: 10,
+      max_rows: 10,
+      max_uncompressed_feed_bytes: 1024 * 1024,
+      max_record_bytes: 1024,
+      max_payload_bytes: 4096,
+      d1_client: None,
+      max_writes_per_row: 1,
+      shutdown,
+    },
+    Arc::new(AtomicU64::new(0)),
+    plan_tx,
+    tx,
+  )?;
+  assert!(!outcome.file_done);
+  assert_eq!(outcome.checkpoint, Checkpoint::default());
+  assert!(plan_rx.try_recv()?.is_none());
+  assert!(rx.try_recv().is_err());
+  Ok(())
+}
+
+#[test]
+fn effective_batch_size_caps_to_affordable_rows_for_remaining_write_budget() {
+  assert_eq!(effective_batch_size(2_000, None, 1), 2_000);
+  assert_eq!(effective_batch_size(2_000, Some(10_000), 1), 2_000);
+  assert_eq!(effective_batch_size(2_000, Some(1_988), 1), 1_988);
+  assert_eq!(effective_batch_size(2_000, Some(1_988), 2), 994);
+  assert_eq!(effective_batch_size(2_000, Some(1), 2), 1);
+  assert_eq!(effective_batch_size(2_000, Some(0), 1), 1);
 }

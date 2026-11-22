@@ -4,9 +4,10 @@ use crate::d1::{Checkpoint, D1Client, D1Error, D1Query};
 use crate::error::ProcessorError;
 use crate::feed::TemporaryFeed;
 use crate::schema::{PlannedColumn, SchemaCatalog, TableImportPlan};
+use crate::workflow::ShutdownSignal;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Read, Seek};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{
   Arc,
   atomic::{AtomicU64, Ordering},
@@ -14,9 +15,8 @@ use std::sync::{
 use tokio::task::{JoinError, JoinSet};
 use zip::ZipArchive;
 
-// Every imported table has at most one primary/unique index. D1 bills one row
-// write for the table and up to one for that index in the worst case.
-const MAX_D1_WRITES_PER_LOGICAL_ROW: u64 = 2;
+// Staging tables created WITHOUT ROWID without extra UNIQUE constraints use a single
+// clustered B-tree (1 D1 write per row); other tables reserve up to 2 writes per row.
 // The CSV reader buffers ahead. This small allowance lets it find the end of a
 // record before the exact byte-span check below rejects an oversized record.
 const CSV_RECORD_READ_AHEAD_BYTES: u64 = 64 * 1024;
@@ -45,6 +45,14 @@ impl JsonBatchBuilder {
     let mut json = Vec::with_capacity(initial_capacity);
     json.push(b'[');
     Self { json, batch_rows: 0, batch_start: initial, batch_size, max_payload_bytes }
+  }
+
+  fn is_empty(&self) -> bool {
+    self.batch_rows == 0
+  }
+
+  fn set_batch_size(&mut self, batch_size: usize) {
+    self.batch_size = batch_size.max(1);
   }
 
   fn push_row(&mut self, start: Checkpoint, end: Checkpoint, record: &csv::StringRecord, columns: &[PlannedColumn], tx: &tokio::sync::mpsc::Sender<SerializedBatch>) -> Result<(), ProcessorError> {
@@ -160,6 +168,7 @@ struct StatementGroupExecutor {
   provider_name: Arc<str>,
   statements_per_request: usize,
   database_concurrency_limit: usize,
+  max_writes_per_row: u64,
 }
 
 impl StatementGroupExecutor {
@@ -227,7 +236,7 @@ impl StatementGroupExecutor {
             return;
           }
         };
-        let Some(estimated_writes) = logical_rows.checked_mul(MAX_D1_WRITES_PER_LOGICAL_ROW) else {
+        let Some(estimated_writes) = logical_rows.checked_mul(self.max_writes_per_row) else {
           self.record_local_failure(pending, ProcessorError::Invariant("D1 batch write estimate overflowed u64".to_owned()), accumulator);
           pending.clear();
           return;
@@ -235,9 +244,9 @@ impl StatementGroupExecutor {
         match self.d1_client.reserve_import_write(estimated_writes).await {
           Ok(reservation) => break (reservation, logical_rows),
           Err(D1Error::WriteBudgetExhausted { remaining, .. }) if slice.len() > 1 => {
-            let fitted = largest_fitting_prefix(slice, remaining);
+            let fitted = largest_fitting_prefix(slice, remaining, self.max_writes_per_row);
             if fitted == 0 {
-              let error = ProcessorError::D1(D1Error::WriteBudgetExhausted { requested: pending[0].rows.saturating_mul(MAX_D1_WRITES_PER_LOGICAL_ROW), remaining });
+              let error = ProcessorError::D1(D1Error::WriteBudgetExhausted { requested: pending[0].rows.saturating_mul(self.max_writes_per_row), remaining });
               self.record_local_failure(pending, error, accumulator);
               pending.clear();
               return;
@@ -266,7 +275,8 @@ impl StatementGroupExecutor {
 
     while let Some(batch) = receiver.recv().await {
       pending.push(batch);
-      if pending.len() < self.statements_per_request {
+      let pending_writes = sum_batch_rows(&pending).ok().and_then(|rows| rows.checked_mul(self.max_writes_per_row)).unwrap_or(u64::MAX);
+      if pending.len() < self.statements_per_request && pending_writes < self.d1_client.remaining_data_writes() {
         continue;
       }
 
@@ -388,6 +398,8 @@ pub(crate) struct CsvIngestRequest<'a> {
   pub(crate) database_id: &'a str,
   pub(crate) provider_name: &'a str,
   pub(crate) feed: Arc<TemporaryFeed>,
+  pub(crate) extracted_csv: Option<Arc<TemporaryFeed>>,
+  pub(crate) cache_extracted_csv: bool,
   pub(crate) csv_file: &'a str,
   pub(crate) table_name: &'a str,
   pub(crate) staging_table: &'a str,
@@ -398,28 +410,44 @@ pub(crate) struct CsvIngestRequest<'a> {
   pub(crate) runtime: &'a RuntimeConfig,
   pub(crate) max_rows: u64,
   pub(crate) rows_processed_this_run: &'a Arc<AtomicU64>,
+  pub(crate) shutdown: &'a ShutdownSignal,
 }
 
 pub(crate) struct CsvIngestOutcome {
   pub(crate) checkpoint: Checkpoint,
   pub(crate) file_done: bool,
   pub(crate) write_budget_exhausted: bool,
+  pub(crate) shutdown_requested: bool,
+  pub(crate) extracted_csv: Option<Arc<TemporaryFeed>>,
   pub(crate) error: Option<ProcessorError>,
 }
 
 pub(crate) async fn ingest_csv_file(request: CsvIngestRequest<'_>) -> CsvIngestOutcome {
   let checkpoint = request.checkpoint;
+  if request.shutdown.is_triggered() {
+    return CsvIngestOutcome { checkpoint, file_done: false, write_budget_exhausted: false, shutdown_requested: true, extracted_csv: request.extracted_csv, error: None };
+  }
   let csv_permit = match request.csv_semaphore.clone().acquire_owned().await {
     Ok(permit) => permit,
     Err(error) => {
-      return CsvIngestOutcome { checkpoint, file_done: false, write_budget_exhausted: false, error: Some(ProcessorError::Invariant(format!("Failed to acquire CSV producer permit: {error}"))) };
+      return CsvIngestOutcome {
+        checkpoint,
+        file_done: false,
+        write_budget_exhausted: false,
+        shutdown_requested: request.shutdown.is_triggered(),
+        extracted_csv: request.extracted_csv,
+        error: Some(ProcessorError::Invariant(format!("Failed to acquire CSV producer permit: {error}"))),
+      };
     }
   };
 
+  let max_writes_per_row = SchemaCatalog::max_writes_per_staging_row(request.provider_name, request.table_name);
   let (plan_tx, plan_rx) = tokio::sync::oneshot::channel();
   let (sender, receiver) = tokio::sync::mpsc::channel(2);
   let job = CsvExtractJob {
     feed: request.feed,
+    extracted_csv: request.extracted_csv,
+    cache_extracted_csv: request.cache_extracted_csv,
     provider_name: request.provider_name.to_owned(),
     csv_file: request.csv_file.to_owned(),
     table_name: request.table_name.to_owned(),
@@ -427,8 +455,12 @@ pub(crate) async fn ingest_csv_file(request: CsvIngestRequest<'_>) -> CsvIngestO
     checkpoint,
     batch_size: request.runtime.query_statement_batch_size,
     max_rows: request.max_rows,
+    max_uncompressed_feed_bytes: request.runtime.max_uncompressed_feed_bytes,
     max_record_bytes: request.runtime.max_csv_record_bytes,
     max_payload_bytes: request.runtime.max_statement_payload_bytes,
+    d1_client: Some(request.d1_client.clone()),
+    max_writes_per_row,
+    shutdown: request.shutdown.clone(),
   };
   let rows_processed = request.rows_processed_this_run.clone();
   let blocking_handle = tokio::task::spawn_blocking(move || {
@@ -439,9 +471,23 @@ pub(crate) async fn ingest_csv_file(request: CsvIngestRequest<'_>) -> CsvIngestO
   let Some(insert_sql) = plan_rx.await.ok().flatten() else {
     drop(receiver);
     return match blocking_handle.await {
-      Ok(Ok(outcome)) => CsvIngestOutcome { checkpoint: outcome.checkpoint, file_done: outcome.file_done, write_budget_exhausted: false, error: None },
-      Ok(Err(error)) => CsvIngestOutcome { checkpoint, file_done: false, write_budget_exhausted: false, error: Some(error) },
-      Err(error) => CsvIngestOutcome { checkpoint, file_done: false, write_budget_exhausted: false, error: Some(ProcessorError::TaskJoin(error)) },
+      Ok(Ok(outcome)) => CsvIngestOutcome {
+        checkpoint: outcome.checkpoint,
+        file_done: outcome.file_done,
+        write_budget_exhausted: false,
+        shutdown_requested: request.shutdown.is_triggered(),
+        extracted_csv: outcome.extracted_csv,
+        error: None,
+      },
+      Ok(Err(error)) => CsvIngestOutcome { checkpoint, file_done: false, write_budget_exhausted: false, shutdown_requested: request.shutdown.is_triggered(), extracted_csv: None, error: Some(error) },
+      Err(error) => CsvIngestOutcome {
+        checkpoint,
+        file_done: false,
+        write_budget_exhausted: false,
+        shutdown_requested: request.shutdown.is_triggered(),
+        extracted_csv: None,
+        error: Some(ProcessorError::TaskJoin(error)),
+      },
     };
   };
 
@@ -454,33 +500,35 @@ pub(crate) async fn ingest_csv_file(request: CsvIngestRequest<'_>) -> CsvIngestO
     provider_name: Arc::from(request.provider_name),
     statements_per_request: request.runtime.d1_statements_per_request,
     database_concurrency_limit: request.runtime.d1_database_concurrency_limit,
+    max_writes_per_row,
   });
   let upload = executor.execute_channel(checkpoint, receiver).await;
   let extraction = match blocking_handle.await {
     Ok(result) => result,
     Err(error) => Err(ProcessorError::TaskJoin(error)),
   };
+  let shutdown_requested = request.shutdown.is_triggered();
 
   if upload.had_error {
     let error = upload
       .first_error
       .or_else(|| extraction.err().filter(|error| !matches!(error, ProcessorError::UploaderClosed)))
       .unwrap_or_else(|| ProcessorError::Invariant("One or more D1 batch groups failed".to_owned()));
-    return CsvIngestOutcome { checkpoint: upload.committed_through, file_done: false, write_budget_exhausted: false, error: Some(error) };
+    return CsvIngestOutcome { checkpoint: upload.committed_through, file_done: false, write_budget_exhausted: false, shutdown_requested, extracted_csv: None, error: Some(error) };
   }
 
   if upload.write_budget_exhausted {
     if let Err(error) = extraction
       && !matches!(error, ProcessorError::UploaderClosed)
     {
-      return CsvIngestOutcome { checkpoint: upload.committed_through, file_done: false, write_budget_exhausted: false, error: Some(error) };
+      return CsvIngestOutcome { checkpoint: upload.committed_through, file_done: false, write_budget_exhausted: false, shutdown_requested, extracted_csv: None, error: Some(error) };
     }
-    return CsvIngestOutcome { checkpoint: upload.committed_through, file_done: false, write_budget_exhausted: true, error: None };
+    return CsvIngestOutcome { checkpoint: upload.committed_through, file_done: false, write_budget_exhausted: true, shutdown_requested, extracted_csv: None, error: None };
   }
 
   let extraction = match extraction {
     Ok(extraction) => extraction,
-    Err(error) => return CsvIngestOutcome { checkpoint: upload.committed_through, file_done: false, write_budget_exhausted: false, error: Some(error) },
+    Err(error) => return CsvIngestOutcome { checkpoint: upload.committed_through, file_done: false, write_budget_exhausted: false, shutdown_requested, extracted_csv: None, error: Some(error) },
   };
 
   if !producer_checkpoint_is_committed(extraction.checkpoint, upload.committed_through) {
@@ -488,6 +536,8 @@ pub(crate) async fn ingest_csv_file(request: CsvIngestRequest<'_>) -> CsvIngestO
       checkpoint: upload.committed_through,
       file_done: false,
       write_budget_exhausted: false,
+      shutdown_requested,
+      extracted_csv: extraction.extracted_csv,
       error: Some(ProcessorError::Invariant(format!(
         "CSV producer reached row {} at byte {}, but only row {} at byte {} was committed",
         extraction.checkpoint.line, extraction.checkpoint.byte, upload.committed_through.line, upload.committed_through.byte,
@@ -495,11 +545,13 @@ pub(crate) async fn ingest_csv_file(request: CsvIngestRequest<'_>) -> CsvIngestO
     };
   }
 
-  CsvIngestOutcome { checkpoint: extraction.checkpoint, file_done: extraction.file_done, write_budget_exhausted: false, error: None }
+  CsvIngestOutcome { checkpoint: extraction.checkpoint, file_done: extraction.file_done, write_budget_exhausted: false, shutdown_requested, extracted_csv: extraction.extracted_csv, error: None }
 }
 
 struct CsvExtractJob {
   feed: Arc<TemporaryFeed>,
+  extracted_csv: Option<Arc<TemporaryFeed>>,
+  cache_extracted_csv: bool,
   provider_name: String,
   csv_file: String,
   table_name: String,
@@ -507,13 +559,24 @@ struct CsvExtractJob {
   checkpoint: Checkpoint,
   batch_size: usize,
   max_rows: u64,
+  max_uncompressed_feed_bytes: u64,
   max_record_bytes: u64,
   max_payload_bytes: u64,
+  d1_client: Option<D1Client>,
+  max_writes_per_row: u64,
+  shutdown: ShutdownSignal,
+}
+
+impl CsvExtractJob {
+  fn remaining_data_writes(&self) -> Option<u64> {
+    self.d1_client.as_ref().map(D1Client::remaining_data_writes)
+  }
 }
 
 struct CsvExtractOutcome {
   file_done: bool,
   checkpoint: Checkpoint,
+  extracted_csv: Option<Arc<TemporaryFeed>>,
 }
 
 fn resolve_table_plan(job: &CsvExtractJob, headers: &csv::StringRecord, plan_tx: tokio::sync::oneshot::Sender<Option<Arc<str>>>) -> Option<TableImportPlan> {
@@ -526,15 +589,77 @@ fn resolve_table_plan(job: &CsvExtractJob, headers: &csv::StringRecord, plan_tx:
   Some(plan)
 }
 
+fn extract_from_plain_file(
+  extracted: Arc<TemporaryFeed>,
+  job: &CsvExtractJob,
+  rows_processed_this_run: &AtomicU64,
+  plan_tx: tokio::sync::oneshot::Sender<Option<Arc<str>>>,
+  tx: &tokio::sync::mpsc::Sender<SerializedBatch>,
+) -> Result<CsvExtractOutcome, ProcessorError> {
+  let mut file = File::open(extracted.path())?;
+  let uncompressed_size = file.metadata()?.len();
+
+  if job.checkpoint.byte == 0 {
+    let mut reader = csv::ReaderBuilder::new().has_headers(true).flexible(true).from_reader(RecordSizeLimiter::new(file, job.max_record_bytes));
+    let headers = reader.headers()?.clone();
+    validate_record_span(0, reader.position().byte(), job.max_record_bytes)?;
+
+    let Some(plan) = resolve_table_plan(job, &headers, plan_tx) else {
+      return Ok(CsvExtractOutcome { file_done: true, checkpoint: job.checkpoint, extracted_csv: Some(extracted) });
+    };
+
+    if job.checkpoint.line != 0 {
+      let mut skip_record = csv::StringRecord::new();
+      for _ in 0..job.checkpoint.line {
+        if !read_bounded_record(&mut reader, &mut skip_record, job.max_record_bytes)? {
+          return Ok(CsvExtractOutcome { file_done: true, checkpoint: Checkpoint { line: job.checkpoint.line, byte: reader.position().byte() }, extracted_csv: Some(extracted) });
+        }
+      }
+    }
+
+    let (file_done, checkpoint) = stream_csv_records(&mut reader, uncompressed_size, 0, &plan.columns, job, rows_processed_this_run, tx)?;
+    return Ok(CsvExtractOutcome { file_done, checkpoint, extracted_csv: Some(extracted) });
+  }
+
+  let (headers, header_end) = {
+    let mut header_reader = csv::ReaderBuilder::new().has_headers(true).flexible(true).from_reader(RecordSizeLimiter::new(&mut file, job.max_record_bytes));
+    let headers = header_reader.headers()?.clone();
+    let header_end = header_reader.position().byte();
+    validate_record_span(0, header_end, job.max_record_bytes)?;
+    (headers, header_end)
+  };
+  let Some(plan) = resolve_table_plan(job, &headers, plan_tx) else {
+    return Ok(CsvExtractOutcome { file_done: true, checkpoint: job.checkpoint, extracted_csv: Some(extracted) });
+  };
+
+  if job.checkpoint.byte < header_end {
+    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("saved byte offset {} for {} precedes the CSV header boundary {header_end}", job.checkpoint.byte, job.csv_file)).into());
+  }
+  if job.checkpoint.byte > uncompressed_size {
+    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("saved byte offset {} for {} exceeds its {uncompressed_size}-byte uncompressed size", job.checkpoint.byte, job.csv_file)).into());
+  }
+  file.seek(SeekFrom::Start(job.checkpoint.byte))?;
+  let mut reader = csv::ReaderBuilder::new().has_headers(false).flexible(true).from_reader(RecordSizeLimiter::new(file, job.max_record_bytes));
+  let (file_done, checkpoint) = stream_csv_records(&mut reader, uncompressed_size, job.checkpoint.byte, &plan.columns, job, rows_processed_this_run, tx)?;
+  Ok(CsvExtractOutcome { file_done, checkpoint, extracted_csv: Some(extracted) })
+}
+
 fn extract_and_batch_csv(
-  job: CsvExtractJob,
+  mut job: CsvExtractJob,
   rows_processed_this_run: Arc<AtomicU64>,
   plan_tx: tokio::sync::oneshot::Sender<Option<Arc<str>>>,
   tx: tokio::sync::mpsc::Sender<SerializedBatch>,
 ) -> Result<CsvExtractOutcome, ProcessorError> {
-  if rows_processed_this_run.load(Ordering::Relaxed) >= job.max_rows {
+  if job.shutdown.is_triggered() || rows_processed_this_run.load(Ordering::Relaxed) >= job.max_rows {
     let _ = plan_tx.send(None);
-    return Ok(CsvExtractOutcome { file_done: false, checkpoint: job.checkpoint });
+    return Ok(CsvExtractOutcome { file_done: false, checkpoint: job.checkpoint, extracted_csv: job.extracted_csv });
+  }
+
+  if job.extracted_csv.is_none() && job.cache_extracted_csv {
+    job.extracted_csv = job.feed.try_extract_zip_entry(&job.csv_file, job.max_uncompressed_feed_bytes)?;
+  }
+  if let Some(extracted) = job.extracted_csv.clone() {
+    return extract_from_plain_file(extracted, &job, &rows_processed_this_run, plan_tx, &tx);
   }
 
   let mut archive = ZipArchive::new(File::open(job.feed.path())?)?;
@@ -546,28 +671,30 @@ fn extract_and_batch_csv(
     validate_record_span(0, reader.position().byte(), job.max_record_bytes)?;
 
     let Some(plan) = resolve_table_plan(&job, &headers, plan_tx) else {
-      return Ok(CsvExtractOutcome { file_done: true, checkpoint: job.checkpoint });
+      return Ok(CsvExtractOutcome { file_done: true, checkpoint: job.checkpoint, extracted_csv: None });
     };
 
     if job.checkpoint.line != 0 {
       let mut skip_record = csv::StringRecord::new();
       for _ in 0..job.checkpoint.line {
         if !read_bounded_record(&mut reader, &mut skip_record, job.max_record_bytes)? {
-          return Ok(CsvExtractOutcome { file_done: true, checkpoint: Checkpoint { line: job.checkpoint.line, byte: reader.position().byte() } });
+          return Ok(CsvExtractOutcome { file_done: true, checkpoint: Checkpoint { line: job.checkpoint.line, byte: reader.position().byte() }, extracted_csv: None });
         }
       }
     }
 
-    return stream_csv_records(&mut reader, uncompressed_size, 0, &plan.columns, &job, &rows_processed_this_run, &tx);
+    let (file_done, checkpoint) = stream_csv_records(&mut reader, uncompressed_size, 0, &plan.columns, &job, &rows_processed_this_run, &tx)?;
+    return Ok(CsvExtractOutcome { file_done, checkpoint, extracted_csv: None });
   }
 
   let (headers, header_end) = read_zip_csv_headers(&mut archive, &job.csv_file, job.max_record_bytes)?;
   let Some(plan) = resolve_table_plan(&job, &headers, plan_tx) else {
-    return Ok(CsvExtractOutcome { file_done: true, checkpoint: job.checkpoint });
+    return Ok(CsvExtractOutcome { file_done: true, checkpoint: job.checkpoint, extracted_csv: None });
   };
 
   let (mut reader, uncompressed_size) = resume_zip_csv_at_byte_offset(&mut archive, &job.csv_file, header_end, job.checkpoint.byte, job.max_record_bytes)?;
-  stream_csv_records(&mut reader, uncompressed_size, job.checkpoint.byte, &plan.columns, &job, &rows_processed_this_run, &tx)
+  let (file_done, checkpoint) = stream_csv_records(&mut reader, uncompressed_size, job.checkpoint.byte, &plan.columns, &job, &rows_processed_this_run, &tx)?;
+  Ok(CsvExtractOutcome { file_done, checkpoint, extracted_csv: None })
 }
 
 fn stream_csv_records<R: Read>(
@@ -578,14 +705,14 @@ fn stream_csv_records<R: Read>(
   job: &CsvExtractJob,
   rows_processed_this_run: &AtomicU64,
   tx: &tokio::sync::mpsc::Sender<SerializedBatch>,
-) -> Result<CsvExtractOutcome, ProcessorError> {
+) -> Result<(bool, Checkpoint), ProcessorError> {
   let mut local_checkpoint = Checkpoint { line: job.checkpoint.line, byte: base_byte_offset.saturating_add(reader.position().byte()) };
   let mut record = csv::StringRecord::new();
   let mut builder = JsonBatchBuilder::new(local_checkpoint, job.batch_size, job.max_payload_bytes);
   let mut file_done = true;
 
   loop {
-    if rows_processed_this_run.load(Ordering::Relaxed) >= job.max_rows {
+    if job.shutdown.is_triggered() || rows_processed_this_run.load(Ordering::Relaxed) >= job.max_rows {
       file_done = local_checkpoint.byte >= uncompressed_size;
       break;
     }
@@ -599,12 +726,24 @@ fn stream_csv_records<R: Read>(
 
     let record_start = local_checkpoint;
     let record_end = Checkpoint { line: record_start.line.saturating_add(1), byte: base_byte_offset.saturating_add(reader.position().byte()) };
+    if builder.is_empty() {
+      builder.set_batch_size(effective_batch_size(job.batch_size, job.remaining_data_writes(), job.max_writes_per_row));
+    }
     builder.push_row(record_start, record_end, &record, columns, tx)?;
     local_checkpoint = record_end;
   }
 
   builder.finish(local_checkpoint, tx)?;
-  Ok(CsvExtractOutcome { file_done, checkpoint: local_checkpoint })
+  Ok((file_done, local_checkpoint))
+}
+
+fn effective_batch_size(configured: usize, remaining_writes: Option<u64>, max_writes_per_row: u64) -> usize {
+  let Some(remaining) = remaining_writes else {
+    return configured.max(1);
+  };
+  let affordable_rows = remaining / max_writes_per_row.max(1);
+  let capped = usize::try_from(affordable_rows).unwrap_or(usize::MAX);
+  configured.min(capped).max(1)
 }
 
 fn append_positional_json_row(json: &mut Vec<u8>, record: &csv::StringRecord, columns: &[PlannedColumn]) -> Result<(), serde_json::Error> {
@@ -643,12 +782,12 @@ fn sum_batch_rows(batches: &[SerializedBatch]) -> Result<u64, ProcessorError> {
   batches.iter().try_fold(0_u64, |total, batch| total.checked_add(batch.rows).ok_or_else(overflow))
 }
 
-fn largest_fitting_prefix(batches: &[SerializedBatch], remaining_writes: u64) -> usize {
+fn largest_fitting_prefix(batches: &[SerializedBatch], remaining_writes: u64, max_writes_per_row: u64) -> usize {
   let mut accumulated = 0_u64;
   let mut count = 0;
   let max_prefix = batches.len().saturating_sub(1);
   for batch in batches.iter().take(max_prefix) {
-    let Some(estimated) = batch.rows.checked_mul(MAX_D1_WRITES_PER_LOGICAL_ROW) else {
+    let Some(estimated) = batch.rows.checked_mul(max_writes_per_row) else {
       break;
     };
     let Some(next_total) = accumulated.checked_add(estimated) else {

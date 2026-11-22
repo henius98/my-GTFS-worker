@@ -431,6 +431,7 @@ fn sqlite_test_runtime(max_rows_per_workflow: u64) -> Arc<RuntimeConfig> {
     d1_query_timeout: std::time::Duration::from_secs(1),
     d1_max_query_retries: 3,
     d1_max_retry_delay: std::time::Duration::from_secs(30),
+    workflow_max_duration: None,
   })
 }
 

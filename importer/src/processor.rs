@@ -6,6 +6,7 @@ use crate::feed::{DownloadedFeed, FeedStore, TemporaryFeed};
 use crate::rotation::DatabaseRotator;
 use crate::scheduler::{NamedWorkItem, WaveStepOutcome};
 use crate::schema::SchemaCatalog;
+use crate::workflow::ShutdownSignal;
 use std::sync::{
   Arc,
   atomic::{AtomicU64, Ordering},
@@ -17,6 +18,7 @@ struct PreparedFile {
   table_name: String,
   db_columns: &'static [&'static str],
   checkpoint: Checkpoint,
+  extracted_csv: Option<Arc<TemporaryFeed>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +92,8 @@ struct CsvFileOutcome {
   completion: CsvFileCompletion,
   checkpoint: Checkpoint,
   write_budget_exhausted: bool,
+  shutdown_requested: bool,
+  extracted_csv: Option<Arc<TemporaryFeed>>,
 }
 
 #[derive(Clone)]
@@ -100,11 +104,21 @@ struct ProviderProcessor {
   database_semaphore: Arc<tokio::sync::Semaphore>,
   runtime: Arc<RuntimeConfig>,
   max_rows: u64,
+  cache_extracted_csv: bool,
+  shutdown: ShutdownSignal,
   rows_processed_this_run: Arc<AtomicU64>,
 }
 
 impl ProviderProcessor {
-  fn new(d1_client: D1Client, provider: ProviderConfig, csv_semaphore: Arc<tokio::sync::Semaphore>, runtime: Arc<RuntimeConfig>, max_rows: u64) -> Self {
+  fn new(
+    d1_client: D1Client,
+    provider: ProviderConfig,
+    csv_semaphore: Arc<tokio::sync::Semaphore>,
+    runtime: Arc<RuntimeConfig>,
+    max_rows: u64,
+    cache_extracted_csv: bool,
+    shutdown: ShutdownSignal,
+  ) -> Self {
     Self {
       d1_client,
       provider,
@@ -112,22 +126,32 @@ impl ProviderProcessor {
       database_semaphore: Arc::new(tokio::sync::Semaphore::new(runtime.d1_database_concurrency_limit)),
       runtime,
       max_rows,
+      cache_extracted_csv,
+      shutdown,
       rows_processed_this_run: Arc::new(AtomicU64::new(0)),
     }
   }
 
-  async fn process_csv_file(&self, feed: Arc<TemporaryFeed>, csv_file: &str, table_name: &str, db_columns: &'static [&'static str], checkpoint: Checkpoint) -> Result<CsvFileOutcome, ProcessorError> {
+  async fn process_csv_file(
+    &self,
+    feed: Arc<TemporaryFeed>,
+    extracted_csv: Option<Arc<TemporaryFeed>>,
+    csv_file: &str,
+    table_name: &str,
+    db_columns: &'static [&'static str],
+    checkpoint: Checkpoint,
+  ) -> Result<CsvFileOutcome, ProcessorError> {
     let staging_table = SchemaCatalog::staging_table_name(table_name);
     println!("[{}] Importing {} into {} (resuming from row {}, byte {})", self.provider.name, csv_file, staging_table, checkpoint.line, checkpoint.byte);
 
-    if self.rows_processed_this_run.load(Ordering::Relaxed) >= self.max_rows {
-      return Ok(CsvFileOutcome { completion: CsvFileCompletion::InProgress, checkpoint, write_budget_exhausted: false });
+    if self.shutdown.is_triggered() || self.rows_processed_this_run.load(Ordering::Relaxed) >= self.max_rows {
+      return Ok(CsvFileOutcome { completion: CsvFileCompletion::InProgress, checkpoint, write_budget_exhausted: false, shutdown_requested: self.shutdown.is_triggered(), extracted_csv });
     }
 
     let progress_reservation = match self.d1_client.reserve_checkpoint().await {
       Ok(reservation) => reservation,
       Err(D1Error::WriteBudgetExhausted { .. }) => {
-        return Ok(CsvFileOutcome { completion: CsvFileCompletion::InProgress, checkpoint, write_budget_exhausted: true });
+        return Ok(CsvFileOutcome { completion: CsvFileCompletion::InProgress, checkpoint, write_budget_exhausted: true, shutdown_requested: self.shutdown.is_triggered(), extracted_csv });
       }
       Err(error) => return Err(error.into()),
     };
@@ -137,6 +161,8 @@ impl ProviderProcessor {
       database_id: &self.provider.database_id,
       provider_name: &self.provider.name,
       feed,
+      extracted_csv,
+      cache_extracted_csv: self.cache_extracted_csv,
       csv_file,
       table_name,
       staging_table: &staging_table,
@@ -147,6 +173,7 @@ impl ProviderProcessor {
       runtime: &self.runtime,
       max_rows: self.max_rows,
       rows_processed_this_run: &self.rows_processed_this_run,
+      shutdown: &self.shutdown,
     })
     .await;
 
@@ -156,12 +183,22 @@ impl ProviderProcessor {
       if let Some(error) = outcome.error {
         return Err(error);
       }
-      return Ok(CsvFileOutcome { completion: CsvFileCompletion::SkippedEmpty, checkpoint: outcome.checkpoint, write_budget_exhausted: outcome.write_budget_exhausted });
+      return Ok(CsvFileOutcome {
+        completion: CsvFileCompletion::SkippedEmpty,
+        checkpoint: outcome.checkpoint,
+        write_budget_exhausted: outcome.write_budget_exhausted,
+        shutdown_requested: outcome.shutdown_requested,
+        extracted_csv: None,
+      });
     }
 
     let status = if outcome.file_done { FileImportStatus::Staged } else { FileImportStatus::InProgress };
-    let update = FileProgressUpdate { file: csv_file, checkpoint: outcome.checkpoint, status };
-    self.d1_client.save_file_progress(progress_reservation, &self.provider.database_id, update).await?;
+    if status == FileImportStatus::InProgress && outcome.checkpoint == checkpoint {
+      let _ = progress_reservation.settle(0);
+    } else {
+      let update = FileProgressUpdate { file: csv_file, checkpoint: outcome.checkpoint, status };
+      self.d1_client.save_file_progress(progress_reservation, &self.provider.database_id, update).await?;
+    }
     if let Some(error) = outcome.error {
       return Err(error);
     }
@@ -169,6 +206,8 @@ impl ProviderProcessor {
       completion: if outcome.file_done { CsvFileCompletion::Staged } else { CsvFileCompletion::InProgress },
       checkpoint: outcome.checkpoint,
       write_budget_exhausted: outcome.write_budget_exhausted,
+      shutdown_requested: outcome.shutdown_requested,
+      extracted_csv: if outcome.file_done { None } else { outcome.extracted_csv },
     })
   }
 }
@@ -246,13 +285,13 @@ pub(crate) async fn prepare_provider(d1_client: &D1Client, rotator: &DatabaseRot
         staged_files.push(StagedFile { csv_file: file.csv_file, table_name: file.table_name });
       }
       FileResumeAction::ResumeInProgress(checkpoint) => {
-        files.push(PreparedFile { csv_file: file.csv_file, table_name: file.table_name, db_columns: file.db_columns, checkpoint });
+        files.push(PreparedFile { csv_file: file.csv_file, table_name: file.table_name, db_columns: file.db_columns, checkpoint, extracted_csv: None });
       }
       FileResumeAction::StartFresh => {
         let create_sql = SchemaCatalog::staging_create_sql(&provider.name, &file.table_name)
           .ok_or_else(|| ProcessorError::Invariant(format!("Missing staging CREATE TABLE DDL for {}.{}", provider.name, file.table_name)))?;
         fresh_setups.push((file.csv_file.clone(), file.crc, file.table_name.clone(), create_sql));
-        files.push(PreparedFile { csv_file: file.csv_file, table_name: file.table_name, db_columns: file.db_columns, checkpoint: Checkpoint::default() });
+        files.push(PreparedFile { csv_file: file.csv_file, table_name: file.table_name, db_columns: file.db_columns, checkpoint: Checkpoint::default(), extracted_csv: None });
       }
     }
   }
@@ -283,25 +322,29 @@ pub(crate) async fn process_prepared_provider(
   csv_semaphore: Arc<tokio::sync::Semaphore>,
   runtime: Arc<RuntimeConfig>,
   max_rows: u64,
+  cache_extracted_csv: bool,
+  shutdown: ShutdownSignal,
 ) -> Result<WaveStepOutcome<PreparedProvider>, ProcessorError> {
   if max_rows == 0 {
     return Err(ProcessorError::Invariant("Provider row allocation must be greater than zero".to_owned()));
   }
 
   let PreparedProvider { provider, download, files, mut staged_files } = prepared;
-  let processor = Arc::new(ProviderProcessor::new(d1_client.clone(), provider.clone(), csv_semaphore, runtime, max_rows));
+  let processor = Arc::new(ProviderProcessor::new(d1_client.clone(), provider.clone(), csv_semaphore, runtime, max_rows, cache_extracted_csv, shutdown.clone()));
   let mut csv_tasks = JoinSet::new();
 
   for mut file in files {
     let processor = processor.clone();
     let feed = download.file.clone();
     let initial_line = file.checkpoint.line;
+    let extracted_csv = file.extracted_csv.take();
     csv_tasks.spawn(async move {
-      match processor.process_csv_file(feed, &file.csv_file, &file.table_name, file.db_columns, file.checkpoint).await {
+      match processor.process_csv_file(feed, extracted_csv, &file.csv_file, &file.table_name, file.db_columns, file.checkpoint).await {
         Ok(outcome) => {
           let committed_rows = outcome.checkpoint.line.saturating_sub(initial_line);
           file.checkpoint = outcome.checkpoint;
-          Ok((file, outcome.completion, outcome.write_budget_exhausted, committed_rows))
+          file.extracted_csv = outcome.extracted_csv;
+          Ok((file, outcome.completion, outcome.write_budget_exhausted, outcome.shutdown_requested, committed_rows))
         }
         Err(error) => Err((file.csv_file, error)),
       }
@@ -310,6 +353,7 @@ pub(crate) async fn process_prepared_provider(
 
   let mut has_csv_error = false;
   let mut write_budget_exhausted = false;
+  let mut shutdown_requested = shutdown.is_triggered();
   let mut rows_processed = 0_u64;
   let mut remaining_files = Vec::new();
   while let Some(result) = csv_tasks.join_next().await {
@@ -322,9 +366,10 @@ pub(crate) async fn process_prepared_provider(
         println!("[{}] CSV task join error: {}", provider.name, error);
         has_csv_error = true;
       }
-      Ok(Ok((file, completion, file_write_budget_exhausted, committed_rows))) => {
+      Ok(Ok((file, completion, file_write_budget_exhausted, file_shutdown_requested, committed_rows))) => {
         rows_processed = rows_processed.saturating_add(committed_rows);
         write_budget_exhausted |= file_write_budget_exhausted;
+        shutdown_requested |= file_shutdown_requested;
         match completion {
           CsvFileCompletion::InProgress => remaining_files.push(file),
           CsvFileCompletion::Staged => staged_files.push(StagedFile { csv_file: file.csv_file, table_name: file.table_name }),
@@ -357,9 +402,10 @@ pub(crate) async fn process_prepared_provider(
     }
   }
 
+  shutdown_requested |= shutdown.is_triggered();
   println!("[{}] Completed run. Processed {} logical rows from a {}-row allocation.", provider.name, rows_processed, max_rows);
   let remaining = (!remaining_files.is_empty() || !staged_files.is_empty()).then_some(PreparedProvider { provider, download, files: remaining_files, staged_files });
-  Ok(WaveStepOutcome { remaining, rows_processed, write_budget_exhausted })
+  Ok(WaveStepOutcome { remaining, rows_processed, write_budget_exhausted, shutdown_requested })
 }
 
 #[cfg(test)]

@@ -20,8 +20,7 @@ fi
 echo "→ Parsing $PROVIDERS_FILE and generating $OUTPUT_FILE..."
 
 python3 - << 'EOF'
-import sys, os
-from datetime import datetime
+import sys
 
 try:
     import tomllib
@@ -34,17 +33,6 @@ except ImportError:
 
 PROVIDERS_FILE = "providers.toml"
 OUTPUT_FILE = "wrangler.toml"
-
-old_mappings = {}
-if os.path.exists(OUTPUT_FILE):
-    try:
-        with open(OUTPUT_FILE, "rb") as f:
-            old_data = tomllib.load(f)
-            for db in old_data.get("d1_databases", []):
-                if "database_id" in db and "database_name" in db:
-                    old_mappings[db["database_id"]] = db["database_name"]
-    except Exception as e:
-        print(f"⚠️ Warning: Could not read existing {OUTPUT_FILE}: {e}")
 
 try:
     with open(PROVIDERS_FILE, "rb") as f:
@@ -95,20 +83,12 @@ with open(OUTPUT_FILE, "w") as out:
             continue
 
         db_id = provider.get("database_id", "")
-
-        if db_id and db_id in old_mappings:
-            db_name = old_mappings[db_id]
-        else:
-            today = datetime.utcnow().strftime('%Y%m%d')
-            db_name = f"gtfs-{name}-db-{today}"
-
         binding_name = f"DB_{name.upper().replace('-', '_')}"
 
         env_block = f"""
 # ── {name} ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "{binding_name}"
-database_name = "{db_name}"
 database_id = "{db_id}"
 migrations_dir = "migrations/{name}"
 """

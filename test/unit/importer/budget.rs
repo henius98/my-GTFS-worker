@@ -1,10 +1,6 @@
 use super::*;
 
 impl WorkflowBudget {
-  pub(crate) fn data_remaining(&self) -> u64 {
-    self.data.remaining()
-  }
-
   pub(crate) fn metadata_remaining(&self) -> u64 {
     self.metadata.remaining()
   }

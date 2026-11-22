@@ -33,6 +33,10 @@ impl InMemoryTransport {
     self.push_outcome(Err(D1AttemptError::retryable(D1Error::ApiError(message.to_owned()), retry_after)));
   }
 
+  pub(crate) fn push_write_safe_retryable_error(&self, message: &str, retry_after: Option<Duration>) {
+    self.push_outcome(Err(D1AttemptError::retryable_for_writes(D1Error::ApiError(message.to_owned()), retry_after)));
+  }
+
   pub(crate) fn push_outcome(&self, outcome: InMemoryQueryOutcome) {
     self.responses.lock().unwrap_or_else(PoisonError::into_inner).push_back(outcome);
   }
@@ -272,6 +276,7 @@ fn http_d1_transport_base_url_trims_trailing_slash_and_rejects_empty() -> Result
     d1_query_timeout: Duration::from_secs(1),
     d1_max_query_retries: 3,
     d1_max_retry_delay: Duration::from_secs(30),
+    workflow_max_duration: None,
   };
   let transport = HttpD1Transport::with_base_url("acct".to_owned(), "tok".to_owned(), "http://127.0.0.1:8799/".to_owned(), &runtime)?;
   assert_eq!(transport.d1_url("/db-1/query"), "http://127.0.0.1:8799/client/v4/accounts/acct/d1/database/db-1/query");
@@ -358,5 +363,68 @@ async fn query_rows_honors_configured_max_query_retries() -> Result<(), D1Error>
   let result = client.query_rows("db-1", D1Query { sql: "SELECT 1", params: Vec::new() }).await;
   assert!(matches!(result, Err(D1Error::ApiError(_))));
   assert_eq!(transport.recorded_queries().len(), 2);
+  Ok(())
+}
+
+#[test]
+fn http_status_classification_separates_write_safe_and_ambiguous_errors() {
+  assert_eq!(classify_http_status(StatusCode::TOO_MANY_REQUESTS), RetrySafety::SafeForWrites);
+  assert_eq!(classify_http_status(StatusCode::SERVICE_UNAVAILABLE), RetrySafety::ReadOnly);
+  assert_eq!(classify_http_status(StatusCode::REQUEST_TIMEOUT), RetrySafety::ReadOnly);
+  assert_eq!(classify_http_status(StatusCode::INTERNAL_SERVER_ERROR), RetrySafety::ReadOnly);
+  assert_eq!(classify_http_status(StatusCode::BAD_REQUEST), RetrySafety::Never);
+}
+
+#[tokio::test]
+async fn write_batches_retry_pre_execution_errors_without_double_charging_budget() -> Result<(), D1Error> {
+  let transport = InMemoryTransport::new();
+  transport.push_write_safe_retryable_error("HTTP 429", Some(Duration::ZERO));
+  transport.push_query_response(vec![ok_result(0, Some(2))]);
+  let client = D1Client::with_transport(transport.clone(), 2, 4, 10, 2, Duration::ZERO, Arc::new(SystemClock));
+  let query = D1Query { sql: "INSERT INTO stops__staging VALUES (1)", params: Vec::new() };
+  let usage = client.execute_import_batch("db-1", std::slice::from_ref(&query), 4).await?;
+  assert_eq!(usage.rows_written, 2);
+  assert_eq!(transport.recorded_queries().len(), 2);
+  assert_eq!(client.budget.data_remaining(), 2);
+
+  // Metadata batches also retry write-safe errors (429 / connect) but never retry ambiguous 503s.
+  let meta_transport = InMemoryTransport::new();
+  meta_transport.push_write_safe_retryable_error("HTTP 429", Some(Duration::ZERO));
+  meta_transport.push_query_response(vec![ok_result(0, Some(1))]);
+  meta_transport.push_retryable_error("HTTP 503", Some(Duration::ZERO));
+  let meta_client = D1Client::with_transport(meta_transport.clone(), 2, 10, 20, 2, Duration::ZERO, Arc::new(SystemClock));
+  let reservation = meta_client.reserve_checkpoint().await?;
+  meta_client.save_file_progress(reservation, "db-1", FileProgressUpdate { file: "stops.txt", checkpoint: Checkpoint { line: 1, byte: 10 }, status: FileImportStatus::InProgress }).await?;
+  assert_eq!(meta_transport.recorded_queries().len(), 2);
+  assert_eq!(meta_client.budget.metadata_remaining(), 19);
+
+  let failing_reservation = meta_client.reserve_checkpoint().await?;
+  assert!(
+    meta_client
+      .save_file_progress(failing_reservation, "db-1", FileProgressUpdate { file: "stops.txt", checkpoint: Checkpoint { line: 2, byte: 20 }, status: FileImportStatus::InProgress })
+      .await
+      .is_err()
+  );
+  assert_eq!(meta_transport.recorded_queries().len(), 3);
+  assert_eq!(meta_client.budget.metadata_remaining(), 19 - CHECKPOINT_WRITE_RESERVE);
+  Ok(())
+}
+
+#[tokio::test]
+async fn release_daily_budget_skips_sql_when_zero_writes_remain() -> Result<(), D1Error> {
+  let transport = InMemoryTransport::new();
+  let granted = METADATA_WRITE_RESERVE + LEDGER_WRITE_RESERVE + 4;
+  transport.push_query_response(vec![D1Result { results: vec![serde_json::json!({ "Granted": granted })], meta: Some(D1Meta { rows_read: 1, rows_written: Some(1) }), success: Some(true) }]);
+  transport.push_query_response(vec![ok_result(0, Some(4))]);
+  transport.push_query_response(vec![ok_result(0, Some(METADATA_WRITE_RESERVE))]);
+
+  let mut client = D1Client::with_in_memory(transport.clone(), granted, METADATA_WRITE_RESERVE);
+  assert!(client.acquire_daily_budget("db-1", granted, 100_000).await?);
+  let query = D1Query { sql: "INSERT INTO stops__staging VALUES (1)", params: Vec::new() };
+  client.execute_import_batch("db-1", std::slice::from_ref(&query), 4).await?;
+  client.metadata_batch("db-1", std::slice::from_ref(&query), METADATA_WRITE_RESERVE).await?;
+  assert_eq!(client.budget.unused_writes(), 0);
+  client.release_daily_budget().await?;
+  assert_eq!(transport.recorded_queries().len(), 3);
   Ok(())
 }

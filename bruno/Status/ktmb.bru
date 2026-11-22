@@ -18,7 +18,7 @@ docs {
   Generated from providers.toml by scripts/generate-bruno.py.
   Regenerate with: python3 scripts/generate-bruno.py
   Returns an array of import progress records; an empty array is valid.
-  Fields: FileName, CRC, LastProcessedLine, LastProcessedByte, Status, UpdatedAt.
-  Successful responses are publicly cached for 60 seconds.
-  Errors: 404 for an unbound provider; 500 for a database or response decoding error.
+  Fields: FileName, CRC, LastProcessedLine, LastProcessedByte, Status (0=COMPLETED, 1=IN_PROGRESS, 2=STAGED), UpdatedAt.
+  Successful responses are edge-cached for WORKER_API_CACHE_TTL_SECONDS.
+  Errors: 404 for an unbound provider; 429 on D1 row read limit; 500 for a database or response decoding error.
 }

@@ -389,6 +389,93 @@ pub fn parse_staging_create_statements(sql: &str, staging_suffix: &str) -> BTree
   statements
 }
 
+fn has_without_rowid_option(options: &str) -> bool {
+  let clean = strip_sql_strings(options);
+  let mut prev_without = false;
+  for token in clean.split(|ch: char| ch.is_whitespace() || ch == ',') {
+    if token.is_empty() {
+      continue;
+    }
+    if prev_without && token.eq_ignore_ascii_case("ROWID") {
+      return true;
+    }
+    prev_without = token.eq_ignore_ascii_case("WITHOUT");
+  }
+  false
+}
+
+fn body_has_unique_constraint(body: &str) -> bool {
+  for part in split_top_level_comma(body) {
+    let part = part.trim();
+    if part.is_empty() {
+      continue;
+    }
+    let first_word = part.split_whitespace().next().unwrap_or("");
+    let remainder = if first_word.eq_ignore_ascii_case("UNIQUE") || first_word.to_ascii_uppercase().starts_with("UNIQUE(") {
+      return true;
+    } else if first_word.eq_ignore_ascii_case("CONSTRAINT") {
+      let after_keyword = part[first_word.len()..].trim_start();
+      if let Some(name) = extract_first_identifier(after_keyword) { &after_keyword[name.len()..] } else { after_keyword }
+    } else if let Some(col_name) = extract_first_identifier(part) {
+      &part[col_name.len()..]
+    } else {
+      part
+    };
+    let clean = strip_sql_strings(remainder);
+    if clean.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_').any(|token| token.eq_ignore_ascii_case("UNIQUE")) {
+      return true;
+    }
+  }
+  false
+}
+
+pub fn staging_create_uses_single_btree(create_sql: &str) -> bool {
+  let Some(open_paren_idx) = create_sql.find('(') else {
+    return false;
+  };
+  let body = &create_sql[open_paren_idx + 1..];
+  let mut depth = 1_usize;
+  let mut in_str = false;
+  let mut close_paren_idx = None;
+  let mut chars = body.char_indices().peekable();
+  while let Some((idx, ch)) = chars.next() {
+    match ch {
+      '\'' if !in_str => in_str = true,
+      '\'' if in_str => {
+        if chars.peek().map(|&(_, c)| c) == Some('\'') {
+          chars.next();
+        } else {
+          in_str = false;
+        }
+      }
+      '(' if !in_str => depth += 1,
+      ')' if !in_str => {
+        depth -= 1;
+        if depth == 0 {
+          close_paren_idx = Some(idx);
+          break;
+        }
+      }
+      _ => {}
+    }
+  }
+  let Some(body_end) = close_paren_idx else {
+    return false;
+  };
+  let options = &body[body_end + 1..];
+  has_without_rowid_option(options) && !body_has_unique_constraint(&body[..body_end])
+}
+
+pub fn parse_staging_writes_per_row(sql: &str, staging_suffix: &str) -> BTreeMap<String, u64> {
+  parse_staging_create_statements(sql, staging_suffix)
+    .into_iter()
+    .map(|(table_name, create_sql)| {
+      let writes = if staging_create_uses_single_btree(&create_sql) { 1 } else { 2 };
+      (table_name, writes)
+    })
+    .collect()
+}
+
 #[cfg(test)]
 #[path = "../test/unit/scripts/schema_parser.rs"]
 mod tests;

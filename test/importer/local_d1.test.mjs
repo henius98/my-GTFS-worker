@@ -7,7 +7,14 @@ import zlib from "node:zlib";
 import { execFileSync, spawn } from "node:child_process";
 import { after, before, test } from "node:test";
 import { unstable_startWorker } from "wrangler";
-import { applyLocalD1Migrations, startLocalD1Bridge } from "../../scripts/local-d1-importer.mjs";
+import {
+  applyLocalD1Migrations,
+  parseCliArgs,
+  resetLocalDailyBudget,
+  resolveSelectedBindings,
+  startLocalD1Bridge,
+  validateProviderDatabaseIds,
+} from "../../scripts/local-d1-importer.mjs";
 
 function crc32(buffer) {
   let crc = 0xffffffff;
@@ -123,6 +130,7 @@ function runImporter(extraEnv) {
       D1_API_BASE_URL: bridge.baseUrl,
       PROVIDERS_CONFIG: providersPath,
       D1_CONCURRENCY_LIMIT: "4",
+      D1_DATABASE_CONCURRENCY_LIMIT: "2",
       D1_MAX_DATABASES: "10",
       D1_STATEMENTS_PER_REQUEST: "2",
       D1_DAILY_WRITE_LIMIT: "20000",
@@ -140,6 +148,7 @@ function runImporter(extraEnv) {
       D1_QUERY_TIMEOUT_SECS: "15",
       D1_MAX_QUERY_RETRIES: "2",
       D1_MAX_RETRY_DELAY_SECS: "5",
+      WORKFLOW_MAX_DURATION_SECS: "60",
       ...extraEnv,
     };
     const child = spawn(importerBin, [], { cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"] });
@@ -207,8 +216,9 @@ test("importer advances contiguous checkpoints under tight write budget, resumes
   assert.ok(initialLiveStops.includes("LEGACY"));
 
   // Run 1: Tight daily write budget (2000 metadata + 2 ledger + 88 data writes = 2090).
-  // stop_times.txt has 120 rows in 20-row batches; ordered budget reservation must advance
-  // stop_times.txt contiguously (LastProcessedLine > 0, not stalled at 0) without swapping live tables.
+  // stop_times.txt has 120 rows in 20-row batches; ordered budget reservation + adaptive batching
+  // must advance stop_times.txt contiguously (using all 88 data writes: 7 small rows + 81 stop_times rows)
+  // without swapping live tables.
   const run1 = await runImporter({ D1_DAILY_WRITE_LIMIT: "2090" });
   assert.equal(run1.code, 0, `Run 1 failed:\n${run1.stdout}\n${run1.stderr}`);
   assert.match(run1.stdout, /write budget exhausted: true/);
@@ -226,15 +236,28 @@ test("importer advances contiguous checkpoints under tight write budget, resumes
     .all();
   assert.equal(stopTimesProg1.results.length, 1);
   assert.equal(stopTimesProg1.results[0].Status, 1);
-  assert.ok(stopTimesProg1.results[0].LastProcessedLine > 0, `expected contiguous checkpoint > 0, got ${JSON.stringify(stopTimesProg1.results[0])}`);
+  assert.equal(stopTimesProg1.results[0].LastProcessedLine, 81, `expected all 81 remaining data writes committed, got ${JSON.stringify(stopTimesProg1.results[0])}`);
   assert.ok(stopTimesProg1.results[0].LastProcessedByte > 0, "expected byte checkpoint > 0");
+
+  // Run 1b: Sub-batch remaining budget (+7 data writes < QUERY_STATEMENT_BATCH_SIZE=20) must still commit 7 rows instead of stalling at 0.
+  const budgetRowAfterRun1 = (await db.prepare('SELECT Reserved FROM "0_daily_import_budget" WHERE Id = 1').all()).results[0];
+  const run1bLimit = String(budgetRowAfterRun1.Reserved + 2002 + 7);
+  const run1b = await runImporter({ D1_DAILY_WRITE_LIMIT: run1bLimit });
+  assert.equal(run1b.code, 0, `Run 1b failed:\n${run1b.stdout}\n${run1b.stderr}`);
+  assert.match(run1b.stdout, /write budget exhausted: true/);
+  const stopTimesProg1b = await db
+    .prepare('SELECT LastProcessedLine, LastProcessedByte, Status FROM "0_import_progress" WHERE FileName = ?')
+    .bind("stop_times.txt")
+    .all();
+  assert.equal(stopTimesProg1b.results[0].LastProcessedLine, 88);
+  assert.equal(stopTimesProg1b.results[0].Status, 1);
 
   // Run 2: Raise daily limit to resume from the saved byte checkpoint and commit atomic swap.
   const run2 = await runImporter({ D1_DAILY_WRITE_LIMIT: "20000" });
   assert.equal(run2.code, 0, `Run 2 failed:\n${run2.stdout}\n${run2.stderr}`);
   assert.match(run2.stdout, /Committing atomic swap for 7 table\(s\)/);
   assert.match(run2.stdout, /0 provider\(s\) remain incomplete; write budget exhausted: false/);
-  assert.match(run2.stdout, new RegExp(`Importing stop_times\\.txt into stop_times__staging \\(resuming from row ${stopTimesProg1.results[0].LastProcessedLine}, byte ${stopTimesProg1.results[0].LastProcessedByte}\\)`));
+  assert.match(run2.stdout, new RegExp(`Importing stop_times\\.txt into stop_times__staging \\(resuming from row ${stopTimesProg1b.results[0].LastProcessedLine}, byte ${stopTimesProg1b.results[0].LastProcessedByte}\\)`));
 
   const liveStopsAfterRun2 = await db.prepare("SELECT stop_id FROM stops ORDER BY stop_id").all();
   assert.deepEqual(
@@ -295,4 +318,97 @@ test("importer advances contiguous checkpoints under tight write budget, resumes
   } finally {
     await worker.dispose();
   }
+});
+
+test("local-d1-importer CLI accepts bare -- separator, new debug flags, scopes bindings, and rejects database_id drift", async () => {
+  const parsed = parseCliArgs([
+    "--",
+    "--serve-only",
+    "--reset-budget",
+    "--log-queries",
+    "--provider",
+    "ktmb,rapid-rail-kl",
+    "--daily-write-limit",
+    "250000",
+    "--max-rows",
+    "50000",
+  ]);
+  assert.equal(parsed.serveOnly, true);
+  assert.equal(parsed.resetBudget, true);
+  assert.equal(parsed.logQueries, true);
+  assert.deepEqual(parsed.selectedProviders, ["ktmb", "rapid-rail-kl"]);
+  assert.equal(parsed.dailyWriteLimit, 250000);
+  assert.equal(parsed.maxRows, 50000);
+
+  const statusParsed = parseCliArgs(["--status", "--provider", "rapid-rail-kl"]);
+  assert.equal(statusParsed.status, true);
+  assert.deepEqual(statusParsed.selectedProviders, ["rapid-rail-kl"]);
+
+  assert.throws(() => parseCliArgs(["--daily-write-limit", "0"]), /Invalid --daily-write-limit/);
+  assert.throws(() => parseCliArgs(["--max-rows", "0"]), /Invalid --max-rows/);
+  assert.throws(() => parseCliArgs(["--provider"]), /Missing value for --provider/);
+  assert.throws(() => parseCliArgs(["--status", "--reset"]), /cannot be combined/);
+  assert.throws(() => parseCliArgs(["--status", "--reset-budget"]), /cannot be combined/);
+  assert.throws(() => parseCliArgs(["--status", "--serve-only"]), /cannot be combined/);
+
+  const multiProviders = {
+    budgetProvider: "ktmb",
+    providers: [
+      { name: "ktmb", databaseId: "id-ktmb" },
+      { name: "rapid-rail-kl", databaseId: "id-rail" },
+      { name: "mybas-johor", databaseId: "id-johor" },
+    ],
+  };
+  const multiWrangler = [
+    { binding: "DB_KTMB", databaseName: "gtfs-ktmb", databaseId: "id-ktmb" },
+    { binding: "DB_RAPID_RAIL_KL", databaseName: "gtfs-rail", databaseId: "id-rail" },
+    { binding: "DB_MYBAS_JOHOR", databaseName: "gtfs-johor", databaseId: "id-johor" },
+  ];
+  assert.equal(resolveSelectedBindings(multiProviders, multiWrangler, null), null);
+  assert.deepEqual(resolveSelectedBindings(multiProviders, multiWrangler, ["rapid-rail-kl"]), ["DB_KTMB", "DB_RAPID_RAIL_KL"]);
+  assert.deepEqual(resolveSelectedBindings(multiProviders, multiWrangler, ["ktmb"]), ["DB_KTMB"]);
+
+  assert.throws(
+    () => validateProviderDatabaseIds(providersPath, [{ binding: "DB_KTMB", databaseName: "gtfs-ktmb", databaseId: "different-id" }]),
+    /database_id mismatch/,
+  );
+  assert.throws(
+    () => validateProviderDatabaseIds(providersPath, [{ binding: "DB_KTMB", databaseName: "gtfs-ktmb", databaseId: ktmbDbId }], ["unknown"]),
+    /Unknown provider/,
+  );
+  assert.doesNotThrow(() => validateProviderDatabaseIds(providersPath, [{ binding: "DB_KTMB", databaseName: "gtfs-ktmb", databaseId: ktmbDbId }], ["ktmb"]));
+
+  const checkBridge = await startLocalD1Bridge({ configPath: wranglerConfigPath, persistDir, quiet: true });
+  try {
+    const initialStats = checkBridge.stats();
+    assert.equal(initialStats.rowsRead, 0);
+    assert.equal(initialStats.rowsWritten, 0);
+
+    const resetCount = await resetLocalDailyBudget(checkBridge.databases, { quiet: true });
+    assert.equal(resetCount, 1);
+    const { db } = checkBridge.databases.get(ktmbDbId);
+    const row = (await db.prepare('SELECT DAY, Reserved FROM "0_daily_import_budget" WHERE Id = 1').all()).results[0];
+    assert.deepEqual(row, { DAY: "", Reserved: 0 });
+  } finally {
+    await checkBridge.close();
+  }
+
+  const statusOutput = execFileSync(
+    process.execPath,
+    [
+      path.resolve("scripts/local-d1-importer.mjs"),
+      "--status",
+      "--config",
+      wranglerConfigPath,
+      "--persist-to",
+      persistDir,
+      "--providers",
+      providersPath,
+      "--provider",
+      "ktmb",
+    ],
+    { cwd: process.cwd(), encoding: "utf8" },
+  );
+  assert.match(statusOutput, /\[local-d1\] === DB_KTMB /);
+  assert.doesNotMatch(statusOutput, /DB_RAPID_BUS_KL/);
 });

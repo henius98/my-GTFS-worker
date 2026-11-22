@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 #[path = "../scripts/schema_parser.rs"]
 mod schema_parser;
-use schema_parser::{STAGING_TABLE_SUFFIX, parse_schema_and_primary_keys, parse_staging_create_statements, split_sql_statements};
+use schema_parser::{STAGING_TABLE_SUFFIX, parse_schema_and_primary_keys, parse_staging_create_statements, parse_staging_writes_per_row, split_sql_statements};
 
 fn migration_sort_key(path: &Path) -> (u64, String) {
   let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default().to_owned();
@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let mut generated_code = String::from("match provider_name {\n");
   let mut keys_code = String::from("match (provider_name, table_name) {\n");
   let mut staging_sql_code = String::from("match (provider_name, table_name) {\n");
+  let mut staging_writes_code = String::from("match (provider_name, table_name) {\n");
   let mut base_sql_code = String::from("match provider_name {\n");
   let mut migrations_sql_code = String::from("match provider_name {\n");
 
@@ -66,6 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         staging_sql_code.push_str(&format!("  ({provider_name:?}, {lower:?}) => Some({create_sql:?}),\n"));
       }
 
+      for (table_name, writes_per_row) in parse_staging_writes_per_row(&sql, STAGING_TABLE_SUFFIX) {
+        let lower = table_name.to_ascii_lowercase();
+        staging_writes_code.push_str(&format!("  ({provider_name:?}, {lower:?}) => {writes_per_row},\n"));
+      }
+
       let base_statements = split_sql_statements(&sql);
       if !base_statements.is_empty() {
         base_sql_code.push_str(&format!("  {provider_name:?} => Some("));
@@ -96,12 +102,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   generated_code.push_str("  _ => None,\n}\n");
   keys_code.push_str("  _ => &[],\n}\n");
   staging_sql_code.push_str("  _ => None,\n}\n");
+  staging_writes_code.push_str("  _ => 2,\n}\n");
   base_sql_code.push_str("  _ => None,\n}\n");
   migrations_sql_code.push_str("  _ => None,\n}\n");
 
   fs::write(out_dir.join("schemas.rs"), generated_code)?;
   fs::write(out_dir.join("primary_keys.rs"), keys_code)?;
   fs::write(out_dir.join("staging_schema_sql.rs"), staging_sql_code)?;
+  fs::write(out_dir.join("staging_writes_per_row.rs"), staging_writes_code)?;
   fs::write(out_dir.join("staging_suffix.rs"), format!("{STAGING_TABLE_SUFFIX:?}"))?;
   fs::write(out_dir.join("base_schema_sql.rs"), base_sql_code)?;
   fs::write(out_dir.join("migrations_sql.rs"), migrations_sql_code)?;

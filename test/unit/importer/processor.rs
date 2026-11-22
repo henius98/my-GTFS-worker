@@ -28,6 +28,7 @@ fn test_runtime_config() -> RuntimeConfig {
     d1_query_timeout: Duration::from_secs(1),
     d1_max_query_retries: 3,
     d1_max_retry_delay: Duration::from_secs(30),
+    workflow_max_duration: None,
   }
 }
 
@@ -51,8 +52,8 @@ async fn process_csv_file_inserts_into_staging_and_commits_checkpoint() -> Resul
   transport.push_query_response(vec![ok_write_result(1)]);
 
   let client = D1Client::with_in_memory(transport.clone(), 100, 10);
-  let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 2);
-  let outcome = processor.process_csv_file(feed, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
+  let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 2, false, ShutdownSignal::new());
+  let outcome = processor.process_csv_file(feed, None, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
 
   assert_eq!(outcome.completion, CsvFileCompletion::InProgress);
   assert!(!outcome.write_budget_exhausted);
@@ -73,8 +74,8 @@ async fn process_csv_file_marks_completed_non_empty_file_as_staged() -> Result<(
   transport.push_query_response(vec![ok_write_result(1)]);
 
   let client = D1Client::with_in_memory(transport.clone(), 100, 10);
-  let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10);
-  let outcome = processor.process_csv_file(feed, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
+  let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10, false, ShutdownSignal::new());
+  let outcome = processor.process_csv_file(feed, None, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
 
   assert_eq!(outcome.completion, CsvFileCompletion::Staged);
   assert_eq!(outcome.checkpoint.line, 2);
@@ -93,8 +94,8 @@ async fn process_csv_file_skips_empty_csv_drops_staging_and_marks_completed() ->
   transport.push_query_response(vec![ok_write_result(1), ok_write_result(1)]);
 
   let client = D1Client::with_in_memory(transport.clone(), 100, 10);
-  let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10);
-  let outcome = processor.process_csv_file(feed, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
+  let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10, false, ShutdownSignal::new());
+  let outcome = processor.process_csv_file(feed, None, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
 
   assert_eq!(outcome.completion, CsvFileCompletion::SkippedEmpty);
   assert_eq!(outcome.checkpoint.line, 0);
@@ -116,8 +117,8 @@ async fn process_csv_file_propagates_first_batch_error_and_persists_partial_chec
 
   let runtime = Arc::new(RuntimeConfig { query_statement_batch_size: 1, d1_statements_per_request: 1, d1_database_concurrency_limit: 1, ..test_runtime_config() });
   let client = D1Client::with_in_memory(transport.clone(), 100, 10);
-  let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), runtime, 10);
-  let error = match processor.process_csv_file(feed, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await {
+  let processor = ProviderProcessor::new(client, test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), runtime, 10, false, ShutdownSignal::new());
+  let error = match processor.process_csv_file(feed, None, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await {
     Ok(_) => panic!("failing D1 batch must return an error"),
     Err(error) => error,
   };
@@ -135,11 +136,13 @@ async fn transport_failure_consumes_full_write_reservation() -> Result<(), Box<d
   let feed = TemporaryFeed::from_zip_entry("ambiguous-retry-test", "stops.txt", b"stop_id,stop_name\nS1,Alpha\n")?;
   let transport = InMemoryTransport::new();
   transport.push_retryable_error("injected 503", Some(Duration::ZERO));
-  transport.push_query_response(vec![ok_write_result(1)]);
 
-  let client = D1Client::with_in_memory(transport, 2, 10);
-  let processor = ProviderProcessor::new(client.clone(), test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 1);
-  assert!(processor.process_csv_file(feed, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await.is_err());
+  // ktmb.stops is WITHOUT ROWID (1 write/row); an ambiguous transport failure consumes that 1-write reservation
+  // and skips the no-op checkpoint save because progress did not advance.
+  let client = D1Client::with_in_memory(transport.clone(), 1, 10);
+  let processor = ProviderProcessor::new(client.clone(), test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 1, false, ShutdownSignal::new());
+  assert!(processor.process_csv_file(feed, None, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await.is_err());
+  assert!(!transport.recorded_queries().iter().any(|query| query.sql.starts_with("UPDATE \"0_import_progress\"")));
   let probe = D1Query { sql: "INSERT INTO stops__staging VALUES (1)", params: Vec::new() };
   assert!(matches!(client.execute_import_batch("db-ktmb", &[probe], 1).await, Err(D1Error::WriteBudgetExhausted { requested: 1, remaining: 0 })));
   Ok(())
@@ -149,51 +152,88 @@ async fn transport_failure_consumes_full_write_reservation() -> Result<(), Box<d
 async fn staging_group_shrinks_to_fit_remaining_write_budget_without_overshoot() -> Result<(), Box<dyn std::error::Error>> {
   let feed = TemporaryFeed::from_zip_entry("shrink-budget-test", "stops.txt", b"stop_id,stop_name\nS1,Alpha\nS2,Beta\nS3,Gamma\nS4,Delta\nS5,Epsilon\n")?;
   let transport = InMemoryTransport::new();
-  // Group has 4 statements of 1 row each (estimated 8 writes). Remaining budget is 5 writes:
-  // shrinks to 2 statements (estimated 4 writes, settles to 2 -> 3 remaining), then 1 statement (estimated 2, settles to 1 -> 2 remaining),
-  // then 1 statement (estimated 2, settles to 1 -> 1 remaining), and stops before the 5th row (estimated 2 > 1).
-  transport.push_query_response(vec![ok_write_result(1), ok_write_result(1)]);
-  transport.push_query_response(vec![ok_write_result(1)]);
-  transport.push_query_response(vec![ok_write_result(1)]);
+  // Group has 4 statements of 1 row each (ktmb.stops WITHOUT ROWID -> estimated 4 writes). Remaining budget is 3 writes:
+  // shrinks to 3 statements (estimated 3 writes, settles to 3 -> 0 remaining), and stops before the 4th row (estimated 1 > 0).
+  transport.push_query_response(vec![ok_write_result(1), ok_write_result(1), ok_write_result(1)]);
   transport.push_query_response(vec![ok_write_result(1)]); // save_file_progress
 
   let runtime = Arc::new(RuntimeConfig { query_statement_batch_size: 1, d1_statements_per_request: 4, d1_database_concurrency_limit: 1, ..test_runtime_config() });
-  let client = D1Client::with_in_memory(transport.clone(), 5, 10);
-  let processor = ProviderProcessor::new(client.clone(), test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), runtime, 10);
-  let outcome = processor.process_csv_file(feed, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
+  let client = D1Client::with_in_memory(transport.clone(), 3, 10);
+  let processor = ProviderProcessor::new(client.clone(), test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), runtime, 10, false, ShutdownSignal::new());
+  let outcome = processor.process_csv_file(feed, None, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
 
   assert_eq!(outcome.completion, CsvFileCompletion::InProgress);
   assert!(outcome.write_budget_exhausted);
-  assert_eq!(outcome.checkpoint.line, 4);
-  assert_eq!(client.usage().rows_written, 5);
+  assert_eq!(outcome.checkpoint.line, 3);
+  assert_eq!(client.usage().rows_written, 4);
   Ok(())
 }
 
 #[tokio::test]
 async fn concurrent_upload_reserves_budget_in_file_order_so_tail_cannot_stall_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
-  let feed = TemporaryFeed::from_zip_entry("ordered-budget-test", "stops.txt", b"stop_id,stop_name\nS1,A\nS2,B\nS3,C\nS4,D\nS5,E\nS6,F\nS7,G\n")?;
+  let feed = TemporaryFeed::from_zip_entry("ordered-budget-test", "stops.txt", b"stop_id,stop_name\nS1,A\nS2,B\nS3,C\nS4,D\nS5,E\n")?;
   let transport = InMemoryTransport::new();
-  // Group 0 has 2 statements of 2 rows (estimated 8 writes). Remaining budget is 6 writes:
-  // Group 1 (tail, 3 rows = 6 est writes) must NOT leapfrog Group 0; Group 0 shrinks to 1 statement (2 rows, est 4 -> settles 2 -> 4 left),
-  // then submits its second statement (2 rows, est 4 -> settles 2 -> 2 left), then stops before Group 1 (2 rows, est 4 > 2).
-  transport.push_query_response(vec![ok_write_result(2)]);
+  // Group 0 has 2 statements of 2 rows (ktmb.stops WITHOUT ROWID -> estimated 4 writes). Remaining budget is 3 writes:
+  // Group 1 (tail, 1 row = 1 est write) must NOT leapfrog Group 0; Group 0 shrinks to 1 statement (2 rows, est 2 -> settles 2 -> 1 left),
+  // then stops before its second statement (2 rows, est 2 > 1).
   transport.push_query_response(vec![ok_write_result(2)]);
   transport.push_query_response(vec![ok_write_result(1)]); // save_file_progress
 
   let runtime = Arc::new(RuntimeConfig { query_statement_batch_size: 2, d1_statements_per_request: 2, d1_database_concurrency_limit: 4, ..test_runtime_config() });
-  let client = D1Client::with_in_memory(transport.clone(), 6, 10);
+  let client = D1Client::with_in_memory(transport.clone(), 3, 10);
   let prepared = PreparedProvider {
     provider: test_provider("ktmb", "db-ktmb"),
     download: DownloadedFeed { size: feed.reserved_bytes(), file: feed, remote_etag: "etag-1".to_owned() },
-    files: vec![PreparedFile { csv_file: "stops.txt".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default() }],
+    files: vec![PreparedFile { csv_file: "stops.txt".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default(), extracted_csv: None }],
     staged_files: Vec::new(),
   };
 
-  let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(2)), runtime, 10).await?;
+  let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(2)), runtime, 10, false, ShutdownSignal::new()).await?;
   assert!(outcome.write_budget_exhausted);
-  assert_eq!(outcome.rows_processed, 4);
+  assert_eq!(outcome.rows_processed, 2);
   let remaining = outcome.remaining.ok_or("expected partial provider")?;
-  assert_eq!(remaining.files[0].checkpoint.line, 4);
+  assert_eq!(remaining.files[0].checkpoint.line, 2);
+  Ok(())
+}
+
+#[tokio::test]
+async fn zero_row_budget_exhaustion_skips_noop_checkpoint_update_and_refunds_metadata() -> Result<(), Box<dyn std::error::Error>> {
+  let feed = TemporaryFeed::from_zip_entry("noop-checkpoint-test", "stops.txt", b"stop_id,stop_name\nS1,Alpha\nS2,Beta\n")?;
+  let transport = InMemoryTransport::new();
+  // 0 data writes remain -> exhausts immediately with 0 committed rows and skips checkpoint write.
+  let client = D1Client::with_in_memory(transport.clone(), 0, 6);
+  let processor = ProviderProcessor::new(client.clone(), test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10, false, ShutdownSignal::new());
+  let outcome = processor.process_csv_file(feed, None, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
+
+  assert_eq!(outcome.completion, CsvFileCompletion::InProgress);
+  assert!(outcome.write_budget_exhausted);
+  assert_eq!(outcome.checkpoint, Checkpoint::default());
+  assert!(transport.recorded_queries().is_empty(), "unchanged InProgress checkpoint must not send UPDATE 0_import_progress");
+  // Metadata reservation (6 writes) was settled to 0, so another reserve_checkpoint must still succeed.
+  assert!(client.reserve_checkpoint().await.is_ok());
+  Ok(())
+}
+
+#[tokio::test]
+async fn batch_size_adapts_below_configured_batch_size_when_remaining_write_budget_is_smaller() -> Result<(), Box<dyn std::error::Error>> {
+  let feed = TemporaryFeed::from_zip_entry("adaptive-batch-test", "stops.txt", b"stop_id,stop_name\nS1,Alpha\nS2,Beta\nS3,Gamma\nS4,Delta\nS5,Epsilon\n")?;
+  let transport = InMemoryTransport::new();
+  // Configured batch size is 10 rows, but only 3 data writes remain -> producer caps batch to 3 rows,
+  // commits all 3 rows immediately, saves checkpoint at line 3, and drains data budget to 0.
+  transport.push_query_response(vec![ok_write_result(3)]);
+  transport.push_query_response(vec![ok_write_result(1)]); // save_file_progress
+  let client = D1Client::with_in_memory(transport.clone(), 3, 10);
+  let processor = ProviderProcessor::new(client.clone(), test_provider("ktmb", "db-ktmb"), Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10, false, ShutdownSignal::new());
+  let outcome = processor.process_csv_file(feed, None, "stops.txt", "stops", &["stop_id", "stop_name"], Checkpoint::default()).await?;
+
+  assert_eq!(outcome.completion, CsvFileCompletion::InProgress);
+  assert!(outcome.write_budget_exhausted);
+  assert_eq!(outcome.checkpoint.line, 3);
+  assert_eq!(client.remaining_data_writes(), 0);
+  let recorded = transport.recorded_queries();
+  assert_eq!(recorded.len(), 2);
+  assert!(recorded[0].sql.starts_with("INSERT INTO \"stops__staging\""));
+  assert_eq!(recorded[0].params[0], serde_json::json!(r#"[["S1","Alpha"],["S2","Beta"],["S3","Gamma"]]"#));
   Ok(())
 }
 
@@ -320,13 +360,13 @@ async fn process_prepared_provider_commits_atomic_swap_and_preserves_empty_table
     provider: test_provider("ktmb", "db-ktmb"),
     download,
     files: vec![
-      PreparedFile { csv_file: "routes.txt".to_owned(), table_name: "routes".to_owned(), db_columns: &["route_id", "route_short_name"], checkpoint: Checkpoint::default() },
-      PreparedFile { csv_file: "stops.txt".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default() },
+      PreparedFile { csv_file: "routes.txt".to_owned(), table_name: "routes".to_owned(), db_columns: &["route_id", "route_short_name"], checkpoint: Checkpoint::default(), extracted_csv: None },
+      PreparedFile { csv_file: "stops.txt".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default(), extracted_csv: None },
     ],
     staged_files: vec![StagedFile { csv_file: "agency.txt".to_owned(), table_name: "agency".to_owned() }],
   };
 
-  let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(2)), Arc::new(test_runtime_config()), 10).await?;
+  let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(2)), Arc::new(test_runtime_config()), 10, false, ShutdownSignal::new()).await?;
   assert!(outcome.remaining.is_none());
   assert_eq!(outcome.rows_processed, 1);
   assert!(!outcome.write_budget_exhausted);
@@ -353,11 +393,11 @@ async fn swap_succeeds_from_metadata_reserve_even_when_data_budget_is_exhausted(
   let prepared = PreparedProvider {
     provider: test_provider("ktmb", "db-ktmb"),
     download: DownloadedFeed { size: feed.reserved_bytes(), file: feed, remote_etag: "etag-2".to_owned() },
-    files: vec![PreparedFile { csv_file: "stops.txt".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default() }],
+    files: vec![PreparedFile { csv_file: "stops.txt".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default(), extracted_csv: None }],
     staged_files: Vec::new(),
   };
 
-  let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10).await?;
+  let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10, false, ShutdownSignal::new()).await?;
   assert!(!outcome.write_budget_exhausted);
   assert!(outcome.remaining.is_none());
   let recorded = transport.recorded_queries();
@@ -376,11 +416,11 @@ async fn swap_defers_cleanly_when_metadata_budget_is_exhausted() -> Result<(), B
   let prepared = PreparedProvider {
     provider: test_provider("ktmb", "db-ktmb"),
     download: DownloadedFeed { size: feed.reserved_bytes(), file: feed, remote_etag: "etag-2".to_owned() },
-    files: vec![PreparedFile { csv_file: "stops.txt".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default() }],
+    files: vec![PreparedFile { csv_file: "stops.txt".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default(), extracted_csv: None }],
     staged_files: Vec::new(),
   };
 
-  let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10).await?;
+  let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10, false, ShutdownSignal::new()).await?;
   assert!(outcome.write_budget_exhausted);
   let remaining = outcome.remaining.ok_or("expected deferred staged swap")?;
   assert!(remaining.files.is_empty());
@@ -388,5 +428,100 @@ async fn swap_defers_cleanly_when_metadata_budget_is_exhausted() -> Result<(), B
   let recorded = transport.recorded_queries();
   assert!(!recorded.iter().any(|query| query.sql == "DROP TABLE IF EXISTS \"stops\""));
   assert!(!recorded.iter().any(|query| query.sql.starts_with("INSERT INTO \"0_dataset_versions\"")));
+  Ok(())
+}
+
+#[tokio::test]
+async fn process_prepared_provider_preserves_remaining_work_when_shutdown_is_triggered() -> Result<(), Box<dyn std::error::Error>> {
+  let feed = TemporaryFeed::from_zip_entry("shutdown-provider-test", "stops.txt", b"stop_id,stop_name\nS1,Alpha\nS2,Beta\n")?;
+  let transport = InMemoryTransport::new();
+  let client = D1Client::with_in_memory(transport.clone(), 100, 100);
+  let prepared = PreparedProvider {
+    provider: test_provider("ktmb", "db-ktmb"),
+    download: DownloadedFeed { size: feed.reserved_bytes(), file: feed, remote_etag: "etag-1".to_owned() },
+    files: vec![PreparedFile { csv_file: "stops.txt".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default(), extracted_csv: None }],
+    staged_files: Vec::new(),
+  };
+  let shutdown = ShutdownSignal::new();
+  shutdown.trigger();
+
+  let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(1)), Arc::new(test_runtime_config()), 10, false, shutdown).await?;
+  assert!(outcome.shutdown_requested);
+  assert_eq!(outcome.rows_processed, 0);
+  assert!(outcome.remaining.is_some());
+  assert!(transport.recorded_queries().is_empty());
+  Ok(())
+}
+
+#[tokio::test]
+async fn per_database_concurrency_limit_caps_in_flight_batches_below_global_limit() -> Result<(), Box<dyn std::error::Error>> {
+  use crate::budget::SystemClock;
+  use crate::d1::{BoxFuture, D1AttemptError, D1Transport};
+  use std::sync::atomic::AtomicUsize;
+
+  struct ConcurrencyMeasuringTransport {
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+  }
+  impl D1Transport for ConcurrencyMeasuringTransport {
+    fn query<'a>(&'a self, _db_id: &'a str, _query: &'a D1Query<'a>) -> BoxFuture<'a, Result<Vec<D1Result>, D1AttemptError>> {
+      Box::pin(async { Ok(vec![ok_write_result(1)]) })
+    }
+    fn query_batch<'a>(&'a self, _db_id: &'a str, queries: &'a [D1Query<'a>]) -> BoxFuture<'a, Result<Vec<D1Result>, D1AttemptError>> {
+      Box::pin(async move {
+        let is_insert = queries.iter().any(|query| query.sql.starts_with("INSERT INTO \""));
+        if is_insert {
+          let active = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+          self.max_in_flight.fetch_max(active, Ordering::SeqCst);
+          tokio::time::sleep(Duration::from_millis(15)).await;
+          self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(queries.iter().map(|_| ok_write_result(1)).collect())
+      })
+    }
+    fn get_database_info<'a>(&'a self, _db_id: &'a str) -> BoxFuture<'a, Result<D1DatabaseInfo, D1Error>> {
+      Box::pin(async { Ok(D1DatabaseInfo { name: String::new(), file_size: 0 }) })
+    }
+    fn get_database_count<'a>(&'a self) -> BoxFuture<'a, Result<u64, D1Error>> {
+      Box::pin(async { Ok(1) })
+    }
+    fn create_database<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, Result<String, D1Error>> {
+      Box::pin(async { Ok(String::new()) })
+    }
+    fn delete_database<'a>(&'a self, _db_id: &'a str) -> BoxFuture<'a, Result<(), D1Error>> {
+      Box::pin(async { Ok(()) })
+    }
+  }
+
+  let feed = TemporaryFeed::from_zip_entries(
+    "per-db-cap-test",
+    &[("stops.txt", b"stop_id,stop_name\nS1,A\nS2,B\nS3,C\nS4,D\nS5,E\nS6,F\n"), ("routes.txt", b"route_id,route_short_name\nR1,A\nR2,B\nR3,C\nR4,D\nR5,E\nR6,F\n")],
+  )?;
+  let transport = Arc::new(ConcurrencyMeasuringTransport { in_flight: AtomicUsize::new(0), max_in_flight: AtomicUsize::new(0) });
+  // Global D1 concurrency = 8, per-database concurrency = 2.
+  let client = D1Client::with_transport(transport.clone(), 8, 1_000, 1_000, 1, Duration::from_secs(1), Arc::new(SystemClock));
+  let runtime = Arc::new(RuntimeConfig {
+    csv_concurrency_limit: 4,
+    d1_global_concurrency_limit: 8,
+    d1_database_concurrency_limit: 2,
+    query_statement_batch_size: 1,
+    d1_statements_per_request: 1,
+    ..test_runtime_config()
+  });
+  let prepared = PreparedProvider {
+    provider: test_provider("ktmb", "db-ktmb"),
+    download: DownloadedFeed { size: feed.reserved_bytes(), file: feed, remote_etag: "etag-1".to_owned() },
+    files: vec![
+      PreparedFile { csv_file: "stops.txt".to_owned(), table_name: "stops".to_owned(), db_columns: &["stop_id", "stop_name"], checkpoint: Checkpoint::default(), extracted_csv: None },
+      PreparedFile { csv_file: "routes.txt".to_owned(), table_name: "routes".to_owned(), db_columns: &["route_id", "route_short_name"], checkpoint: Checkpoint::default(), extracted_csv: None },
+    ],
+    staged_files: Vec::new(),
+  };
+
+  let outcome = process_prepared_provider(&client, prepared, Arc::new(tokio::sync::Semaphore::new(4)), runtime, 100, false, ShutdownSignal::new()).await?;
+  assert!(outcome.remaining.is_none());
+  assert_eq!(outcome.rows_processed, 12);
+  let peak = transport.max_in_flight.load(Ordering::SeqCst);
+  assert!((1..=2).contains(&peak), "expected per-database peak concurrency in 1..=2, observed {peak}");
   Ok(())
 }

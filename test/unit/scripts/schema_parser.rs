@@ -176,3 +176,37 @@ fn test_parse_staging_create_statements_rewrites_table_name_and_preserves_option
   assert!(!stop_times_sql.contains("IF NOT EXISTS"));
   assert_eq!(staging.get("no_space").map(String::as_str), Some("CREATE TABLE \"no_space__staging\"(id INTEGER PRIMARY KEY) STRICT"));
 }
+
+#[test]
+fn test_parse_staging_writes_per_row_distinguishes_without_rowid_and_indexed_tables() {
+  let sql = r#"
+    CREATE TABLE IF NOT EXISTS stops (
+      stop_id TEXT PRIMARY KEY,
+      unique_code TEXT,
+      note TEXT DEFAULT 'UNIQUE'
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS strict_table (
+      id TEXT PRIMARY KEY,
+      val TEXT
+    ) WITHOUT ROWID, STRICT;
+    CREATE TABLE IF NOT EXISTS with_unique_col (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS with_unique_constraint (
+      id TEXT PRIMARY KEY,
+      code TEXT,
+      CONSTRAINT uq_code UNIQUE (code)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS rowid_table (
+      id TEXT PRIMARY KEY,
+      val TEXT
+    );
+  "#;
+  let writes = parse_staging_writes_per_row(sql, STAGING_TABLE_SUFFIX);
+  assert_eq!(writes.get("stops"), Some(&1));
+  assert_eq!(writes.get("strict_table"), Some(&1));
+  assert_eq!(writes.get("with_unique_col"), Some(&2));
+  assert_eq!(writes.get("with_unique_constraint"), Some(&2));
+  assert_eq!(writes.get("rowid_table"), Some(&2));
+}

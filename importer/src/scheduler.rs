@@ -1,4 +1,5 @@
 use crate::error::ProcessorError;
+use crate::workflow::ShutdownSignal;
 use std::future::Future;
 use tokio::task::JoinSet;
 
@@ -10,20 +11,29 @@ pub(crate) struct WaveStepOutcome<P> {
   pub(crate) remaining: Option<P>,
   pub(crate) rows_processed: u64,
   pub(crate) write_budget_exhausted: bool,
+  pub(crate) shutdown_requested: bool,
 }
 
 pub(crate) struct WaveScheduleSummary<P> {
   pub(crate) total_rows_processed: u64,
   pub(crate) remaining_providers: Vec<P>,
   pub(crate) write_budget_exhausted: bool,
+  pub(crate) shutdown_requested: bool,
   pub(crate) has_error: bool,
   pub(crate) waves_executed: u64,
 }
 
-pub(crate) async fn run_waves<P, E, F, Fut>(mut prepared: Vec<P>, max_rows_per_workflow: u64, mut run_provider_wave: F) -> Result<WaveScheduleSummary<P>, ProcessorError>
+pub(crate) async fn run_waves<P, E, C, F, Fut>(
+  mut prepared: Vec<P>,
+  max_rows_per_workflow: u64,
+  shutdown: &ShutdownSignal,
+  mut wave_write_cap: C,
+  mut run_provider_wave: F,
+) -> Result<WaveScheduleSummary<P>, ProcessorError>
 where
   P: NamedWorkItem,
   E: std::fmt::Display + Send + 'static,
+  C: FnMut() -> Option<u64>,
   F: FnMut(P, u64) -> Fut,
   Fut: Future<Output = Result<WaveStepOutcome<P>, E>> + Send + 'static,
 {
@@ -39,11 +49,16 @@ where
   let mut total_rows_processed = 0_u64;
   let mut wave = 0_u64;
   let mut write_budget_exhausted = false;
+  let mut shutdown_requested = shutdown.is_triggered();
 
-  while !pending.is_empty() && remaining_budget != 0 {
+  while !pending.is_empty() && remaining_budget != 0 && !shutdown_requested {
     wave += 1;
-    let row_limits = fair_row_limits(remaining_budget, pending.len());
-    let allocated_this_wave = row_limits.iter().sum::<u64>();
+    let pending_count = u64::try_from(pending.len()).unwrap_or(u64::MAX);
+    let wave_cap = match wave_write_cap() {
+      Some(writes_remaining) => remaining_budget.min(writes_remaining.max(pending_count)),
+      None => remaining_budget,
+    };
+    let row_limits = fair_row_limits(wave_cap, pending.len());
     let mut processing_tasks = JoinSet::new();
     let mut next_pending = Vec::new();
     for (prepared_provider, max_rows) in pending.into_iter().zip(row_limits) {
@@ -70,6 +85,7 @@ where
           }
           processed_this_wave = processed_this_wave.saturating_add(outcome.rows_processed.min(max_rows));
           write_budget_exhausted |= outcome.write_budget_exhausted;
+          shutdown_requested |= outcome.shutdown_requested;
           if let Some(provider) = outcome.remaining {
             next_pending.push(provider);
           }
@@ -85,6 +101,7 @@ where
       }
     }
 
+    shutdown_requested |= shutdown.is_triggered();
     total_rows_processed = total_rows_processed.saturating_add(processed_this_wave);
     remaining_budget = max_rows_per_workflow.saturating_sub(total_rows_processed);
     next_pending.sort_by(|left, right| left.name().cmp(right.name()));
@@ -93,19 +110,27 @@ where
     if has_error {
       break;
     }
+    if !write_budget_exhausted && !pending.is_empty() && wave_write_cap() == Some(0) {
+      write_budget_exhausted = true;
+    }
     if write_budget_exhausted {
       println!("D1 workflow write budget reached; preserving checkpoints for the next scheduled run");
       break;
     }
-    if processed_this_wave >= allocated_this_wave {
+    if shutdown_requested {
+      println!("Graceful shutdown requested; preserving checkpoints for the next scheduled run");
       break;
     }
-    if !pending.is_empty() && remaining_budget != 0 {
-      println!("Redistributing {remaining_budget} unused workflow rows across {} provider(s) with pending work", pending.len());
+    if processed_this_wave == 0 || remaining_budget == 0 {
+      break;
+    }
+    if !pending.is_empty() {
+      let next_budget = wave_write_cap().map_or(remaining_budget, |writes| remaining_budget.min(writes));
+      println!("Redistributing {next_budget} unused workflow rows across {} provider(s) with pending work", pending.len());
     }
   }
 
-  Ok(WaveScheduleSummary { total_rows_processed, remaining_providers: pending, write_budget_exhausted, has_error, waves_executed: wave })
+  Ok(WaveScheduleSummary { total_rows_processed, remaining_providers: pending, write_budget_exhausted, shutdown_requested, has_error, waves_executed: wave })
 }
 
 pub(crate) fn fair_row_limits(total: u64, consumers: usize) -> Vec<u64> {

@@ -22,5 +22,5 @@ docs {
   Returns the provider network as a GeoJSON FeatureCollection.
   Enable route_id to fetch one route and its stops; an unknown route returns 404.
   LineString features represent route shapes or straight stop-to-stop segments;
-  Point features represent stops. Successful responses are cached for five minutes.
+  Point features represent stops. Successful responses are edge-cached for WORKER_FEED_CACHE_TTL_SECONDS.
 }

@@ -4,10 +4,11 @@ This document serves as the single source of truth for architectural patterns an
 
 ## 1. System Architecture
 
-The application is a Cargo Workspace containing two distinct environments:
+The application is a Cargo Workspace containing three crates:
 
-- **`worker/`**: Cloudflare Worker (Wasm). A unified worker that dynamically routes to specific databases via the `/<provider>/status` API endpoints.
-- **`importer/`**: GitHub Actions standalone CLI. Connects directly to Cloudflare D1 via HTTP APIs to ingest ZIP/CSV GTFS files concurrently.
+- **`worker/`**: Cloudflare Worker (Wasm). A unified worker that dynamically routes requests to per-provider D1 databases (`DB_<PROVIDER>`) across `/`, `/<provider>/status`, `/<provider>/data/<table>`, `/<provider>/sql`, `/<provider>/departures`, and `/<provider>/map`.
+- **`importer/`**: GitHub Actions standalone CLI. Connects directly to Cloudflare D1 via HTTP APIs to ingest ZIP/CSV GTFS files concurrently into `<table_name>__staging` tables under a shared daily write ledger (`0_daily_import_budget`), then commits atomic table swaps once all provider files finish staging.
+- **`test/`** (`gtfs-checks`): Single crate housing all integration tests, migration/live-feed validators, and benchmarks, alongside out-of-line unit tests under `test/unit/`.
 
 ## 2. Eval-Driven Development (EDD) & Test Organization
 
@@ -20,12 +21,12 @@ The application is a Cargo Workspace containing two distinct environments:
 - Agents deploying or configuring databases must utilize the unified `./scripts/deploy.sh` orchestrator which provisions D1, creates empty migration folders (if missing), and triggers `scripts/generate-wrangler.sh`.
 - `providers.toml` is the absolute source of truth.
 - Do not edit `wrangler.toml` directly, it is auto-generated.
-- **Schema Modifications**: The `importer/build.rs` script parses `0_gtfs_schema.sql` at **compile time**. To add a new table or column, agents MUST do both:
-  1. Update `0_gtfs_schema.sql` so the Rust compiler statically maps the new CSV columns.
-  2. Create a _new_ D1 migration file (`npx wrangler d1 migrations create DB_<PROVIDER> <name>`) to actually execute the `ALTER TABLE` in production, as D1 ignores modifications to already-applied migrations.
+- **Schema Modifications**: Both `importer/build.rs` and `worker/build.rs` parse `migrations/<provider>/0_gtfs_schema.sql` at **compile time** via `scripts/schema_parser.rs`. To add a new table or column, agents MUST do both:
+  1. Update `migrations/<provider>/0_gtfs_schema.sql` so the importer compiles the CSV columns, primary keys, staging table DDL, and base schema, and the worker validates `/data` and `/map` columns.
+  2. Create a _new_ D1 migration file (`npx wrangler d1 migrations create DB_<PROVIDER> <name>`) to actually execute the `ALTER TABLE` or table recreation in production, as D1 ignores modifications to already-applied migrations.
 
 ## 4. Architectural Patterns & Concurrency
 
-- **Compile-Time Schema Discovery**: The importer avoids runtime `PRAGMA table_info()` queries by generating static Rust arrays via `build.rs` to map CSV headers to database columns safely.
+- **Compile-Time Schema Discovery**: Both `importer` and `worker` avoid runtime `PRAGMA table_info()` queries by generating static Rust maps via `build.rs` and the shared `scripts/schema_parser.rs`.
 - **Decoupled Async/Blocking Work**: Never run heavy CPU tasks (e.g., ZIP decompression, CSV parsing, or massive JSON serialization) directly on the `tokio` async executor. Always use `tokio::task::spawn_blocking` coupled with an MPSC channel to stream data back to the async thread.
-- **Global Concurrency Limits**: Rely on `Arc<Semaphore>` across providers and tasks to bound memory (e.g., parsing large ZIP files). D1 batch queries are similarly bounded via config limits (`D1_CONCURRENCY_LIMIT`) to prevent 429 rate limiting.
+- **Global & Per-Database Concurrency Limits**: Rely on `Arc<Semaphore>` across providers and tasks to bound CPU/memory (CSV producers) and D1 batch traffic via `D1_CONCURRENCY_LIMIT` and `D1_DATABASE_CONCURRENCY_LIMIT` to prevent 429 rate limiting, paired with wave-based row/write budgeting.

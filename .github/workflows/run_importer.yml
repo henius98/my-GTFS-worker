@@ -50,6 +50,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           D1_CONCURRENCY_LIMIT: ${{ vars.D1_CONCURRENCY_LIMIT }}
+          D1_DATABASE_CONCURRENCY_LIMIT: ${{ vars.D1_DATABASE_CONCURRENCY_LIMIT }}
           D1_MAX_DATABASES: ${{ vars.D1_MAX_DATABASES }}
           D1_STATEMENTS_PER_REQUEST: ${{ vars.D1_STATEMENTS_PER_REQUEST }}
           D1_DAILY_WRITE_LIMIT: ${{ vars.D1_DAILY_WRITE_LIMIT }}
@@ -67,6 +68,7 @@ jobs:
           D1_QUERY_TIMEOUT_SECS: ${{ vars.D1_QUERY_TIMEOUT_SECS }}
           D1_MAX_QUERY_RETRIES: ${{ vars.D1_MAX_QUERY_RETRIES }}
           D1_MAX_RETRY_DELAY_SECS: ${{ vars.D1_MAX_RETRY_DELAY_SECS }}
+          WORKFLOW_MAX_DURATION_SECS: ${{ vars.WORKFLOW_MAX_DURATION_SECS }}
         run: ./importer_bin
 
       - name: Check for Database Rotation

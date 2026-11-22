@@ -177,6 +177,10 @@ impl WorkflowBudget {
     self.daily_lease.as_ref().is_some_and(|lease| lease.database_id == database_id)
   }
 
+  pub(crate) fn data_remaining(&self) -> u64 {
+    self.data.remaining()
+  }
+
   pub(crate) fn unused_writes(&self) -> u64 {
     self.data.remaining() + self.metadata.remaining()
   }

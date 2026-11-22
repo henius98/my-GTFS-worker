@@ -6,9 +6,56 @@ use crate::processor;
 use crate::rotation::DatabaseRotator;
 use crate::scheduler;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::sync::{
+  Arc,
+  atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
+
+#[derive(Clone, Default)]
+pub struct ShutdownSignal {
+  triggered: Arc<AtomicBool>,
+  notify: Arc<Notify>,
+}
+
+impl ShutdownSignal {
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  pub fn trigger(&self) {
+    if !self.triggered.swap(true, Ordering::SeqCst) {
+      self.notify.notify_waiters();
+    }
+  }
+
+  pub fn is_triggered(&self) -> bool {
+    self.triggered.load(Ordering::Relaxed)
+  }
+
+  pub async fn wait(&self) {
+    loop {
+      let notified = self.notify.notified();
+      tokio::pin!(notified);
+      let _ = notified.as_mut().enable();
+      if self.triggered.load(Ordering::Acquire) {
+        return;
+      }
+      notified.await;
+    }
+  }
+}
+
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+  fn drop(&mut self) {
+    if let Some(handle) = self.0.take() {
+      handle.abort();
+    }
+  }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowSummary {
@@ -16,6 +63,7 @@ pub struct WorkflowSummary {
   pub total_rows_processed: u64,
   pub remaining_providers: usize,
   pub write_budget_exhausted: bool,
+  pub shutdown_requested: bool,
   pub has_error: bool,
   pub waves_executed: u64,
   pub usage: D1Usage,
@@ -24,13 +72,55 @@ pub struct WorkflowSummary {
 pub async fn run_import(
   providers: ProvidersToml,
   runtime: Arc<RuntimeConfig>,
-  mut d1_client: D1Client,
+  d1_client: D1Client,
   feed_fetcher: Arc<dyn FeedFetcher>,
   providers_path: impl Into<PathBuf>,
 ) -> Result<WorkflowSummary, ProcessorError> {
+  run_import_with_shutdown(providers, runtime, d1_client, feed_fetcher, providers_path, ShutdownSignal::new()).await
+}
+
+pub async fn run_import_with_shutdown(
+  providers: ProvidersToml,
+  runtime: Arc<RuntimeConfig>,
+  mut d1_client: D1Client,
+  feed_fetcher: Arc<dyn FeedFetcher>,
+  providers_path: impl Into<PathBuf>,
+  shutdown: ShutdownSignal,
+) -> Result<WorkflowSummary, ProcessorError> {
+  let _deadline_guard = AbortOnDrop(runtime.workflow_max_duration.map(|max_duration| {
+    let deadline_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+      tokio::time::sleep(max_duration).await;
+      println!("Workflow soft duration limit ({}s) reached; draining in-flight batches and saving checkpoints", max_duration.as_secs());
+      deadline_shutdown.trigger();
+    })
+  }));
+
+  if shutdown.is_triggered() {
+    return Ok(WorkflowSummary {
+      deferred: false,
+      total_rows_processed: 0,
+      remaining_providers: 0,
+      write_budget_exhausted: false,
+      shutdown_requested: true,
+      has_error: false,
+      waves_executed: 0,
+      usage: d1_client.usage(),
+    });
+  }
+
   let budget_database_id = providers.budget_database()?.database_id.clone();
   if !d1_client.acquire_daily_budget(&budget_database_id, runtime.d1_daily_write_limit, runtime.d1_daily_write_limit).await? {
-    return Ok(WorkflowSummary { deferred: true, total_rows_processed: 0, remaining_providers: 0, write_budget_exhausted: false, has_error: false, waves_executed: 0, usage: d1_client.usage() });
+    return Ok(WorkflowSummary {
+      deferred: true,
+      total_rows_processed: 0,
+      remaining_providers: 0,
+      write_budget_exhausted: false,
+      shutdown_requested: shutdown.is_triggered(),
+      has_error: false,
+      waves_executed: 0,
+      usage: d1_client.usage(),
+    });
   }
 
   let csv_semaphore = Arc::new(Semaphore::new(runtime.csv_concurrency_limit));
@@ -39,8 +129,9 @@ pub async fn run_import(
   let rotator = DatabaseRotator::new(d1_client.clone(), providers_path, runtime.db_size_threshold_bytes, runtime.d1_max_databases);
   let mut preparation_tasks = JoinSet::new();
 
+  let soft_duration_label = runtime.workflow_max_duration.map_or_else(|| "none".to_owned(), |duration| format!("{}s", duration.as_secs()));
   println!(
-    "Importer limits: {} logical workflow rows, {} daily D1 write limit, {} CSV producers, {} global D1 requests, {} request(s) per database, {} rows per statement, {} statements per request, {} databases, {}-byte downloads, {} uncompressed bytes/feed, {} archive entries/feed, {} bytes/CSV record, {} bytes/statement, {} bytes temporary feed storage, {} read retries (max {}s delay)",
+    "Importer limits: {} logical workflow rows, {} daily D1 write limit, {} CSV producers, {} global D1 requests, {} request(s) per database, {} rows per statement, {} statements per request, {} databases, {}-byte downloads, {} uncompressed bytes/feed, {} archive entries/feed, {} bytes/CSV record, {} bytes/statement, {} bytes temporary feed storage, {} retries (max {}s delay), soft duration limit {}",
     runtime.max_rows_per_workflow,
     runtime.d1_daily_write_limit,
     runtime.csv_concurrency_limit,
@@ -57,6 +148,7 @@ pub async fn run_import(
     runtime.max_temp_feed_storage_bytes,
     runtime.d1_max_query_retries,
     runtime.d1_max_retry_delay.as_secs(),
+    soft_duration_label,
   );
 
   for provider in providers.providers {
@@ -68,7 +160,11 @@ pub async fn run_import(
     let client = d1_client.clone();
     let rotator = rotator.clone();
     let feed_store = feed_store.clone();
+    let prep_shutdown = shutdown.clone();
     preparation_tasks.spawn(async move {
+      if prep_shutdown.is_triggered() {
+        return (provider.name, Ok(None));
+      }
       let provider_name = provider.name.clone();
       println!("[{provider_name}] Preparing provider");
       let result = processor::prepare_provider(&client, &rotator, &feed_store, provider).await;
@@ -93,25 +189,42 @@ pub async fn run_import(
     }
   }
 
-  let schedule = scheduler::run_waves(prepared, runtime.max_rows_per_workflow, |prepared_provider, max_rows| {
-    let client = d1_client.clone();
-    let csv_sem = csv_semaphore.clone();
-    let runtime = runtime.clone();
-    async move { processor::process_prepared_provider(&client, prepared_provider, csv_sem, runtime, max_rows).await }
-  })
+  let cache_extracted_csv = prepared.len() > 1;
+  let wave_budget_client = d1_client.clone();
+  let schedule = scheduler::run_waves(
+    prepared,
+    runtime.max_rows_per_workflow,
+    &shutdown,
+    || Some(wave_budget_client.remaining_data_writes()),
+    |prepared_provider, max_rows| {
+      let client = d1_client.clone();
+      let csv_sem = csv_semaphore.clone();
+      let runtime = runtime.clone();
+      let wave_shutdown = shutdown.clone();
+      async move { processor::process_prepared_provider(&client, prepared_provider, csv_sem, runtime, max_rows, cache_extracted_csv, wave_shutdown).await }
+    },
+  )
   .await?;
 
   let has_error = preparation_has_error || schedule.has_error;
+  let shutdown_requested = schedule.shutdown_requested || shutdown.is_triggered();
   println!(
-    "Workflow logical-row budget: processed {} of {} rows; {} provider(s) remain incomplete; write budget exhausted: {}",
+    "Workflow logical-row budget: processed {} of {} rows; {} provider(s) remain incomplete; write budget exhausted: {}; shutdown requested: {}",
     schedule.total_rows_processed,
     runtime.max_rows_per_workflow,
     schedule.remaining_providers.len(),
-    schedule.write_budget_exhausted
+    schedule.write_budget_exhausted,
+    shutdown_requested,
   );
 
-  if !has_error {
-    d1_client.release_daily_budget().await?;
+  // Release any provably unused daily writes even if a provider failed; unsettled
+  // write reservations already deducted their worst-case estimates on drop.
+  if let Err(error) = d1_client.release_daily_budget().await {
+    if has_error {
+      println!("Failed to release unused daily D1 budget after workflow error: {error}");
+    } else {
+      return Err(error.into());
+    }
   }
   let usage = d1_client.usage();
   println!("D1 query metadata for this workflow: {} rows read, {} rows written", usage.rows_read, usage.rows_written);
@@ -121,6 +234,7 @@ pub async fn run_import(
     total_rows_processed: schedule.total_rows_processed,
     remaining_providers: schedule.remaining_providers.len(),
     write_budget_exhausted: schedule.write_budget_exhausted,
+    shutdown_requested,
     has_error,
     waves_executed: schedule.waves_executed,
     usage,
