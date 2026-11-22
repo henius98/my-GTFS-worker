@@ -216,9 +216,9 @@ test("importer advances contiguous checkpoints under tight write budget, resumes
   assert.ok(initialLiveStops.includes("LEGACY"));
 
   // Run 1: Tight daily write budget (2000 metadata + 2 ledger + 88 data writes = 2090).
-  // stop_times.txt has 120 rows in 20-row batches; ordered budget reservation + adaptive batching
-  // must advance stop_times.txt contiguously (using all 88 data writes: 7 small rows + 81 stop_times rows)
-  // without swapping live tables.
+  // All 7 CSV files run concurrently against the shared 88-write data budget; ordered budget reservation
+  // + adaptive batching must commit all 88 data writes contiguously (with stop_times.txt taking 81..88 rows
+  // depending on how many of the 7 small-file rows run first) without swapping live tables.
   const run1 = await runImporter({ D1_DAILY_WRITE_LIMIT: "2090" });
   assert.equal(run1.code, 0, `Run 1 failed:\n${run1.stdout}\n${run1.stderr}`);
   assert.match(run1.stdout, /write budget exhausted: true/);
@@ -230,34 +230,42 @@ test("importer advances contiguous checkpoints under tight write budget, resumes
     "live stops must remain untouched until every file completes staging",
   );
 
-  const stopTimesProg1 = await db
-    .prepare('SELECT LastProcessedLine, LastProcessedByte, Status FROM "0_import_progress" WHERE FileName = ?')
-    .bind("stop_times.txt")
-    .all();
-  assert.equal(stopTimesProg1.results.length, 1);
-  assert.equal(stopTimesProg1.results[0].Status, 1);
-  assert.equal(stopTimesProg1.results[0].LastProcessedLine, 81, `expected all 81 remaining data writes committed, got ${JSON.stringify(stopTimesProg1.results[0])}`);
-  assert.ok(stopTimesProg1.results[0].LastProcessedByte > 0, "expected byte checkpoint > 0");
+  const allProg1 = await db.prepare('SELECT FileName, LastProcessedLine, LastProcessedByte, Status FROM "0_import_progress"').all();
+  const totalCommitted1 = allProg1.results.reduce((sum, row) => sum + row.LastProcessedLine, 0);
+  assert.equal(totalCommitted1, 88, `expected all 88 data writes committed across files, got ${JSON.stringify(allProg1.results)}`);
 
-  // Run 1b: Sub-batch remaining budget (+7 data writes < QUERY_STATEMENT_BATCH_SIZE=20) must still commit 7 rows instead of stalling at 0.
+  const stopTimesProg1 = allProg1.results.filter((row) => row.FileName === "stop_times.txt");
+  assert.equal(stopTimesProg1.length, 1);
+  assert.equal(stopTimesProg1[0].Status, 1);
+  assert.ok(
+    stopTimesProg1[0].LastProcessedLine >= 81 && stopTimesProg1[0].LastProcessedLine <= 88,
+    `expected stop_times.txt to commit 81..88 rows, got ${JSON.stringify(stopTimesProg1[0])}`,
+  );
+  assert.ok(stopTimesProg1[0].LastProcessedByte > 0, "expected byte checkpoint > 0");
+
+  // Run 1b: Sub-batch remaining budget (+7 data writes < QUERY_STATEMENT_BATCH_SIZE=20) must still commit 7 rows across remaining files instead of stalling at 0.
   const budgetRowAfterRun1 = (await db.prepare('SELECT Reserved FROM "0_daily_import_budget" WHERE Id = 1').all()).results[0];
   const run1bLimit = String(budgetRowAfterRun1.Reserved + 2002 + 7);
   const run1b = await runImporter({ D1_DAILY_WRITE_LIMIT: run1bLimit });
   assert.equal(run1b.code, 0, `Run 1b failed:\n${run1b.stdout}\n${run1b.stderr}`);
   assert.match(run1b.stdout, /write budget exhausted: true/);
-  const stopTimesProg1b = await db
-    .prepare('SELECT LastProcessedLine, LastProcessedByte, Status FROM "0_import_progress" WHERE FileName = ?')
-    .bind("stop_times.txt")
-    .all();
-  assert.equal(stopTimesProg1b.results[0].LastProcessedLine, 88);
-  assert.equal(stopTimesProg1b.results[0].Status, 1);
+  const allProg1b = await db.prepare('SELECT FileName, LastProcessedLine, LastProcessedByte, Status FROM "0_import_progress"').all();
+  const totalCommitted1b = allProg1b.results.reduce((sum, row) => sum + row.LastProcessedLine, 0);
+  assert.equal(totalCommitted1b, 95, `expected 95 total data writes committed across files, got ${JSON.stringify(allProg1b.results)}`);
+  const stopTimesProg1b = allProg1b.results.filter((row) => row.FileName === "stop_times.txt");
+  assert.equal(stopTimesProg1b.length, 1);
+  assert.ok(
+    stopTimesProg1b[0].LastProcessedLine >= 88 && stopTimesProg1b[0].LastProcessedLine <= 95,
+    `expected stop_times.txt to reach 88..95 rows, got ${JSON.stringify(stopTimesProg1b[0])}`,
+  );
+  assert.equal(stopTimesProg1b[0].Status, 1);
 
   // Run 2: Raise daily limit to resume from the saved byte checkpoint and commit atomic swap.
   const run2 = await runImporter({ D1_DAILY_WRITE_LIMIT: "20000" });
   assert.equal(run2.code, 0, `Run 2 failed:\n${run2.stdout}\n${run2.stderr}`);
   assert.match(run2.stdout, /Committing atomic swap for 7 table\(s\)/);
   assert.match(run2.stdout, /0 provider\(s\) remain incomplete; write budget exhausted: false/);
-  assert.match(run2.stdout, new RegExp(`Importing stop_times\\.txt into stop_times__staging \\(resuming from row ${stopTimesProg1b.results[0].LastProcessedLine}, byte ${stopTimesProg1b.results[0].LastProcessedByte}\\)`));
+  assert.match(run2.stdout, new RegExp(`Importing stop_times\\.txt into stop_times__staging \\(resuming from row ${stopTimesProg1b[0].LastProcessedLine}, byte ${stopTimesProg1b[0].LastProcessedByte}\\)`));
 
   const liveStopsAfterRun2 = await db.prepare("SELECT stop_id FROM stops ORDER BY stop_id").all();
   assert.deepEqual(
