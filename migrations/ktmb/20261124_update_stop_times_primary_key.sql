@@ -1,4 +1,4 @@
--- Migration: Change stop_times primary key to (trip_id, stop_id, arrival_time).
+-- Migration: Change stop_times primary key to (trip_id, stop_id, stop_sequence).
 CREATE TABLE IF NOT EXISTS "stop_times_new" (
   trip_id TEXT,
   arrival_time TEXT,

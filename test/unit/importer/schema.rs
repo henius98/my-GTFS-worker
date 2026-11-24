@@ -11,13 +11,13 @@ fn positional_sql_quotes_identifiers() {
 #[test]
 fn upserts_preserve_primary_keys_and_skip_key_only_conflicts() {
   let keys = SchemaCatalog::primary_keys("ktmb", "stop_times");
-  assert_eq!(keys, &["trip_id", "stop_id", "arrival_time"]);
+  assert_eq!(keys, &["trip_id", "stop_id", "stop_sequence"]);
   let sql = SchemaCatalog::positional_insert_sql("stop_times", &["stop_id", "trip_id", "stop_sequence", "arrival_time"], keys);
   let update = sql.split_once("DO UPDATE SET").map(|(_, update)| update).unwrap_or_default();
-  assert!(update.contains("\"stop_sequence\" = excluded.\"stop_sequence\""));
+  assert!(update.contains("\"arrival_time\" = excluded.\"arrival_time\""));
   assert!(!update.contains("\"trip_id\""));
   assert!(!update.contains("\"stop_id\""));
-  assert!(!update.contains("\"arrival_time\""));
+  assert!(!update.contains("\"stop_sequence\""));
   assert!(SchemaCatalog::positional_insert_sql("stop_times", keys, keys).ends_with("DO NOTHING"));
   assert_eq!(SchemaCatalog::primary_keys("mybas-johor", "areas"), &["area_id"]);
   assert_eq!(SchemaCatalog::primary_keys("ktmb", "trips"), &["route_id", "service_id", "trip_id"]);
@@ -43,7 +43,7 @@ fn plan_table_import_projects_matching_headers_and_targets_staging_table() {
     ]
   );
   assert!(plan.insert_sql.starts_with("INSERT INTO \"stop_times__staging\""));
-  assert!(plan.insert_sql.contains("ON CONFLICT DO UPDATE SET \"stop_sequence\" = excluded.\"stop_sequence\""));
+  assert!(plan.insert_sql.contains("ON CONFLICT DO UPDATE SET \"arrival_time\" = excluded.\"arrival_time\""));
 
   let freq_headers = csv::StringRecord::from(vec!["trip_id", "start_time", "end_time", "headway_secs"]);
   let freq_plan = SchemaCatalog::plan_table_import("rapid-rail-kl", "frequencies", &["trip_id", "start_time", "end_time", "headway_secs"], &freq_headers);

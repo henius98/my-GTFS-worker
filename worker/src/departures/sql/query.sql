@@ -7,7 +7,7 @@
 --
 -- Performance note:
 -- Relies on WITHOUT ROWID primary keys:
---   stop_times(trip_id, stop_id, arrival_time) -> scanned for stop_id = ?1
+--   stop_times(trip_id, stop_id, stop_sequence) -> scanned for stop_id = ?1
 --   trips(trip_id), routes(route_id), agency(agency_id) -> PK point lookups.
 --
 -- Parameters:
