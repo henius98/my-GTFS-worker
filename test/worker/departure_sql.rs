@@ -348,12 +348,11 @@ fn map_queries_filter_by_date_with_calendar_and_calendar_dates_exceptions() -> C
   assert_eq!(hol_trip_ids_json, r#"["T_HOL"]"#);
   assert_eq!(hol_shape_ids_json, r#"["SH_HOL"]"#);
 
-  // Out-of-range Monday (2026-10-05): route exists with empty JSON arrays.
+  // Out-of-range Monday (2026-10-05): no active trips returns 0 rows.
   let oob_cte = exc_cte(20261005, "monday");
   let oob_trips_sql = route_trips_template.replace("__ACTIVE_SERVICES__", &oob_cte);
-  let (oob_trip_ids_json, oob_shape_ids_json): (String, String) = db.query_row(&oob_trips_sql, params!["U1"], |row| Ok((row.get(4)?, row.get(5)?)))?;
-  assert_eq!(oob_trip_ids_json, "[]");
-  assert_eq!(oob_shape_ids_json, "[]");
+  let oob_trips = db.prepare(&oob_trips_sql)?.query_map(params!["U1"], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+  assert!(oob_trips.is_empty());
 
   let hol_shapes = db.prepare(&shapes_by_route_sql)?.query_map(params![&hol_shape_ids_json], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
   assert_eq!(hol_shapes, vec!["SH_HOL", "SH_HOL"]);

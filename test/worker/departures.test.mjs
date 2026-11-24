@@ -571,8 +571,12 @@ test("filters map GeoJSON shapes, fallback segments, and stops by date including
     const emptyRes = await worker.fetch(
       `/rapid-bus-kl/map?route_id=U1&date=${emptyDate}`
     );
-    assert.equal(emptyRes.status, 200, emptyDate);
-    assert.deepEqual((await emptyRes.json()).features, [], emptyDate);
+    assert.equal(emptyRes.status, 404, emptyDate);
+    assert.deepEqual(
+      await emptyRes.json(),
+      { error: "Not found route_id" },
+      emptyDate
+    );
   }
 
   // Provider with calendar_dates (ktmb): exception_type 2 removes base service, exception_type 1 adds holiday service.

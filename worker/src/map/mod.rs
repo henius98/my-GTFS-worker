@@ -282,9 +282,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
       return crate::json_error(404, "Not found route_id");
     };
     let route_rows = vec![MapRoute { route_id: id, route_short_name, route_long_name, route_color }];
-    if trip_ids_json == "[]" {
-      (route_rows, BTreeMap::new(), BTreeMap::new(), Vec::new())
-    } else if has_shapes && shape_ids_json != "[]" {
+    if has_shapes && shape_ids_json != "[]" {
       let geometry_stmt = prepare_ids_query(&db, SHAPES_BY_ROUTE_SQL, &shape_ids_json)?;
       let stop_stmt = prepare_ids_query(&db, STOPS_BY_ROUTE_SQL, &trip_ids_json)?;
       let mut second_batch = db.batch(vec![geometry_stmt, stop_stmt]).await?.into_iter();
