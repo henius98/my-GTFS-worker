@@ -1,0 +1,998 @@
+# AUTO-GENERATED from providers.toml, migrations/*/0_gtfs_schema.sql, Cargo.toml, and wrangler.toml — do not edit directly.
+# Regenerate with: python3 scripts/generate-openapi.py
+openapi: 3.1.0
+info:
+  title: my-GTFS-worker API
+  version: 0.1.0
+  summary: Unified Cloudflare Worker API for Malaysian GTFS static transit datasets.
+  description: |-
+    Serves per-provider GTFS static datasets stored in isolated Cloudflare D1 databases.
+
+    **CORS**: Every response includes `Access-Control-Allow-Origin` from `WORKER_CORS_ALLOW_ORIGIN`. `OPTIONS` preflight requests return `204 No Content` with `Access-Control-Allow-Methods: GET, POST, OPTIONS` and `Access-Control-Allow-Headers: Content-Type, Authorization, X-Admin-Key`.
+
+    **Rate limits**: Exceeding the Cloudflare D1 daily row read limit returns `429 Too Many Requests` with a JSON `ErrorResponse` body.
+servers:
+  - url: "https://my-gtfs-worker.98heniyschen.workers.dev"
+    description: Production Cloudflare Worker
+  - url: "http://localhost:8787"
+    description: Local Wrangler dev server
+tags:
+  - name: Health
+    description: Worker liveness endpoint.
+  - name: Status
+    description: GTFS import progress per provider.
+  - name: Data
+    description: "Paginated, filterable GTFS table queries."
+  - name: SQL
+    description: Admin-protected read-only SQL queries.
+  - name: Departures
+    description: Estimated upcoming stop departures from static schedules and frequencies.
+  - name: Map
+    description: GeoJSON transit network routes and stops.
+paths:
+  "/":
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Worker liveness check
+      description: Returns plain text confirming that the Worker is running. Does not query D1.
+      responses:
+        "200":
+          description: Worker is running.
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+          content:
+            "text/plain":
+              schema:
+                type: string
+              example: "Worker is running. Use /<provider>/status to check GTFS import progress."
+        "500":
+          "$ref": "#/components/responses/InternalServerError"
+  "/{provider}/status":
+    parameters:
+      - "$ref": "#/components/parameters/Provider"
+    get:
+      tags: [Status]
+      operationId: getProviderStatus
+      summary: Get GTFS import progress for a provider
+      description: "Returns all rows from `0_import_progress` for the provider. Canonicalizes cache keys and edge-caches successful responses for `WORKER_API_CACHE_TTL_SECONDS` (currently `60`s)."
+      responses:
+        "200":
+          description: "Import progress records (may be an empty array)."
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+            Cache-Control:
+              "$ref": "#/components/headers/CacheControl"
+          content:
+            "application/json":
+              schema:
+                type: array
+                items:
+                  "$ref": "#/components/schemas/ImportProgress"
+        "404":
+          "$ref": "#/components/responses/ProviderNotFound"
+        "405":
+          "$ref": "#/components/responses/MethodNotAllowedText"
+        "429":
+          "$ref": "#/components/responses/RateLimitExceeded"
+        "500":
+          "$ref": "#/components/responses/InternalServerError"
+  "/{provider}/data/{table}":
+    parameters:
+      - "$ref": "#/components/parameters/Provider"
+      - "$ref": "#/components/parameters/Table"
+    get:
+      tags: [Data]
+      operationId: listTableRows
+      summary: Query rows from a provider table
+      description: |-
+        Returns paginated rows for any table compiled into the provider's D1 schema. Duplicate query parameter keys return `400`. Column names are resolved case-insensitively.
+
+        Responses set `Cache-Control: public, max-age=60` (from `WORKER_API_CACHE_TTL_SECONDS`).
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: "Maximum rows to return. Values above `WORKER_SQL_MAX_ROWS` (1000) are clamped to 1000."
+          schema:
+            type: integer
+            minimum: 0
+            default: 1000
+          example: 10
+        - name: offset
+          in: query
+          required: false
+          description: Number of rows to skip before returning results.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          example: 0
+        - name: include
+          in: query
+          required: false
+          description: "Comma-separated list of columns to return. Mutually exclusive with `exclude`; must not be empty."
+          schema:
+            type: string
+            minLength: 1
+          example: "stop_id,stop_name"
+        - name: exclude
+          in: query
+          required: false
+          description: "Comma-separated list of columns to omit. Mutually exclusive with `include`; cannot exclude all columns."
+          schema:
+            type: string
+            minLength: 1
+          example: "stop_lat,stop_lon"
+        - name: filter
+          in: query
+          required: false
+          description: "Exact case-sensitive match (`=`). Comma-separated `val@col` items; escape literal commas in values with `\\,`."
+          schema:
+            type: string
+          example: KJ10@stop_id
+        - name: ifilter
+          in: query
+          required: false
+          description: "Exact case-insensitive match (`COLLATE NOCASE =`). Comma-separated `val@col` items; escape literal commas with `\\,`."
+          schema:
+            type: string
+          example: kj10@stop_id
+        - name: contains
+          in: query
+          required: false
+          description: "Case-sensitive substring match (`INSTR(col, val) > 0`). Comma-separated `val@col` items; escape literal commas with `\\,`."
+          schema:
+            type: string
+          example: KJ@stop_id
+        - name: icontains
+          in: query
+          required: false
+          description: "Case-insensitive substring match (`LIKE '%val%'`). Comma-separated `val@col` items; escape literal commas with `\\,`."
+          schema:
+            type: string
+          example: sentral@stop_name
+        - name: range
+          in: query
+          required: false
+          description: "Inclusive range filter (`>=` / `<=`). Comma-separated `col[begin:end]` or `col[begin..end]` items. Supports open bounds (`col[:end]`, `col[begin:]`) and `HH:MM[:SS]` time values."
+          schema:
+            type: string
+          example: "stop_lat[1:7]"
+        - name: sort
+          in: query
+          required: false
+          description: "Comma-separated columns to sort by. Prefix a column with `-` for descending order."
+          schema:
+            type: string
+          example: "stop_name,-stop_id"
+      responses:
+        "200":
+          description: Paginated table rows.
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+            Cache-Control:
+              "$ref": "#/components/headers/CacheControl"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/DataResponse"
+        "400":
+          "$ref": "#/components/responses/BadRequestText"
+        "404":
+          description: "Unknown provider or table not compiled into the provider's schema."
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+          content:
+            "text/plain":
+              schema:
+                type: string
+              example: "Table 'unknown' not found"
+        "405":
+          "$ref": "#/components/responses/MethodNotAllowedText"
+        "429":
+          "$ref": "#/components/responses/RateLimitExceeded"
+        "500":
+          "$ref": "#/components/responses/InternalServerError"
+  "/{provider}/sql":
+    parameters:
+      - "$ref": "#/components/parameters/Provider"
+    post:
+      tags: [SQL]
+      operationId: executeSqlQuery
+      summary: Run a read-only SQL query
+      description: |-
+        Executes one read-only `SELECT` or `WITH ... SELECT` statement wrapped in a subquery capped at `WORKER_SQL_MAX_ROWS` (1000). SQL comments (`--`, `/*`) and multiple statements are rejected; a single trailing semicolon is allowed.
+
+        Requires `WORKER_ADMIN_KEY` via `Authorization: Bearer <key>` or `X-Admin-Key: <key>` (unless `WORKER_ALLOW_ANONYMOUS_SQL=true` or `WORKER_TEST_NOW` is set for local/test environments).
+      security:
+        - BearerAuth: []
+        - AdminKeyHeader: []
+      requestBody:
+        required: true
+        description: "Single read-only SQL `SELECT` or `WITH ... SELECT` statement."
+        content:
+          "text/plain":
+            schema:
+              type: string
+              minLength: 1
+            example: "SELECT stop_id, stop_name FROM stops LIMIT 10"
+      responses:
+        "200":
+          description: Query result rows.
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/SqlResponse"
+        "400":
+          "$ref": "#/components/responses/BadRequestText"
+        "401":
+          description: Missing or invalid admin key.
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+          content:
+            "text/plain":
+              schema:
+                type: string
+              example: Unauthorized
+        "403":
+          description: "`WORKER_ADMIN_KEY` is not configured and anonymous SQL is disabled."
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+          content:
+            "text/plain":
+              schema:
+                type: string
+              example: "Forbidden: WORKER_ADMIN_KEY is not configured"
+        "404":
+          "$ref": "#/components/responses/ProviderNotFound"
+        "405":
+          description: "Method not allowed. Only `POST` is accepted."
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+            Allow:
+              "$ref": "#/components/headers/Allow"
+          content:
+            "text/plain":
+              schema:
+                type: string
+              example: Method Not Allowed
+        "429":
+          "$ref": "#/components/responses/RateLimitExceeded"
+        "500":
+          "$ref": "#/components/responses/InternalServerError"
+  "/{provider}/departures":
+    parameters:
+      - "$ref": "#/components/parameters/Provider"
+    get:
+      tags: [Departures]
+      operationId: getDepartures
+      summary: Estimate upcoming departures at a stop
+      description: |-
+        Estimates upcoming departures from static GTFS schedules and frequencies over `WORKER_DEPARTURES_SEARCH_DAYS` (7 days). Respects `calendar`, `calendar_dates` overrides, agency timezones, post-midnight service times, and excludes `pickup_type = 1` stop times. Unknown or duplicate query parameters return `400`.
+
+        Responses always set `Cache-Control: no-store` and `X-Departure-Cache: HIT | MISS | BYPASS` (backed by per-provider `departure_cache` with TTL `WORKER_FEED_CACHE_TTL_SECONDS` = 86400s).
+      parameters:
+        - name: stop_id
+          in: query
+          required: true
+          description: "GTFS stop identifier (1 to 256 bytes after trimming)."
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          example: KJ10
+        - name: route_id
+          in: query
+          required: false
+          description: "Optional GTFS route identifier filter (1 to 256 bytes after trimming)."
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          example: KJL
+        - name: direction_id
+          in: query
+          required: false
+          description: "Optional GTFS travel direction filter (`0` or `1`)."
+          schema:
+            type: integer
+            enum: [0, 1]
+          example: 0
+        - name: limit
+          in: query
+          required: false
+          description: "Maximum departures to return (`1..=100`, default `5`)."
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 5
+          example: 5
+        - name: at
+          in: query
+          required: false
+          description: "RFC3339 timestamp with timezone offset (defaults to current UTC time)."
+          schema:
+            type: string
+            format: date-time
+          example: "2026-09-23T08:00:00+08:00"
+      responses:
+        "200":
+          description: Estimated upcoming departures.
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+            Cache-Control:
+              "$ref": "#/components/headers/CacheControl"
+            X-Departure-Cache:
+              "$ref": "#/components/headers/DepartureCacheStatus"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/DeparturesResponse"
+        "400":
+          "$ref": "#/components/responses/BadRequestJson"
+        "404":
+          description: "Unknown `stop_id` (JSON) or unbound provider (plain text)."
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/ErrorResponse"
+              example:
+                error: Unknown stop_id
+            "text/plain":
+              schema:
+                type: string
+              example: "Provider 'unknown' not found or DB not bound"
+        "405":
+          "$ref": "#/components/responses/MethodNotAllowedJson"
+        "429":
+          "$ref": "#/components/responses/RateLimitExceeded"
+        "500":
+          "$ref": "#/components/responses/InternalServerError"
+        "503":
+          description: Departure lookup failed against D1 or schedule data is invalid.
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/ErrorResponse"
+              example:
+                error: Departure data is unavailable
+  "/{provider}/map":
+    parameters:
+      - "$ref": "#/components/parameters/Provider"
+    get:
+      tags: [Map]
+      operationId: getProviderMap
+      summary: Get provider transit network as GeoJSON
+      description: |-
+        Returns active routes and stops for a service date as a GeoJSON `FeatureCollection`. Providers with a `shapes` table emit `LineString` route features (`geometry_source: "shape"`); providers without shapes (or routes without shape points) fall back to `MultiLineString` stop-to-stop segments (`geometry_source: "stop_sequence"`). Stops emit `Point` features.
+
+        Edge-cached using `WORKER_FEED_CACHE_TTL_SECONDS` (`86400`s).
+      parameters:
+        - name: route_id
+          in: query
+          required: false
+          description: "Optional GTFS route identifier to filter the map to one route (1 to 256 bytes after trimming)."
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          example: KJL
+        - name: date
+          in: query
+          required: false
+          description: "Service date in `YYYY-MM-DD` or `YYYYMMDD` format. Defaults to today in `Asia/Kuala_Lumpur`."
+          schema:
+            type: string
+            pattern: "^(\\d{4}-\\d{2}-\\d{2}|\\d{8})$"
+          example: "2026-09-23"
+      responses:
+        "200":
+          description: GeoJSON FeatureCollection of route geometries and stops.
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+            Cache-Control:
+              "$ref": "#/components/headers/CacheControl"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/MapFeatureCollection"
+        "400":
+          "$ref": "#/components/responses/BadRequestJson"
+        "404":
+          description: "Provider database unavailable or requested `route_id` not found."
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/ErrorResponse"
+              example:
+                error: Not found route_id
+        "405":
+          "$ref": "#/components/responses/MethodNotAllowedJson"
+        "429":
+          "$ref": "#/components/responses/RateLimitExceeded"
+        "500":
+          "$ref": "#/components/responses/InternalServerError"
+        "503":
+          description: Map query failed against D1.
+          headers:
+            Access-Control-Allow-Origin:
+              "$ref": "#/components/headers/CorsAllowOrigin"
+          content:
+            "application/json":
+              schema:
+                "$ref": "#/components/schemas/ErrorResponse"
+              example:
+                error: Map data is unavailable
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: "Admin key passed as `Authorization: Bearer <WORKER_ADMIN_KEY>`."
+    AdminKeyHeader:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: "Admin key passed via the `X-Admin-Key` header."
+  parameters:
+    Provider:
+      name: provider
+      in: path
+      required: true
+      description: "Active GTFS provider identifier from `providers.toml` (matched case-insensitively)."
+      schema:
+        type: string
+        enum:
+          - mybas-johor
+          - ktmb
+          - rapid-bus-mrtfeeder
+          - rapid-rail-kl
+          - rapid-bus-kl
+          - rapid-bus-penang
+      example: mybas-johor
+    Table:
+      name: table
+      in: path
+      required: true
+      description: |-
+        Table compiled into the provider's D1 schema (matched case-insensitively).
+        Available tables per provider:
+        - `mybas-johor`: `0_dataset_versions`, `0_import_progress`, `agency`, `areas`, `calendar`, `departure_cache`, `fare_leg_rules`, `fare_media`, `fare_products`, `rider_categories`, `routes`, `shapes`, `stop_areas`, `stop_times`, `stops`, `trips`
+        - `ktmb`: `0_daily_import_budget`, `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `calendar_dates`, `departure_cache`, `routes`, `stop_times`, `stops`, `trips`
+        - `rapid-bus-mrtfeeder`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `calendar_dates`, `departure_cache`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
+        - `rapid-rail-kl`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `departure_cache`, `frequencies`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
+        - `rapid-bus-kl`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `departure_cache`, `frequencies`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
+        - `rapid-bus-penang`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `departure_cache`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
+      schema:
+        type: string
+        enum:
+          - 0_daily_import_budget
+          - 0_dataset_versions
+          - 0_import_progress
+          - agency
+          - areas
+          - calendar
+          - calendar_dates
+          - departure_cache
+          - fare_leg_rules
+          - fare_media
+          - fare_products
+          - frequencies
+          - rider_categories
+          - routes
+          - shapes
+          - stop_areas
+          - stop_times
+          - stops
+          - trips
+      example: stops
+  headers:
+    CorsAllowOrigin:
+      description: "CORS allowed origin from `WORKER_CORS_ALLOW_ORIGIN`."
+      schema:
+        type: string
+    Allow:
+      description: "Allowed HTTP method(s) for the endpoint."
+      schema:
+        type: string
+    CacheControl:
+      description: HTTP caching directive for the response.
+      schema:
+        type: string
+    DepartureCacheStatus:
+      description: "Status of the per-provider D1 `departure_cache` lookup."
+      schema:
+        type: string
+        enum: [HIT, MISS, BYPASS]
+  responses:
+    BadRequestText:
+      description: "Invalid query parameter, column, or SQL statement."
+      headers:
+        Access-Control-Allow-Origin:
+          "$ref": "#/components/headers/CorsAllowOrigin"
+      content:
+        "text/plain":
+          schema:
+            type: string
+    BadRequestJson:
+      description: Invalid query parameter.
+      headers:
+        Access-Control-Allow-Origin:
+          "$ref": "#/components/headers/CorsAllowOrigin"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/ErrorResponse"
+    ProviderNotFound:
+      description: Provider does not exist or its D1 database binding is unavailable.
+      headers:
+        Access-Control-Allow-Origin:
+          "$ref": "#/components/headers/CorsAllowOrigin"
+      content:
+        "text/plain":
+          schema:
+            type: string
+          example: "Provider 'unknown' not found or DB not bound"
+    MethodNotAllowedText:
+      description: "Method not allowed. Only `GET` is accepted."
+      headers:
+        Access-Control-Allow-Origin:
+          "$ref": "#/components/headers/CorsAllowOrigin"
+        Allow:
+          "$ref": "#/components/headers/Allow"
+      content:
+        "text/plain":
+          schema:
+            type: string
+          example: Method Not Allowed
+    MethodNotAllowedJson:
+      description: "Method not allowed. Only `GET` is accepted."
+      headers:
+        Access-Control-Allow-Origin:
+          "$ref": "#/components/headers/CorsAllowOrigin"
+        Allow:
+          "$ref": "#/components/headers/Allow"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/ErrorResponse"
+          example:
+            error: Method not allowed
+    RateLimitExceeded:
+      description: Cloudflare D1 daily row read limit exceeded.
+      headers:
+        Access-Control-Allow-Origin:
+          "$ref": "#/components/headers/CorsAllowOrigin"
+      content:
+        "application/json":
+          schema:
+            "$ref": "#/components/schemas/ErrorResponse"
+          example:
+            error: Database daily row read limit exceeded. Please try again after midnight UTC.
+    InternalServerError:
+      description: Unhandled server or configuration error.
+      headers:
+        Access-Control-Allow-Origin:
+          "$ref": "#/components/headers/CorsAllowOrigin"
+      content:
+        "text/plain":
+          schema:
+            type: string
+          example: Internal Server Error
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+    ImportProgress:
+      type: object
+      required:
+        - FileName
+        - CRC
+        - LastProcessedLine
+        - LastProcessedByte
+        - Status
+        - UpdatedAt
+      additionalProperties: false
+      properties:
+        FileName:
+          type: [string, "null"]
+          description: GTFS CSV file name in the upstream archive.
+        CRC:
+          type: [string, "null"]
+          description: CRC32 checksum of the CSV file.
+        LastProcessedLine:
+          type: [integer, "null"]
+          format: int64
+          description: Last committed CSV data line.
+        LastProcessedByte:
+          type: [integer, "null"]
+          format: int64
+          description: Byte offset checkpoint for resumable imports.
+        Status:
+          type: [integer, "null"]
+          enum: [0, 1, 2, null]
+          description: "Import status: `0` = COMPLETED, `1` = IN_PROGRESS, `2` = STAGED."
+        UpdatedAt:
+          type: [string, "null"]
+          description: Timestamp of the last progress update.
+    DataRow:
+      type: object
+      description: Arbitrary table row whose keys match the selected columns.
+      additionalProperties: true
+    DataResponse:
+      type: object
+      required: [data, limit, offset]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items:
+            "$ref": "#/components/schemas/DataRow"
+        limit:
+          type: integer
+          minimum: 0
+          description: Effective row limit applied to the query.
+        offset:
+          type: integer
+          minimum: 0
+          description: Row offset applied to the query.
+    SqlResponse:
+      type: object
+      required: [data]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items:
+            "$ref": "#/components/schemas/DataRow"
+    DepartureStop:
+      type: object
+      required: [stop_id, stop_name]
+      additionalProperties: false
+      properties:
+        stop_id:
+          type: string
+        stop_name:
+          type: [string, "null"]
+    Departure:
+      type: object
+      required:
+        - trip_id
+        - route_id
+        - route_short_name
+        - route_long_name
+        - route_color
+        - route_text_color
+        - service_id
+        - trip_headsign
+        - direction_id
+        - stop_sequence
+        - service_date
+        - agency_timezone
+        - headway_secs
+        - trip_start_secs
+        - estimate_method
+        - departure_secs
+        - service_departure_time
+        - estimated_arrival_at
+        - estimated_departure_at
+        - wait_seconds
+      additionalProperties: false
+      properties:
+        trip_id:
+          type: string
+        route_id:
+          type: string
+        route_short_name:
+          type: [string, "null"]
+        route_long_name:
+          type: [string, "null"]
+        route_color:
+          type: [string, "null"]
+        route_text_color:
+          type: [string, "null"]
+        service_id:
+          type: string
+        trip_headsign:
+          type: [string, "null"]
+        direction_id:
+          type: [integer, "null"]
+          enum: [0, 1, null]
+        stop_sequence:
+          type: integer
+          minimum: 0
+        service_date:
+          type: string
+          format: date
+          description: "GTFS service date (may precede the local calendar date after midnight)."
+        agency_timezone:
+          type: string
+          description: IANA timezone name used to resolve the service day.
+        headway_secs:
+          type: [integer, "null"]
+          minimum: 1
+          description: "Headway in seconds for frequency-based trips; `null` for scheduled trips."
+        trip_start_secs:
+          type: [integer, "null"]
+          minimum: 0
+          description: Trip start offset in seconds since service-day origin for frequency-based trips.
+        estimate_method:
+          type: string
+          enum: [gtfs_schedule, frequency_start_plus_headway]
+        departure_secs:
+          type: integer
+          minimum: 0
+          description: "Seconds since service-day origin; may exceed 86400 for post-midnight service."
+        service_departure_time:
+          type: string
+          pattern: "^\\d{2,}:\\d{2}:\\d{2}$"
+          description: "GTFS service-day time string (`HH:MM:SS`, hours may exceed 23)."
+        estimated_arrival_at:
+          type: string
+          format: date-time
+          description: RFC3339 estimated arrival timestamp in agency timezone offset.
+        estimated_departure_at:
+          type: string
+          format: date-time
+          description: RFC3339 estimated departure timestamp in agency timezone offset.
+        wait_seconds:
+          type: integer
+          minimum: 0
+          description: "Seconds from `requested_at` until `estimated_departure_at` (rounded up)."
+    DeparturesResponse:
+      type: object
+      required:
+        - stop
+        - route_id
+        - direction_id
+        - requested_at
+        - search_until
+        - limit
+        - is_estimate
+        - estimate_method
+        - realtime
+        - departures
+      additionalProperties: false
+      properties:
+        stop:
+          "$ref": "#/components/schemas/DepartureStop"
+        route_id:
+          type: [string, "null"]
+        direction_id:
+          type: [integer, "null"]
+          enum: [0, 1, null]
+        requested_at:
+          type: string
+          format: date-time
+        search_until:
+          type: string
+          format: date-time
+        limit:
+          type: integer
+          minimum: 1
+        is_estimate:
+          type: boolean
+          const: true
+        estimate_method:
+          type: [string, "null"]
+          enum: [gtfs_schedule, frequency_start_plus_headway, mixed, null]
+          description: "`null` when `departures` is empty; `mixed` when results combine scheduled and headway estimates."
+        realtime:
+          type: boolean
+          const: false
+        departures:
+          type: array
+          items:
+            "$ref": "#/components/schemas/Departure"
+    GeoJsonPosition:
+      type: array
+      description: "GeoJSON `[longitude, latitude]` coordinate pair."
+      prefixItems:
+        - type: number
+          minimum: -180
+          maximum: 180
+        - type: number
+          minimum: -90
+          maximum: 90
+      items: false
+      minItems: 2
+      maxItems: 2
+    LineStringGeometry:
+      type: object
+      required: [type, coordinates]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: LineString
+        coordinates:
+          type: array
+          minItems: 2
+          items:
+            "$ref": "#/components/schemas/GeoJsonPosition"
+    MultiLineStringGeometry:
+      type: object
+      required: [type, coordinates]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: MultiLineString
+        coordinates:
+          type: array
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items:
+              "$ref": "#/components/schemas/GeoJsonPosition"
+    PointGeometry:
+      type: object
+      required: [type, coordinates]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: Point
+        coordinates:
+          "$ref": "#/components/schemas/GeoJsonPosition"
+    ShapeRouteProperties:
+      type: object
+      required:
+        - kind
+        - route_id
+        - shape_id
+        - geometry_source
+        - route_short_name
+        - route_long_name
+        - route_color
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          const: route
+        route_id:
+          type: string
+        shape_id:
+          type: string
+        geometry_source:
+          type: string
+          const: shape
+        route_short_name:
+          type: [string, "null"]
+        route_long_name:
+          type: [string, "null"]
+        route_color:
+          type: [string, "null"]
+    SegmentRouteProperties:
+      type: object
+      required:
+        - kind
+        - route_id
+        - geometry_source
+        - route_short_name
+        - route_long_name
+        - route_color
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          const: route
+        route_id:
+          type: string
+        geometry_source:
+          type: string
+          const: stop_sequence
+        route_short_name:
+          type: [string, "null"]
+        route_long_name:
+          type: [string, "null"]
+        route_color:
+          type: [string, "null"]
+    StopProperties:
+      type: object
+      required:
+        - kind
+        - route_id
+        - stop_id
+        - stop_name
+        - arrival_times
+        - departure_times
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          const: stop
+        route_id:
+          type: string
+        stop_id:
+          type: string
+        stop_name:
+          type: [string, "null"]
+        arrival_times:
+          type: [string, "null"]
+          description: Aggregated arrival times for active trips at this stop.
+        departure_times:
+          type: [string, "null"]
+          description: Aggregated departure times for active trips at this stop.
+    ShapeRouteFeature:
+      type: object
+      required: [type, geometry, properties]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: Feature
+        geometry:
+          "$ref": "#/components/schemas/LineStringGeometry"
+        properties:
+          "$ref": "#/components/schemas/ShapeRouteProperties"
+    SegmentRouteFeature:
+      type: object
+      required: [type, geometry, properties]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: Feature
+        geometry:
+          "$ref": "#/components/schemas/MultiLineStringGeometry"
+        properties:
+          "$ref": "#/components/schemas/SegmentRouteProperties"
+    StopFeature:
+      type: object
+      required: [type, geometry, properties]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: Feature
+        geometry:
+          "$ref": "#/components/schemas/PointGeometry"
+        properties:
+          "$ref": "#/components/schemas/StopProperties"
+    MapFeature:
+      oneOf:
+        - "$ref": "#/components/schemas/ShapeRouteFeature"
+        - "$ref": "#/components/schemas/SegmentRouteFeature"
+        - "$ref": "#/components/schemas/StopFeature"
+    MapFeatureCollection:
+      type: object
+      required: [type, features]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: FeatureCollection
+        features:
+          type: array
+          items:
+            "$ref": "#/components/schemas/MapFeature"
