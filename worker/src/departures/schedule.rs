@@ -131,19 +131,33 @@ fn service_origin(date: NaiveDate, timezone: Tz) -> Result<DateTime<Tz>, &'stati
   Ok(noon - Duration::hours(12))
 }
 
+fn cached_service_origin(cache: &mut Option<(Tz, DateTime<Tz>)>, date: NaiveDate, timezone: Tz) -> Result<DateTime<Tz>, &'static str> {
+  if let Some((tz, orig)) = *cache
+    && tz == timezone
+  {
+    return Ok(orig);
+  }
+  let orig = service_origin(date, timezone)?;
+  *cache = Some((timezone, orig));
+  Ok(orig)
+}
+
 /// Format seconds into a service day, retaining hours past midnight.
 fn fmt_secs(secs: u32) -> String {
   format!("{:02}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
 fn parse_time(value: &str) -> Result<u32, &'static str> {
-  let parts: Vec<_> = value.trim().split(':').collect();
-  if parts.len() != 3 || parts[0].is_empty() || parts[1].len() != 2 || parts[2].len() != 2 || parts.iter().any(|part| !part.bytes().all(|b| b.is_ascii_digit())) {
+  let mut parts = value.trim().split(':');
+  let (Some(h), Some(m), Some(s), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+    return Err("Malformed GTFS time");
+  };
+  if h.is_empty() || m.len() != 2 || s.len() != 2 || [h, m, s].iter().any(|part| !part.bytes().all(|b| b.is_ascii_digit())) {
     return Err("Malformed GTFS time");
   }
-  let hours = parts[0].parse::<u32>().map_err(|_| "GTFS hours out of range")?;
-  let minutes = parts[1].parse::<u8>().map_err(|_| "Invalid GTFS minutes")?;
-  let seconds = parts[2].parse::<u8>().map_err(|_| "Invalid GTFS seconds")?;
+  let hours = h.parse::<u32>().map_err(|_| "GTFS hours out of range")?;
+  let minutes = m.parse::<u8>().map_err(|_| "Invalid GTFS minutes")?;
+  let seconds = s.parse::<u8>().map_err(|_| "Invalid GTFS seconds")?;
   if minutes >= 60 || seconds >= 60 {
     return Err("GTFS minutes and seconds must be below 60");
   }
@@ -232,23 +246,23 @@ fn sort_and_dedup_candidates(candidates: &mut Vec<Candidate>, prepared: &[Prepar
   });
 }
 
-/// GTFS service days may run past 24:00:00. Search all dates whose frequency
-/// windows reach the request, instead of assigning a fixed rollover hour.
-/// Next `limit` estimated departures before the exclusive search horizon.
-///
-/// If today's service is exhausted or has too few results, include the next
-/// active dates and merge them with previous-day trains still running.
-/// Every candidate is checked against the original requested instant.
-pub(crate) fn next_departures(templates: &[Template], when: DateTime<Utc>, until: DateTime<Utc>, limit: usize, default_timezone: &str) -> Result<Vec<Departure>, &'static str> {
-  let cutoff = when.timestamp() + i64::from(when.timestamp_subsec_nanos() > 0);
+fn prepare_templates<'a>(templates: &'a [Template], when: DateTime<Utc>, until: DateTime<Utc>, default_timezone: &'a str) -> Result<Vec<PreparedTemplate<'a>>, &'static str> {
   let mut prepared = Vec::with_capacity(templates.len());
+  let mut last_tz: Option<(&'a str, Tz)> = None;
 
   for t in templates {
     let timezone_name = match t.agency_timezone.as_deref().map(str::trim) {
       Some(tz) if !tz.is_empty() => tz,
       _ => default_timezone,
     };
-    let timezone: Tz = timezone_name.parse().map_err(|_| "Unknown agency timezone")?;
+    let timezone = match last_tz {
+      Some((name, tz)) if name == timezone_name => tz,
+      _ => {
+        let tz: Tz = timezone_name.parse().map_err(|_| "Unknown agency timezone")?;
+        last_tz = Some((timezone_name, tz));
+        tz
+      }
+    };
     let arrival_time = i64::from(parse_time(&t.arrival_time)?);
     let departure_time = i64::from(parse_time(&t.departure_time)?);
     // A scheduled stop has one run on each active service date. Frequency
@@ -298,7 +312,35 @@ pub(crate) fn next_departures(templates: &[Template], when: DateTime<Utc>, until
     }
     prepared.push(PreparedTemplate { template: t, timezone, timezone_name, start, end, headway, first_departure, departure_offset, arrival_offset, earliest, latest, parsed_service });
   }
+  Ok(prepared)
+}
 
+fn earliest_future_departure(prepared: &[PreparedTemplate<'_>], next_date: NaiveDate) -> Result<Option<DateTime<FixedOffset>>, &'static str> {
+  let mut earliest = None;
+  let mut next_origin: Option<(Tz, DateTime<Tz>)> = None;
+  for p in prepared {
+    if next_date >= p.earliest && next_date <= p.latest {
+      let origin = cached_service_origin(&mut next_origin, next_date, p.timezone)?;
+      let min_dep = origin.checked_add_signed(Duration::seconds(p.first_departure)).ok_or("Departure time overflow")?.fixed_offset();
+      earliest = Some(match earliest {
+        Some(cur) if cur < min_dep => cur,
+        _ => min_dep,
+      });
+    }
+  }
+  Ok(earliest)
+}
+
+/// GTFS service days may run past 24:00:00. Search all dates whose frequency
+/// windows reach the request, instead of assigning a fixed rollover hour.
+/// Next `limit` estimated departures before the exclusive search horizon.
+///
+/// If today's service is exhausted or has too few results, include the next
+/// active dates and merge them with previous-day trains still running.
+/// Every candidate is checked against the original requested instant.
+pub(crate) fn next_departures(templates: &[Template], when: DateTime<Utc>, until: DateTime<Utc>, limit: usize, default_timezone: &str) -> Result<Vec<Departure>, &'static str> {
+  let cutoff = when.timestamp() + i64::from(when.timestamp_subsec_nanos() > 0);
+  let prepared = prepare_templates(templates, when, until, default_timezone)?;
   if prepared.is_empty() {
     return Ok(Vec::new());
   }
@@ -323,14 +365,7 @@ pub(crate) fn next_departures(templates: &[Template], when: DateTime<Utc>, until
       if !active {
         continue;
       }
-      let origin = match current_origin {
-        Some((tz, orig)) if tz == p.timezone => orig,
-        _ => {
-          let orig = service_origin(current_date, p.timezone)?;
-          current_origin = Some((p.timezone, orig));
-          orig
-        }
-      };
+      let origin = cached_service_origin(&mut current_origin, current_date, p.timezone)?;
       let base = origin.timestamp();
       let delta = (cutoff - base - p.first_departure).max(0);
       let k = delta / p.headway + i64::from(delta % p.headway != 0);
@@ -362,30 +397,7 @@ pub(crate) fn next_departures(templates: &[Template], when: DateTime<Utc>, until
       if candidates.len() >= limit {
         let t_limit = candidates[limit - 1].estimated_departure_at;
         let next_date = current_date.succ_opt().ok_or("Service date overflow")?;
-        let mut earliest_future_departure = None;
-        let mut next_origin: Option<(Tz, DateTime<Tz>)> = None;
-        for p in &prepared {
-          if next_date >= p.earliest && next_date <= p.latest {
-            let origin = match next_origin {
-              Some((tz, orig)) if tz == p.timezone => orig,
-              _ => {
-                let orig = service_origin(next_date, p.timezone)?;
-                next_origin = Some((p.timezone, orig));
-                orig
-              }
-            };
-            let min_dep = origin.checked_add_signed(Duration::seconds(p.first_departure)).ok_or("Departure time overflow")?.fixed_offset();
-            earliest_future_departure = Some(match earliest_future_departure {
-              Some(cur) if cur < min_dep => cur,
-              _ => min_dep,
-            });
-          }
-        }
-        if let Some(min_future) = earliest_future_departure {
-          if min_future >= t_limit {
-            break;
-          }
-        } else {
+        if earliest_future_departure(&prepared, next_date)?.is_none_or(|min_future| min_future >= t_limit) {
           break;
         }
       }

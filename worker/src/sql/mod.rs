@@ -1,9 +1,12 @@
-use worker::js_sys::{JSON, Object, Reflect};
+use worker::js_sys::{Object, Reflect};
 use worker::wasm_bindgen::JsValue;
-use worker::wasm_bindgen_futures::JsFuture;
 use worker::{Env, Method, Request, Response, Result};
 
 use crate::database;
+
+#[path = "../../../scripts/sql_strings.rs"]
+mod sql_strings;
+use sql_strings::strip_sql_strings;
 
 const QUERY_SQL: &str = include_str!("query.sql");
 
@@ -11,9 +14,23 @@ fn build_wrapped_query(sql: &str, max_rows: u32) -> String {
   QUERY_SQL.trim_end().replace("__LIMIT__", &max_rows.to_string()).replace("__SQL__", sql)
 }
 
+fn extract_bearer_token(header: &str) -> Option<&str> {
+  let (scheme, rest) = header.trim().split_once(' ')?;
+  scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+  let (a, b) = (a.as_bytes(), b.as_bytes());
+  let mut diff = a.len() ^ b.len();
+  for (&x, &y) in a.iter().zip(b.iter()) {
+    diff |= usize::from(x ^ y);
+  }
+  diff == 0
+}
+
 pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Response> {
   if req.method() != Method::Post {
-    return Response::error("Method Not Allowed", 405);
+    return crate::method_not_allowed("POST", false);
   }
 
   let admin_key = env.secret("WORKER_ADMIN_KEY").map(|s| s.to_string()).or_else(|_| env.var("WORKER_ADMIN_KEY").map(|v| v.to_string())).ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
@@ -23,14 +40,11 @@ pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Resp
   match admin_key {
     Some(expected_key) => {
       let auth_header = req.headers().get("Authorization").ok().flatten();
-      let bearer = auth_header.as_deref().and_then(|h| {
-        let trimmed = h.trim();
-        if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") { Some(trimmed[7..].trim()) } else { None }
-      });
+      let bearer_matches = auth_header.as_deref().and_then(extract_bearer_token).is_some_and(|token| constant_time_eq(token, &expected_key));
       let x_admin_key = req.headers().get("X-Admin-Key").ok().flatten();
-      let x_key = x_admin_key.as_deref().map(str::trim);
+      let x_key_matches = x_admin_key.as_deref().map(str::trim).is_some_and(|key| constant_time_eq(key, &expected_key));
 
-      if bearer != Some(&expected_key) && x_key != Some(&expected_key) {
+      if !bearer_matches && !x_key_matches {
         return Response::error("Unauthorized", 401);
       }
     }
@@ -63,48 +77,15 @@ pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Resp
   // A subquery accepts SELECT statements (including WITH ... SELECT) but rejects writes. Cap returned rows as in /data.
   let query = build_wrapped_query(sql, super::max_rows(env)?);
   let statement = d1.prepare(query);
-  let data_results = match statement.inner().all() {
-    Ok(promise) => match JsFuture::from(promise).await {
-      Ok(result) => result,
-      Err(error) => return Response::error(format!("Query error: {:?}", error), 400),
-    },
-    Err(error) => return Response::error(format!("Query error: {:?}", error), 400),
+  let details = match database::query_raw_results(&statement).await {
+    Ok(details) => details,
+    Err(err) if crate::is_d1_row_read_limit_error(&err) => return Err(err),
+    Err(err) => return Response::error(format!("Query error: {err}"), 400),
   };
 
-  let details = Reflect::get(&data_results, &JsValue::from_str("results"))?;
   let response_data = Object::new();
   Reflect::set(&response_data, &JsValue::from_str("data"), &details)?;
-  let body = JSON::stringify(&response_data)?.as_string().ok_or_else(|| worker::Error::RustError("Failed to serialize SQL response".into()))?;
-  let mut response = Response::ok(body)?;
-  response.headers_mut().set("Content-Type", "application/json")?;
-  Ok(response)
-}
-
-fn strip_sql_strings(s: &str) -> String {
-  let mut result = String::new();
-  let mut in_string = false;
-  let mut chars = s.chars().peekable();
-  while let Some(ch) = chars.next() {
-    match ch {
-      '\'' if !in_string => {
-        in_string = true;
-        result.push(' ');
-      }
-      '\'' if in_string => {
-        if chars.peek() == Some(&'\'') {
-          chars.next();
-          result.push(' ');
-          result.push(' ');
-        } else {
-          in_string = false;
-          result.push(' ');
-        }
-      }
-      _ if in_string => result.push(' '),
-      _ => result.push(ch),
-    }
-  }
-  result
+  database::json_response_from_js(&response_data)
 }
 
 #[cfg(test)]

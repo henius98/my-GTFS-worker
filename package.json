@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "packageManager": "pnpm@11.9.0",
   "description": "Cloudflare Worker GTFS importer",
-  "main": "build/worker/shim.mjs",
+  "main": "worker/build/index.js",
   "scripts": {
     "build": "bash ./scripts/build.sh",
     "dev": "wrangler dev",

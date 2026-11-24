@@ -86,6 +86,7 @@ test("validates departure requests through HTTP", async () => {
   }
   const method = await request("?stop_id=S", { method: "POST" });
   assert.equal(method.status, 405);
+  assert.equal(method.headers.get("Allow"), "GET");
   assert.deepEqual(await method.json(), { error: "Method not allowed" });
 
   const valid = await request(
@@ -266,6 +267,7 @@ async function seedKtmbProgress(rows) {
 test("serves status rows and validates method and provider", async () => {
   const method = await worker.fetch("/ktmb/status", { method: "POST" });
   assert.equal(method.status, 405);
+  assert.equal(method.headers.get("Allow"), "GET");
   assert.equal((await worker.fetch("/unknown/status")).status, 404);
 
   await seedKtmbProgress([
@@ -380,14 +382,34 @@ test("returns map GeoJSON from stop_sequence fallback and shapes", async () => {
     (feature) => feature.properties.kind === "route"
   );
   assert.equal(fallbackRoute.properties.geometry_source, "stop_sequence");
+  assert.equal(fallbackRoute.geometry.type, "MultiLineString");
   assert.deepEqual(fallbackRoute.geometry.coordinates, [
-    [101.686, 3.139],
-    [101.696, 3.149]
+    [
+      [101.686, 3.139],
+      [101.696, 3.149]
+    ]
   ]);
-  assert.equal(
-    ktmbBody.features.filter((feature) => feature.properties.kind === "stop")
-      .length,
-    2
+  const ktmbStops = ktmbBody.features.filter(
+    (feature) => feature.properties.kind === "stop"
+  );
+  assert.deepEqual(
+    ktmbStops.map((feature) => ({
+      stop_id: feature.properties.stop_id,
+      arrival_times: feature.properties.arrival_times,
+      departure_times: feature.properties.departure_times
+    })),
+    [
+      {
+        stop_id: "S",
+        arrival_times: "08:09:00, 08:19:00",
+        departure_times: "08:10:00, 08:20:00"
+      },
+      {
+        stop_id: "S2",
+        arrival_times: "08:14:00",
+        departure_times: "08:15:00"
+      }
+    ]
   );
 
   const ktmbAllMap = await worker.fetch("/ktmb/map");
@@ -401,6 +423,27 @@ test("returns map GeoJSON from stop_sequence fallback and shapes", async () => {
         feature.properties.route_id === "R" &&
         feature.properties.geometry_source === "stop_sequence"
     )
+  );
+  assert.deepEqual(
+    ktmbAllBody.features
+      .filter((feature) => feature.properties.kind === "stop")
+      .map((feature) => ({
+        stop_id: feature.properties.stop_id,
+        arrival_times: feature.properties.arrival_times,
+        departure_times: feature.properties.departure_times
+      })),
+    [
+      {
+        stop_id: "S",
+        arrival_times: "08:09:00, 08:19:00",
+        departure_times: "08:10:00, 08:20:00"
+      },
+      {
+        stop_id: "S2",
+        arrival_times: "08:14:00",
+        departure_times: "08:15:00"
+      }
+    ]
   );
 
   await seedRapidBusKl();
@@ -430,6 +473,253 @@ test("returns map GeoJSON from stop_sequence fallback and shapes", async () => {
   );
 });
 
+test("filters map GeoJSON shapes, fallback segments, and stops by date including calendar_dates exceptions", async () => {
+  for (const invalid of [
+    "/ktmb/map?date=monday",
+    "/ktmb/map?date=2026-02-29",
+    "/ktmb/map?date=",
+    "/ktmb/map?date=2026-09-24&date=2026-09-25"
+  ]) {
+    const response = await worker.fetch(invalid);
+    assert.equal(response.status, 400, invalid);
+    assert.equal(typeof (await response.json()).error, "string", invalid);
+  }
+  assert.equal((await worker.fetch("/ktmb/map/monday")).status, 404);
+
+  // Provider without calendar_dates (rapid-bus-kl): weekday + [start_date, end_date].
+  await seedRapidBusKl();
+  const { DB_RAPID_BUS_KL: db } = await worker.getEnv();
+  await db.batch([
+    db
+      .prepare(
+        "UPDATE calendar SET saturday = 0, sunday = 0, start_date = 20260921, end_date = 20260927 WHERE service_id = ?"
+      )
+      .bind("daily"),
+    db
+      .prepare(
+        "INSERT INTO calendar (service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+      .bind("sunday_only", 0, 0, 0, 0, 0, 0, 1, 20260921, 20260927),
+    db
+      .prepare(
+        "INSERT INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES (?, ?, ?, ?)"
+      )
+      .bind("S3", "Sunday Stop", 3.3, 101.8),
+    db
+      .prepare(
+        "INSERT INTO shapes (shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence) VALUES (?, ?, ?, ?)"
+      )
+      .bind("SH_SUN", 3.1, 101.6, 1),
+    db
+      .prepare(
+        "INSERT INTO shapes (shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence) VALUES (?, ?, ?, ?)"
+      )
+      .bind("SH_SUN", 3.3, 101.8, 2),
+    db
+      .prepare(
+        "INSERT INTO trips (trip_id, route_id, service_id, shape_id, trip_headsign, direction_id) VALUES (?, ?, ?, ?, ?, ?)"
+      )
+      .bind("sun-trip", "U1", "sunday_only", "SH_SUN", "Sunday", 0),
+    db
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("sun-trip", "S1", 1, "09:00:00", "09:00:00"),
+    db
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("sun-trip", "S3", 2, "09:10:00", "09:10:00")
+  ]);
+
+  // 2026-09-21 is Monday.
+  const monRes = await worker.fetch("/rapid-bus-kl/map?route_id=U1&date=2026-09-21");
+  assert.equal(monRes.status, 200);
+  const monBody = await monRes.json();
+  assert.deepEqual(
+    monBody.features
+      .filter((f) => f.properties.kind === "route")
+      .map((f) => f.properties.shape_id),
+    ["SH1"]
+  );
+  assert.deepEqual(
+    monBody.features
+      .filter((f) => f.properties.kind === "stop")
+      .map((f) => f.properties.stop_id),
+    ["S1", "S2"]
+  );
+
+  // 20260927 is Sunday (YYYYMMDD format).
+  const sunRes = await worker.fetch("/rapid-bus-kl/map?date=20260927");
+  assert.equal(sunRes.status, 200);
+  const sunBody = await sunRes.json();
+  assert.deepEqual(
+    sunBody.features
+      .filter((f) => f.properties.kind === "route")
+      .map((f) => f.properties.shape_id),
+    ["SH_SUN"]
+  );
+  assert.deepEqual(
+    sunBody.features
+      .filter((f) => f.properties.kind === "stop")
+      .map((f) => f.properties.stop_id),
+    ["S1", "S3"]
+  );
+
+  // 2026-09-26 is Saturday (inactive) and 2026-09-28 is outside calendar range.
+  for (const emptyDate of ["2026-09-26", "2026-09-28"]) {
+    const emptyRes = await worker.fetch(
+      `/rapid-bus-kl/map?route_id=U1&date=${emptyDate}`
+    );
+    assert.equal(emptyRes.status, 200, emptyDate);
+    assert.deepEqual((await emptyRes.json()).features, [], emptyDate);
+  }
+
+  // Provider with calendar_dates (ktmb): exception_type 2 removes base service, exception_type 1 adds holiday service.
+  const { DB_KTMB: ktmb } = await worker.getEnv();
+  await ktmb.batch([
+    ktmb
+      .prepare("UPDATE stops SET stop_lat = ?, stop_lon = ? WHERE stop_id = ?")
+      .bind(3.139, 101.686, "S"),
+    ktmb
+      .prepare(
+        "INSERT INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES (?, ?, ?, ?)"
+      )
+      .bind("S2", "Second", 3.149, 101.696),
+    ktmb
+      .prepare(
+        "INSERT INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES (?, ?, ?, ?)"
+      )
+      .bind("S3", "Holiday", 3.159, 101.706),
+    ktmb
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("early", "S2", 2, "08:14:00", "08:15:00"),
+    ktmb
+      .prepare(
+        "INSERT INTO trips (trip_id, route_id, service_id, direction_id) VALUES (?, ?, ?, ?)"
+      )
+      .bind("hol-trip", "R", "holiday_only", 0),
+    ktmb
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("hol-trip", "S", 1, "09:00:00", "09:00:00"),
+    ktmb
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("hol-trip", "S3", 2, "09:10:00", "09:10:00"),
+    ktmb
+      .prepare(
+        "INSERT INTO calendar_dates (service_id, date, exception_type) VALUES (?, ?, ?)"
+      )
+      .bind("daily", 20260924, 2),
+    ktmb
+      .prepare(
+        "INSERT INTO calendar_dates (service_id, date, exception_type) VALUES (?, ?, ?)"
+      )
+      .bind("holiday_only", 20260924, 1)
+  ]);
+
+  // Omitting both params defaults date to today (WORKER_TEST_NOW = 2026-09-24) and returns all active routes.
+  const ktmbDefault = await worker.fetch("/ktmb/map");
+  assert.equal(ktmbDefault.status, 200);
+  const ktmbDefaultBody = await ktmbDefault.json();
+  assert.deepEqual(
+    ktmbDefaultBody.features
+      .filter((f) => f.properties.kind === "route")
+      .map((f) => ({
+        route_id: f.properties.route_id,
+        type: f.geometry.type,
+        coordinates: f.geometry.coordinates
+      })),
+    [
+      {
+        route_id: "R",
+        type: "MultiLineString",
+        coordinates: [
+          [
+            [101.686, 3.139],
+            [101.706, 3.159]
+          ]
+        ]
+      }
+    ]
+  );
+  assert.deepEqual(
+    ktmbDefaultBody.features
+      .filter((f) => f.properties.kind === "stop")
+      .map((f) => f.properties.stop_id),
+    ["S", "S3"]
+  );
+
+  // 2026-09-24: daily removed (exception_type = 2), holiday_only added (exception_type = 1).
+  const ktmbHoliday = await worker.fetch("/ktmb/map?route_id=R&date=2026-09-24");
+  assert.equal(ktmbHoliday.status, 200);
+  const ktmbHolidayBody = await ktmbHoliday.json();
+  assert.deepEqual(
+    ktmbHolidayBody.features
+      .filter((f) => f.properties.kind === "route")
+      .map((f) => ({
+        route_id: f.properties.route_id,
+        type: f.geometry.type,
+        coordinates: f.geometry.coordinates
+      })),
+    [
+      {
+        route_id: "R",
+        type: "MultiLineString",
+        coordinates: [
+          [
+            [101.686, 3.139],
+            [101.706, 3.159]
+          ]
+        ]
+      }
+    ]
+  );
+  assert.deepEqual(
+    ktmbHolidayBody.features
+      .filter((f) => f.properties.kind === "stop")
+      .map((f) => f.properties.stop_id),
+    ["S", "S3"]
+  );
+
+  // 2026-09-25: normal daily service applies, holiday_only inactive.
+  const ktmbNormal = await worker.fetch("/ktmb/map?route_id=R&date=20260925");
+  assert.equal(ktmbNormal.status, 200);
+  const ktmbNormalBody = await ktmbNormal.json();
+  assert.deepEqual(
+    ktmbNormalBody.features
+      .filter((f) => f.properties.kind === "route")
+      .map((f) => ({
+        route_id: f.properties.route_id,
+        type: f.geometry.type,
+        coordinates: f.geometry.coordinates
+      })),
+    [
+      {
+        route_id: "R",
+        type: "MultiLineString",
+        coordinates: [
+          [
+            [101.686, 3.139],
+            [101.696, 3.149]
+          ]
+        ]
+      }
+    ]
+  );
+  assert.deepEqual(
+    ktmbNormalBody.features
+      .filter((f) => f.properties.kind === "stop")
+      .map((f) => f.properties.stop_id),
+    ["S", "S2"]
+  );
+});
+
 test("computes frequency departures with exact_times 0 and 1", async () => {
   await seedRapidBusKl();
   const response = await worker.fetch(
@@ -455,4 +745,24 @@ test("computes frequency departures with exact_times 0 and 1", async () => {
     "2026-09-24T08:05:00+08:00"
   );
   assert.equal(body.departures[1].headway_secs, 600);
+});
+
+test("serves /sql read-only queries and enforces method", async () => {
+  const method = await worker.fetch("/ktmb/sql", { method: "GET" });
+  assert.equal(method.status, 405);
+  assert.equal(method.headers.get("Allow"), "POST");
+
+  const ok = await worker.fetch("/ktmb/sql", {
+    method: "POST",
+    body: "SELECT stop_id FROM stops WHERE stop_id = 'S'"
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get("Content-Type"), "application/json");
+  assert.deepEqual(await ok.json(), { data: [{ stop_id: "S" }] });
+
+  const bad = await worker.fetch("/ktmb/sql", {
+    method: "POST",
+    body: "DELETE FROM stops"
+  });
+  assert.equal(bad.status, 400);
 });

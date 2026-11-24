@@ -16,15 +16,12 @@ struct ImportProgress {
 }
 
 fn canonical_cache_key(url: &Url, provider: &str) -> String {
-  let mut cache_url = url.clone();
-  cache_url.set_path(&format!("/{}/status", provider.to_ascii_lowercase()));
-  cache_url.set_query(None);
-  cache_url.to_string()
+  crate::canonical_cache_url(url, provider, "status").to_string()
 }
 
 pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider: &str) -> Result<Response> {
   if req.method() != Method::Get {
-    return Response::error(format!("{} Method Not Allowed", req.method()), 405);
+    return crate::method_not_allowed("GET", false);
   }
 
   let cache_control = crate::api_cache_control(env)?;
@@ -32,8 +29,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   // Query strings, path casing, and a trailing slash do not alter status
   // output; canonicalize them so callers cannot create arbitrary cache keys.
   let cache_key = canonical_cache_key(url, provider);
-  let cache = Cache::default();
-  if let Ok(Some(response)) = cache.get(&cache_key, false).await {
+  if let Ok(Some(response)) = Cache::default().get(&cache_key, false).await {
     return Ok(response);
   }
 
@@ -43,25 +39,17 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   };
 
   // Fetch detailed import progress
-  let progress_results = match d1.prepare(include_str!("sql/import_progress.sql")).all().await {
-    Ok(res) => res,
-    Err(e) if crate::is_d1_row_read_limit(&e.to_string()) => return crate::d1_row_read_limit_response(),
-    Err(e) => return Response::error(format!("Database error: {}", e), 500),
-  };
+  let progress_results = d1.prepare(include_str!("sql/import_progress.sql")).all().await?;
+  if !progress_results.success() {
+    return Err(worker::Error::RustError("Status query failed".into()));
+  }
 
   // Deserialize directly into the response shape to avoid building an
   // intermediate dynamic JSON object tree on every cache miss.
-  let details = match progress_results.results::<ImportProgress>() {
-    Ok(results) => results,
-    Err(e) => return Response::error(format!("Database response error: {}", e), 500),
-  };
+  let details = progress_results.results::<ImportProgress>()?;
 
   let mut response = Response::from_json(&details)?;
-  response.headers_mut().set("Cache-Control", &cache_control)?;
-  let cached_response = response.cloned()?;
-  ctx.wait_until(async move {
-    let _ = Cache::default().put(cache_key, cached_response).await;
-  });
+  crate::cache_response(&ctx, cache_key, &mut response, &cache_control)?;
   Ok(response)
 }
 

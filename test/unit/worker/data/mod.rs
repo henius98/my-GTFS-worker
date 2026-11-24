@@ -7,6 +7,7 @@ fn test_parse_filter_items_single_and_escaped() {
   assert_eq!(parse_filter_items("val@col"), vec!["val@col"]);
   assert_eq!(parse_filter_items(r"val1\,val2@col"), vec!["val1,val2@col"]);
   assert_eq!(parse_filter_items("val1@col1,val2@col2"), vec!["val1@col1", "val2@col2"]);
+  assert_eq!(parse_filter_items("val\x00with_nul@col"), vec!["val\x00with_nul@col"]);
 }
 
 #[test]

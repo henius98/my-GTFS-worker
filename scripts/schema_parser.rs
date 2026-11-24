@@ -114,32 +114,9 @@ pub fn strip_sql_comments(sql: &str) -> String {
   result
 }
 
-pub fn strip_sql_strings(s: &str) -> String {
-  let mut result = String::new();
-  let mut in_string = false;
-  let mut chars = s.chars().peekable();
-  while let Some(ch) = chars.next() {
-    match ch {
-      '\'' if !in_string => {
-        in_string = true;
-        result.push(' ');
-      }
-      '\'' if in_string => {
-        if chars.peek() == Some(&'\'') {
-          chars.next();
-          result.push(' ');
-          result.push(' ');
-        } else {
-          in_string = false;
-          result.push(' ');
-        }
-      }
-      _ if in_string => result.push(' '),
-      _ => result.push(ch),
-    }
-  }
-  result
-}
+#[path = "sql_strings.rs"]
+mod sql_strings;
+pub use sql_strings::strip_sql_strings;
 
 pub fn extract_first_identifier(s: &str) -> Option<&str> {
   let s = s.trim_start();

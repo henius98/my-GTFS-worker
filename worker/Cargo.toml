@@ -15,5 +15,8 @@ serde_json.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 chrono-tz = "0.10"
 
+[package.metadata.wasm-pack.profile.custom]
+wasm-opt = ["-Oz"]
+
 [lints]
 workspace = true

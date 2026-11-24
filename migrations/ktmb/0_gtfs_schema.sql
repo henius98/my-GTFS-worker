@@ -28,8 +28,9 @@ CREATE TABLE IF NOT EXISTS "0_dataset_versions" (ETag TEXT, UpdatedAt DATETIME D
 CREATE TABLE IF NOT EXISTS trips (
   route_id TEXT,
   service_id TEXT,
-  trip_id VARCHAR(20) PRIMARY KEY,
-  direction_id INTEGER
+  trip_id VARCHAR(20),
+  direction_id INTEGER,
+  PRIMARY KEY (route_id, service_id, trip_id)
   -- FOREIGN KEY (route_id) REFERENCES routes(route_id),
   -- FOREIGN KEY (service_id) REFERENCES calendar(service_id)
 ) WITHOUT ROWID;
@@ -77,7 +78,7 @@ CREATE TABLE IF NOT EXISTS stop_times (
   stop_id TEXT,
   stop_sequence INTEGER,
   shape_dist_traveled REAL,
-  PRIMARY KEY (stop_id, trip_id, stop_sequence)
+  PRIMARY KEY (trip_id, stop_id, stop_sequence)
   -- FOREIGN KEY (trip_id) REFERENCES trips(trip_id),
   -- FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
 ) WITHOUT ROWID;

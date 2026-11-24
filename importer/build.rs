@@ -23,6 +23,7 @@ fn push_statement_slice(output: &mut String, indent: &str, statements: &[String]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
   println!("cargo:rerun-if-changed=../migrations");
   println!("cargo:rerun-if-changed=../scripts/schema_parser.rs");
+  println!("cargo:rerun-if-changed=../scripts/sql_strings.rs");
   let out_dir = PathBuf::from(env::var("OUT_DIR")?);
 
   let migrations_dir = PathBuf::from("../migrations");

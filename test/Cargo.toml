@@ -36,7 +36,7 @@ name = "test_data_api"
 path = "worker/test_data_api.rs"
 
 [dependencies]
-chrono.workspace = true
+chrono = { workspace = true, features = ["clock"] }
 csv.workspace = true
 importer = { path = "../importer" }
 reqwest = { workspace = true, features = ["blocking"] }

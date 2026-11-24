@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
-use worker::wasm_bindgen::JsValue;
-use worker::{D1Database, D1Result, Result};
+use worker::{D1Database, D1Result, D1Type, Result};
 
-use super::Parameters;
 use super::schedule::{Calendar, Exception, ParsedService, Template};
+use super::{Parameters, Stop};
 use crate::data::schema;
 
+const STOP_QUERY: &str = include_str!("sql/stop.sql");
 const QUERY: &str = include_str!("sql/query.sql");
 const FREQUENCIES_QUERY: &str = include_str!("sql/query_frequencies.sql");
 const AGENCY_JOIN_SQL: &str = include_str!("sql/agency_join.sql");
@@ -19,12 +19,11 @@ fn decode<T: DeserializeOwned>(result: D1Result) -> Result<Vec<T>> {
   if !result.success() {
     return Err(worker::Error::RustError("Departure query failed".into()));
   }
-  // worker 0.8.x unwraps typed D1 deserialization internally. Decode plain JSON
-  // first so nullable/malformed feed fields return an error instead of a panic.
-  Ok(result.results::<serde_json::Value>()?.into_iter().map(serde_json::from_value).collect::<std::result::Result<Vec<T>, _>>()?)
+  // worker 0.9+ returns typed D1 deserialization errors as Result instead of panicking.
+  result.results::<T>()
 }
 
-pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -> Result<Vec<Template>> {
+pub(super) async fn load_stop_and_templates(db: &D1Database, provider: &str, params: &Parameters) -> Result<Option<(Stop, Vec<Template>)>> {
   let has = |table: &str, column: &str| schema::has_column(provider, table, column);
   let frequencies = has("frequencies", "trip_id");
   let stop_headsign = has("stop_times", "stop_headsign");
@@ -35,13 +34,7 @@ pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -
     (false, true) => "t.trip_headsign",
     (false, false) => "NULL",
   };
-  let route_columns = format!(
-    "{}, {}, {}, {}",
-    if has("routes", "route_short_name") { "r.route_short_name" } else { "NULL AS route_short_name" },
-    if has("routes", "route_long_name") { "r.route_long_name" } else { "NULL AS route_long_name" },
-    if has("routes", "route_color") { "r.route_color" } else { "NULL AS route_color" },
-    if has("routes", "route_text_color") { "r.route_text_color" } else { "NULL AS route_text_color" },
-  );
+  let route_columns = schema::optional_columns(provider, "routes", "r.", &["route_short_name", "route_long_name", "route_color", "route_text_color"]);
   let base_sql = if frequencies { FREQUENCIES_QUERY } else { QUERY };
   let sql = base_sql
     .replace("__ROUTE_COLUMNS__", &route_columns)
@@ -49,23 +42,31 @@ pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -
     .replace("__EXACT_TIMES__", if has("frequencies", "exact_times") { "f.exact_times" } else { "NULL" })
     .replace("__AGENCY_JOIN__", if has("agency", "agency_id") { AGENCY_JOIN_SQL.trim_end() } else { "LEFT JOIN agency a ON 1 = 1" })
     .replace("__PICKUP_FILTER__", if has("stop_times", "pickup_type") { "AND COALESCE(st.pickup_type, 0) <> 1" } else { "" });
-  let result = db
-    .prepare(sql)
-    .bind(&[params.stop_id.clone().into(), params.route_id.clone().map(JsValue::from).unwrap_or(JsValue::NULL), params.direction_id.map(JsValue::from).unwrap_or(JsValue::NULL)])?
-    .all()
-    .await?;
-  let mut templates = decode::<Template>(result)?;
+
+  let stop_stmt = db.prepare(STOP_QUERY).bind_refs(&D1Type::Text(&params.stop_id))?;
+  let templates_stmt =
+    db.prepare(sql).bind_refs(&[D1Type::Text(&params.stop_id), params.route_id.as_deref().map_or(D1Type::Null, D1Type::Text), params.direction_id.map_or(D1Type::Null, D1Type::Integer)])?;
+  let mut initial_results = db.batch(vec![stop_stmt, templates_stmt]).await?.into_iter();
+  let stop_result = initial_results.next().ok_or_else(|| worker::Error::RustError("Missing stop result".into()))?;
+  let templates_result = initial_results.next().ok_or_else(|| worker::Error::RustError("Missing templates result".into()))?;
+
+  let Some(stop) = decode::<Stop>(stop_result)?.into_iter().next() else {
+    return Ok(None);
+  };
+  let mut templates = decode::<Template>(templates_result)?;
   if templates.is_empty() {
-    return Ok(templates);
+    return Ok(Some((stop, templates)));
   }
+
   let service_ids = serde_json::to_string(&templates.iter().map(|template| &template.service_id).collect::<HashSet<_>>())?;
+  let service_ids_arg = D1Type::Text(&service_ids);
   let (calendars_result, exceptions_result) = if has("calendar_dates", "service_id") {
-    let mut results = db.batch(vec![db.prepare(CALENDAR_QUERY).bind(&[service_ids.clone().into()])?, db.prepare(CALENDAR_DATES_QUERY).bind(&[service_ids.into()])?]).await?;
-    let exceptions = results.pop().ok_or_else(|| worker::Error::RustError("Missing calendar_dates result".into()))?;
-    let calendars = results.pop().ok_or_else(|| worker::Error::RustError("Missing calendar result".into()))?;
+    let mut results = db.batch(vec![db.prepare(CALENDAR_QUERY).bind_refs(&service_ids_arg)?, db.prepare(CALENDAR_DATES_QUERY).bind_refs(&service_ids_arg)?]).await?.into_iter();
+    let calendars = results.next().ok_or_else(|| worker::Error::RustError("Missing calendar result".into()))?;
+    let exceptions = results.next().ok_or_else(|| worker::Error::RustError("Missing calendar_dates result".into()))?;
     (calendars, Some(exceptions))
   } else {
-    let calendars = db.prepare(CALENDAR_QUERY).bind(&[service_ids.into()])?.all().await?;
+    let calendars = db.prepare(CALENDAR_QUERY).bind_refs(&service_ids_arg)?.all().await?;
     (calendars, None)
   };
   let calendars: Vec<Calendar> = decode(calendars_result)?;
@@ -73,6 +74,7 @@ pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -
     Some(res) => decode(res)?,
     None => Vec::new(),
   };
+
   let mut calendars_by_service: HashMap<String, Vec<Calendar>> = HashMap::new();
   for calendar in calendars {
     calendars_by_service.entry(calendar.service_id.clone()).or_default().push(calendar);
@@ -86,8 +88,8 @@ pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -
     if services.contains_key(&template.service_id) {
       continue;
     }
-    let c = calendars_by_service.get(&template.service_id).map(|v| v.as_slice()).unwrap_or(&[]);
-    let e = exceptions_by_service.get(&template.service_id).map(|v| v.as_slice()).unwrap_or(&[]);
+    let c = calendars_by_service.get(&template.service_id).map_or(&[][..], Vec::as_slice);
+    let e = exceptions_by_service.get(&template.service_id).map_or(&[][..], Vec::as_slice);
     if let Some(parsed) = ParsedService::build(c, e).map_err(|message| worker::Error::RustError(message.into()))? {
       services.insert(template.service_id.clone(), Arc::new(parsed));
     }
@@ -95,5 +97,5 @@ pub(super) async fn load(db: &D1Database, provider: &str, params: &Parameters) -
   for template in &mut templates {
     template.service = services.get(&template.service_id).cloned();
   }
-  Ok(templates)
+  Ok(Some((stop, templates)))
 }

@@ -2,7 +2,7 @@
 # Regenerate with: ./scripts/generate-wrangler.sh
 
 name = "my-gtfs-worker"
-main = "worker/build/worker/shim.mjs"
+main = "worker/build/index.js"
 compatibility_date = "2026-09-08"
 
 [placement]
@@ -22,6 +22,17 @@ persist = true
 [build]
 command = "bash ./scripts/build.sh"
 
+[vars]
+WORKER_CORS_ALLOW_ORIGIN = "*"                    # Worker SQL max rows; this is the maximum number of rows that can be returned in a single query to the worker.
+WORKER_SQL_MAX_ROWS = "1000"                      # Short edge Cache-Control max-age lifetime in seconds for /status and /data (non-negative integer).
+WORKER_API_CACHE_TTL_SECONDS = "300"               # Feed-level cache lifetime in seconds for /map edge caching and /departures D1 departure_cache (positive integer).
+WORKER_FEED_CACHE_TTL_SECONDS = "86400"           # Max distance in seconds from `now` for /departures requests to populate departure_cache (0 disables writes).
+WORKER_DEPARTURE_CACHE_WINDOW_SECONDS = "300"     # Maximum and default `limit` values for /departures (1 <= default <= max).
+WORKER_DEPARTURES_MAX_LIMIT = "100"
+WORKER_DEPARTURES_DEFAULT_LIMIT = "5"             # Forward search horizon in days for /departures (positive integer).
+WORKER_DEPARTURES_SEARCH_DAYS = "7"               # Fallback IANA timezone when a GTFS feed omits agency_timezone.
+WORKER_DEFAULT_TIMEZONE = "Asia/Kuala_Lumpur"
+
 # ─── Provider D1 Databases ──────────────────────────────────────────────────
 # All providers share the same worker, but queries route to the specific D1 database.
 #
@@ -31,35 +42,35 @@ command = "bash ./scripts/build.sh"
 # ── mybas-johor ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_MYBAS_JOHOR"
-database_id = "11578d7b-8e95-4cd2-a9eb-b79c0a34969c"
+database_id = "c617037b-5f08-43b1-8a68-9e674bbd2a03"
 migrations_dir = "migrations/mybas-johor"
 
 # ── ktmb ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_KTMB"
-database_id = "d7e59044-ef3b-469c-8522-abc18c2304d5"
+database_id = "6588b1c2-18c2-461b-908f-b26f4c3be298"
 migrations_dir = "migrations/ktmb"
 
 # ── rapid-bus-mrtfeeder ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_BUS_MRTFEEDER"
-database_id = "5554680f-2629-4ffe-87d9-98e11ce68b6c"
+database_id = "4834f12b-7894-4a89-8405-d632aaeff5d6"
 migrations_dir = "migrations/rapid-bus-mrtfeeder"
 
 # ── rapid-rail-kl ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_RAIL_KL"
-database_id = "f2ac7f44-6947-4de3-ad31-2f6eba264f09"
+database_id = "2dab4d70-cb49-405b-89a2-82117ca288b8"
 migrations_dir = "migrations/rapid-rail-kl"
 
 # ── rapid-bus-kl ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_BUS_KL"
-database_id = "fe6b7fae-09ae-407e-83a7-f3ddc33846c1"
+database_id = "5bc9bf7f-05cf-458b-96e9-27f1833e0774"
 migrations_dir = "migrations/rapid-bus-kl"
 
 # ── rapid-bus-penang ─────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB_RAPID_BUS_PENANG"
-database_id = "e1f9a85f-152f-41c3-a5d9-08a54509e915"
+database_id = "5e0f6c68-0cd4-4360-8a40-8156256ad9e3"
 migrations_dir = "migrations/rapid-bus-penang"

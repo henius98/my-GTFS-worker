@@ -25,10 +25,10 @@ fn cached_entry(count: usize) -> Entry {
 
 #[test]
 fn cache_ttl_parses_positive_values_and_rejects_invalid_values() {
-  assert_eq!(crate::parse_positive_i64("86400", crate::MAX_TTL_SECONDS), Some(24 * 60 * 60));
-  assert_eq!(crate::parse_positive_i64(" 3600 ", crate::MAX_TTL_SECONDS), Some(3600));
+  assert_eq!(crate::parse_int_in_range("86400", 1i64, crate::MAX_TTL_SECONDS), Some(24 * 60 * 60));
+  assert_eq!(crate::parse_int_in_range(" 3600 ", 1i64, crate::MAX_TTL_SECONDS), Some(3600));
   for value in ["", "0", "-1", "one hour", "9223372036854776"] {
-    assert_eq!(crate::parse_positive_i64(value, crate::MAX_TTL_SECONDS), None);
+    assert_eq!(crate::parse_int_in_range(value, 1i64, crate::MAX_TTL_SECONDS), None);
   }
 }
 

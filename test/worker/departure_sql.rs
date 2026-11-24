@@ -1,7 +1,7 @@
 //! Exercise the Worker's cache SQL and migrations without compiling Worker code.
 
 use gtfs_checks::{CheckResult, providers, root};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::fs;
 
@@ -30,7 +30,8 @@ fn write(db: &Connection, payload: &Value, requested_revision: Option<&str>, exp
 }
 
 fn read(db: &Connection, now: i64, route: &str, direction: i64) -> CheckResult<Option<Value>> {
-  let payload: Option<String> = db.query_row(&sql("cache_read.sql")?, params!["S", route, direction, revision(db)?, now], |row| row.get(0)).optional()?;
+  let statement = sql("cache_read.sql")?.replace("__FEED_STATE__", &sql("feed_state.sql")?);
+  let payload: Option<String> = db.query_row(&statement, params!["S", route, direction, now], |row| row.get(1))?;
   payload.map(|text| serde_json::from_str(&text).map_err(Into::into)).transpose()
 }
 
@@ -160,8 +161,7 @@ fn ktmb_departure_query_uses_primary_keys_and_agency_fallback() -> CheckResult {
     .replace("__PICKUP_FILTER__", "");
 
   let plan = explain_plan(&db, &query, &[&"S1", &Option::<String>::None, &Option::<i64>::None])?;
-  assert!(plan.iter().any(|step| step.contains("SEARCH st USING PRIMARY KEY (stop_id=?)")), "{plan:?}");
-  assert!(plan.iter().any(|step| step.contains("SEARCH t USING PRIMARY KEY (trip_id=?)")), "{plan:?}");
+  assert!(plan.iter().any(|step| step.contains("SEARCH st USING PRIMARY KEY (trip_id=? AND stop_id=?)")), "{plan:?}");
   assert!(plan.iter().any(|step| step.contains("SEARCH r USING PRIMARY KEY (route_id=?)")), "{plan:?}");
   assert!(plan.iter().any(|step| step.contains("SEARCH a USING PRIMARY KEY (agency_id=?)")), "{plan:?}");
   assert!(!plan.iter().any(|step| step.starts_with("SCAN a ")), "{plan:?}");
@@ -210,26 +210,182 @@ fn ktmb_map_queries_deduplicate_and_use_primary_keys() -> CheckResult {
   let db = database()?;
   db.execute("INSERT INTO routes (route_id) VALUES ('R1'), ('R2')", [])?;
   db.execute("INSERT INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES ('S1', 'A', 3.1, 101.6), ('S2', 'B', 3.2, 101.7), ('S3', 'C', 3.3, 101.8)", [])?;
-  db.execute("INSERT INTO trips (trip_id, route_id, service_id, direction_id) VALUES ('T1', 'R1', 'SVC', 0), ('T2', 'R1', 'SVC', 0), ('T3', 'R2', 'SVC', 0)", [])?;
+  db.execute("INSERT INTO calendar (service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date) VALUES ('SVC', 1, 1, 1, 1, 1, 1, 1, 20260101, 20261231)", [])?;
+  db.execute("INSERT INTO trips (trip_id, route_id, service_id, direction_id) VALUES ('T1', 'R1', 'SVC', 0), ('T2', 'R1', 'SVC', 1), ('T3', 'R2', 'SVC', 0)", [])?;
   db.execute(
-    "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES ('T1', 'S1', 1, '08:00:00', '08:00:00'), ('T1', 'S2', 2, '08:10:00', '08:10:00'), ('T2', 'S1', 1, '09:00:00', '09:00:00'), ('T2', 'S2', 2, '09:10:00', '09:10:00'), ('T3', 'S2', 1, '10:00:00', '10:00:00'), ('T3', 'S3', 2, '10:10:00', '10:10:00')",
+    "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES ('T1', 'S1', 1, '08:00:00', '08:00:00'), ('T1', 'S2', 2, '08:10:00', '08:10:00'), ('T2', 'S2', 1, '09:00:00', '09:00:00'), ('T2', 'S1', 2, '09:10:00', '09:10:00'), ('T3', 'S2', 1, '10:00:00', '10:00:00'), ('T3', 'S3', 2, '10:10:00', '10:10:00')",
     [],
   )?;
 
-  let segments_sql = map_sql("segments.sql")?.replace("__TRIP_FILTER__", " WHERE trips.route_id = ?1");
-  let segments = db.prepare(&segments_sql)?.query_map(params!["R1"], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
-  assert_eq!(segments, vec![("R1".into(), "S1".into(), "S2".into())]);
+  let active_services = map_sql("active_services_calendar.sql")?.trim_end().replace("__WEEKDAY__", "monday").replace("__DATE__", "20260921");
+
+  let route_trips_sql = map_sql("route_trips.sql")?
+    .replace("__ACTIVE_SERVICES__", &active_services)
+    .replace("__ROUTE_COLUMNS__", "routes.route_short_name, routes.route_long_name, routes.route_color")
+    .replace("__SHAPE_IDS_EXPR__", "'[]' AS shape_ids_json");
+  let route_trips_plan = explain_plan(&db, &route_trips_sql, &[&"R1"])?;
+  assert!(route_trips_plan.first().is_some_and(|step| step.contains("SEARCH routes USING PRIMARY KEY (route_id=?)")), "{route_trips_plan:?}");
+  assert!(route_trips_plan.iter().any(|step| step.contains("SEARCH trips USING PRIMARY KEY (route_id=?")), "{route_trips_plan:?}");
+  let (trip_ids_json, shape_ids_json): (String, String) = db.query_row(&route_trips_sql, params!["R1"], |row| Ok((row.get(4)?, row.get(5)?)))?;
+  assert_eq!(serde_json::from_str::<Vec<String>>(&trip_ids_json)?, vec!["T1", "T2"]);
+  assert_eq!(shape_ids_json, "[]");
+  let missing_trips = db.prepare(&route_trips_sql)?.query_map(params!["MISSING"], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+  assert!(missing_trips.is_empty());
+
+  // Reverse trips (S1 -> S2 and S2 -> S1) collapse into one undirected coordinate pair in a single materialized scan.
+  let merged_by_route_sql = map_sql("segments_and_stops_by_route.sql")?;
+  let merged_plan = explain_plan(&db, &merged_by_route_sql, &[&trip_ids_json])?;
+  assert!(merged_plan.iter().any(|step| step.contains("MATERIALIZE trip_stop_times")), "{merged_plan:?}");
+  assert!(merged_plan.iter().any(|step| step.contains("SEARCH stop_times USING PRIMARY KEY (trip_id=?)")), "{merged_plan:?}");
+  assert!(merged_plan.iter().any(|step| step.contains("SEARCH stops USING PRIMARY KEY (stop_id=?)")), "{merged_plan:?}");
+  let merged_rows = db
+    .prepare(&merged_by_route_sql)?
+    .query_map(params![&trip_ids_json], |row| {
+      Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, f64>(3)?, row.get::<_, f64>(4)?, row.get::<_, Option<f64>>(5)?, row.get::<_, Option<f64>>(6)?))
+    })?
+    .collect::<Result<Vec<_>, _>>()?;
+  assert_eq!(
+    merged_rows,
+    vec![("segment".into(), None, 3.1, 101.6, Some(3.2), Some(101.7)), ("stop".into(), Some("S1".into()), 3.1, 101.6, None, None), ("stop".into(), Some("S2".into()), 3.2, 101.7, None, None),]
+  );
 
   let stops_by_route_sql = map_sql("stops_by_route.sql")?;
-  let plan = explain_plan(&db, &stops_by_route_sql, &[&"R1"])?;
-  assert!(plan.iter().any(|step| step.contains("SEARCH stop_times USING PRIMARY KEY (stop_id=?)")), "{plan:?}");
-  assert!(!plan.iter().any(|step| step.contains("TEMP B-TREE")), "{plan:?}");
+  let plan = explain_plan(&db, &stops_by_route_sql, &[&trip_ids_json])?;
+  assert!(plan.iter().any(|step| step.contains("SEARCH stops USING PRIMARY KEY (stop_id=?)")), "{plan:?}");
+  assert!(!plan.iter().any(|step| step.contains("trips")), "{plan:?}");
 
-  let filtered_stops = db.prepare(&stops_by_route_sql)?.query_map(params!["R1"], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?.collect::<Result<Vec<_>, _>>()?;
-  assert_eq!(filtered_stops, vec![("R1".into(), "S1".into()), ("R1".into(), "S2".into())]);
+  let filtered_stops = db
+    .prepare(&stops_by_route_sql)?
+    .query_map(params![&trip_ids_json], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?)))?
+    .collect::<Result<Vec<_>, _>>()?;
+  assert_eq!(
+    filtered_stops,
+    vec![("S1".into(), Some("08:00:00, 09:10:00".into()), Some("08:00:00, 09:10:00".into())), ("S2".into(), Some("08:10:00, 09:00:00".into()), Some("08:10:00, 09:00:00".into())),]
+  );
 
-  let all_stops_sql = map_sql("stops.sql")?;
-  let all_stops = db.prepare(&all_stops_sql)?.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?.collect::<Result<Vec<_>, _>>()?;
-  assert_eq!(all_stops, vec![("R1".into(), "S1".into()), ("R1".into(), "S2".into()), ("R2".into(), "S2".into()), ("R2".into(), "S3".into())]);
+  let all_merged_sql = map_sql("segments_and_stops.sql")?.replace("__ACTIVE_SERVICES__", &active_services);
+  let all_merged = db
+    .prepare(&all_merged_sql)?
+    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, f64>(4)?, row.get::<_, Option<f64>>(6)?)))?
+    .collect::<Result<Vec<_>, _>>()?;
+  assert_eq!(
+    all_merged,
+    vec![
+      ("segment".into(), "R1".into(), None, 3.1, Some(3.2)),
+      ("segment".into(), "R2".into(), None, 3.2, Some(3.3)),
+      ("stop".into(), "R1".into(), Some("S1".into()), 3.1, None),
+      ("stop".into(), "R1".into(), Some("S2".into()), 3.2, None),
+      ("stop".into(), "R2".into(), Some("S2".into()), 3.2, None),
+      ("stop".into(), "R2".into(), Some("S3".into()), 3.3, None),
+    ]
+  );
+
+  let all_stops_sql = map_sql("stops.sql")?.replace("__ACTIVE_SERVICES__", &active_services);
+  let all_stops = db
+    .prepare(&all_stops_sql)?
+    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?)))?
+    .collect::<Result<Vec<_>, _>>()?;
+  assert_eq!(
+    all_stops,
+    vec![
+      ("R1".into(), "S1".into(), Some("08:00:00, 09:10:00".into()), Some("08:00:00, 09:10:00".into())),
+      ("R1".into(), "S2".into(), Some("08:10:00, 09:00:00".into()), Some("08:10:00, 09:00:00".into())),
+      ("R2".into(), "S2".into(), Some("10:00:00".into()), Some("10:00:00".into())),
+      ("R2".into(), "S3".into(), Some("10:10:00".into()), Some("10:10:00".into())),
+    ]
+  );
+  Ok(())
+}
+
+#[test]
+fn map_queries_filter_by_date_with_calendar_and_calendar_dates_exceptions() -> CheckResult {
+  let db = Connection::open_in_memory()?;
+  db.execute_batch(&fs::read_to_string(root().join("migrations/rapid-bus-mrtfeeder/0_gtfs_schema.sql"))?)?;
+  db.execute("INSERT INTO routes (route_id) VALUES ('U1')", [])?;
+  db.execute("INSERT INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES ('S1', 'A', 3.1, 101.6), ('S2', 'B', 3.2, 101.7), ('S3', 'C', 3.3, 101.8), ('S4', 'D', 3.4, 101.9)", [])?;
+  db.execute(
+    "INSERT INTO shapes (shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence) VALUES ('SH_WD', 3.1, 101.6, 1), ('SH_WD', 3.2, 101.7, 2), ('SH_WE', 3.1, 101.6, 1), ('SH_WE', 3.3, 101.8, 2), ('SH_HOL', 3.1, 101.6, 1), ('SH_HOL', 3.4, 101.9, 2)",
+    [],
+  )?;
+  db.execute(
+    "INSERT INTO calendar (service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date) VALUES ('WD', 1, 1, 1, 1, 1, 0, 0, 20260901, 20260930), ('WE', 0, 0, 0, 0, 0, 1, 1, 20260901, 20260930)",
+    [],
+  )?;
+  // 2026-09-21 (Monday): remove WD (exception_type = 2), add HOL (calendar_dates-only, exception_type = 1)
+  // 2026-09-28 (Monday): normal WD schedule
+  db.execute("INSERT INTO calendar_dates (service_id, date, exception_type) VALUES ('WD', 20260921, 2), ('HOL', 20260921, 1)", [])?;
+  db.execute("INSERT INTO trips (trip_id, route_id, service_id, shape_id) VALUES ('T_WD', 'U1', 'WD', 'SH_WD'), ('T_WE', 'U1', 'WE', 'SH_WE'), ('T_HOL', 'U1', 'HOL', 'SH_HOL')", [])?;
+  db.execute(
+    "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES ('T_WD', 'S1', 1, '08:00:00', '08:00:00'), ('T_WD', 'S2', 2, '08:10:00', '08:10:00'), ('T_WE', 'S1', 1, '09:00:00', '09:00:00'), ('T_WE', 'S3', 2, '09:10:00', '09:10:00'), ('T_HOL', 'S1', 1, '10:00:00', '10:00:00'), ('T_HOL', 'S4', 2, '10:10:00', '10:10:00')",
+    [],
+  )?;
+
+  let exc_cte_template = map_sql("active_services_with_exceptions.sql")?;
+  let exc_cte = |yyyymmdd: i32, weekday: &str| exc_cte_template.trim_end().replace("__WEEKDAY__", weekday).replace("__DATE__", &yyyymmdd.to_string());
+  let cal_only_cte = map_sql("active_services_calendar.sql")?.trim_end().replace("__WEEKDAY__", "monday").replace("__DATE__", "20260928");
+  let route_trips_template = map_sql("route_trips.sql")?
+    .replace("__ROUTE_COLUMNS__", "routes.route_short_name, routes.route_long_name, NULL AS route_color")
+    .replace("__SHAPE_IDS_EXPR__", "json_group_array(DISTINCT trips.shape_id) FILTER (WHERE trips.shape_id IS NOT NULL AND trips.shape_id <> '') AS shape_ids_json");
+
+  // Single-route query starts from routes primary key and returns JSON trip/shape arrays.
+  let cal_trips_sql = route_trips_template.replace("__ACTIVE_SERVICES__", &cal_only_cte);
+  let plan = explain_plan(&db, &cal_trips_sql, &[&"U1"])?;
+  assert!(plan.first().is_some_and(|step| step.contains("SEARCH routes USING PRIMARY KEY (route_id=?)")), "{plan:?}");
+  let (cal_trip_ids_json, cal_shape_ids_json): (String, String) = db.query_row(&cal_trips_sql, params!["U1"], |row| Ok((row.get(4)?, row.get(5)?)))?;
+  assert_eq!(cal_trip_ids_json, r#"["T_WD"]"#);
+  assert_eq!(cal_shape_ids_json, r#"["SH_WD"]"#);
+
+  let shapes_by_route_sql = map_sql("shapes_by_route.sql")?;
+  let shape_plan = explain_plan(&db, &shapes_by_route_sql, &[&cal_shape_ids_json])?;
+  assert!(shape_plan.iter().any(|step| step.contains("SEARCH shapes USING PRIMARY KEY (shape_id=?)")), "{shape_plan:?}");
+  let cal_shapes = db.prepare(&shapes_by_route_sql)?.query_map(params![&cal_shape_ids_json], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+  assert_eq!(cal_shapes, vec!["SH_WD", "SH_WD"]);
+
+  // Holiday Monday (2026-09-21): WD removed, HOL added.
+  let hol_cte = exc_cte(20260921, "monday");
+  let hol_trips_sql = route_trips_template.replace("__ACTIVE_SERVICES__", &hol_cte);
+  let (hol_trip_ids_json, hol_shape_ids_json): (String, String) = db.query_row(&hol_trips_sql, params!["U1"], |row| Ok((row.get(4)?, row.get(5)?)))?;
+  assert_eq!(hol_trip_ids_json, r#"["T_HOL"]"#);
+  assert_eq!(hol_shape_ids_json, r#"["SH_HOL"]"#);
+
+  // Out-of-range Monday (2026-10-05): route exists with empty JSON arrays.
+  let oob_cte = exc_cte(20261005, "monday");
+  let oob_trips_sql = route_trips_template.replace("__ACTIVE_SERVICES__", &oob_cte);
+  let (oob_trip_ids_json, oob_shape_ids_json): (String, String) = db.query_row(&oob_trips_sql, params!["U1"], |row| Ok((row.get(4)?, row.get(5)?)))?;
+  assert_eq!(oob_trip_ids_json, "[]");
+  assert_eq!(oob_shape_ids_json, "[]");
+
+  let hol_shapes = db.prepare(&shapes_by_route_sql)?.query_map(params![&hol_shape_ids_json], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+  assert_eq!(hol_shapes, vec!["SH_HOL", "SH_HOL"]);
+
+  let hol_merged_sql = map_sql("segments_and_stops_by_route.sql")?;
+  let hol_segments = db
+    .prepare(&hol_merged_sql)?
+    .query_map(params![&hol_trip_ids_json], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(3)?, row.get::<_, f64>(4)?, row.get::<_, Option<f64>>(5)?, row.get::<_, Option<f64>>(6)?)))?
+    .collect::<Result<Vec<_>, _>>()?;
+  assert_eq!(hol_segments.into_iter().filter(|row| row.0 == "segment").collect::<Vec<_>>(), vec![("segment".into(), 3.1, 101.6, Some(3.4), Some(101.9))]);
+
+  let hol_stops_sql = map_sql("stops_by_route.sql")?;
+  let hol_stops = db
+    .prepare(&hol_stops_sql)?
+    .query_map(params![&hol_trip_ids_json], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?)))?
+    .collect::<Result<Vec<_>, _>>()?;
+  assert_eq!(hol_stops, vec![("S1".into(), Some("10:00:00".into()), Some("10:00:00".into())), ("S4".into(), Some("10:10:00".into()), Some("10:10:00".into()))]);
+
+  let hol_all_stops_sql = map_sql("stops.sql")?.replace("__ACTIVE_SERVICES__", &hol_cte);
+  let hol_all_stops =
+    db.prepare(&hol_all_stops_sql)?.query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?)))?.collect::<Result<Vec<_>, _>>()?;
+  assert_eq!(hol_all_stops, vec![("S1".into(), Some("10:00:00".into()), Some("10:00:00".into())), ("S4".into(), Some("10:10:00".into()), Some("10:10:00".into()))]);
+
+  // Normal Monday (2026-09-28): WD active, HOL inactive.
+  let norm_cte = exc_cte(20260928, "monday");
+  let norm_shapes_sql = map_sql("shapes.sql")?.replace("__ACTIVE_SERVICES__", &norm_cte);
+  let norm_shapes = db.prepare(&norm_shapes_sql)?.query_map([], |row| row.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>()?;
+  assert_eq!(norm_shapes, vec!["SH_WD", "SH_WD"]);
+
+  // Out-of-range Monday (2026-10-05): no active service.
+  let oob_shapes_sql = map_sql("shapes.sql")?.replace("__ACTIVE_SERVICES__", &oob_cte);
+  let oob_shapes = db.prepare(&oob_shapes_sql)?.query_map([], |row| row.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>()?;
+  assert!(oob_shapes.is_empty());
   Ok(())
 }

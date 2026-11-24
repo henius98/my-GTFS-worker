@@ -12,8 +12,8 @@ serde_json.workspace = true
 zip.workspace = true
 csv.workspace = true
 thiserror.workspace = true
-chrono.workspace = true
-toml_edit = { version = "0.22.27", features = ["serde"] }
+chrono = { workspace = true, features = ["clock"] }
+toml_edit = { version = "0.25.20", features = ["serde"] }
 
 [lints]
 workspace = true

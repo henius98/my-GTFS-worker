@@ -45,7 +45,7 @@ header = """# AUTO-GENERATED from providers.toml — do not edit directly.
 # Regenerate with: ./scripts/generate-wrangler.sh
 
 name = "my-gtfs-worker"
-main = "worker/build/worker/shim.mjs"
+main = "worker/build/index.js"
 compatibility_date = "2026-09-08"
 
 [placement]
@@ -64,6 +64,17 @@ persist = true
 
 [build]
 command = "bash ./scripts/build.sh"
+
+[vars]
+WORKER_CORS_ALLOW_ORIGIN = "*"                    # Worker SQL max rows; this is the maximum number of rows that can be returned in a single query to the worker.
+WORKER_SQL_MAX_ROWS = "1000"                      # Short edge Cache-Control max-age lifetime in seconds for /status and /data (non-negative integer).
+WORKER_API_CACHE_TTL_SECONDS = "60"               # Feed-level cache lifetime in seconds for /map edge caching and /departures D1 departure_cache (positive integer).
+WORKER_FEED_CACHE_TTL_SECONDS = "86400"           # Max distance in seconds from `now` for /departures requests to populate departure_cache (0 disables writes).
+WORKER_DEPARTURE_CACHE_WINDOW_SECONDS = "300"     # Maximum and default `limit` values for /departures (1 <= default <= max).
+WORKER_DEPARTURES_MAX_LIMIT = "100"
+WORKER_DEPARTURES_DEFAULT_LIMIT = "5"             # Forward search horizon in days for /departures (positive integer).
+WORKER_DEPARTURES_SEARCH_DAYS = "7"               # Fallback IANA timezone when a GTFS feed omits agency_timezone.
+WORKER_DEFAULT_TIMEZONE = "Asia/Kuala_Lumpur"
 
 # ─── Provider D1 Databases ──────────────────────────────────────────────────
 # All providers share the same worker, but queries route to the specific D1 database.

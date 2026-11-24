@@ -7,10 +7,10 @@
 --   PICKUP_FILTER - Optional pickup_type filter.
 --
 -- Performance note:
--- stop_times has PRIMARY KEY (stop_id, trip_id, stop_sequence) WITHOUT ROWID
--- and no secondary trip_id index. Computing first_stops via a gated CTE avoids
--- N correlated full table scans of stop_times (0 scans when no frequency trips
--- match, at most 1 scan otherwise).
+-- stop_times has PRIMARY KEY (trip_id, stop_id, stop_sequence) WITHOUT ROWID
+-- and no secondary stop_id index. Computing first_stops via a gated CTE avoids
+-- N correlated lookups (0 lookups when no frequency trips match, PK prefix
+-- lookups on trip_id otherwise).
 --
 -- Parameters:
 --   ?1: stop_id, ?2: route_id or NULL, ?3: direction_id or NULL
