@@ -102,6 +102,7 @@ def load_worker_vars() -> dict[str, str]:
     "WORKER_SQL_MAX_ROWS": "1000",
     "WORKER_API_CACHE_TTL_SECONDS": "60",
     "WORKER_FEED_CACHE_TTL_SECONDS": "86400",
+    "WORKER_MAP_MAX_ROUTES": "20",
     "WORKER_DEPARTURE_CACHE_WINDOW_SECONDS": "300",
     "WORKER_DEPARTURES_MAX_LIMIT": "100",
     "WORKER_DEPARTURES_DEFAULT_LIMIT": "5",
@@ -143,6 +144,7 @@ def build_openapi_spec() -> dict[str, Any]:
   sql_max_rows = int(worker_vars["WORKER_SQL_MAX_ROWS"])
   api_cache_ttl = int(worker_vars["WORKER_API_CACHE_TTL_SECONDS"])
   feed_cache_ttl = int(worker_vars["WORKER_FEED_CACHE_TTL_SECONDS"])
+  map_max_routes = int(worker_vars["WORKER_MAP_MAX_ROUTES"])
   departures_max_limit = int(worker_vars["WORKER_DEPARTURES_MAX_LIMIT"])
   departures_default_limit = int(worker_vars["WORKER_DEPARTURES_DEFAULT_LIMIT"])
   departures_search_days = int(worker_vars["WORKER_DEPARTURES_SEARCH_DAYS"])
@@ -583,16 +585,20 @@ def build_openapi_spec() -> dict[str, Any]:
             "Providers with a `shapes` table emit `LineString` route features (`geometry_source: \"shape\"`); "
             "providers without shapes (or routes without shape points) fall back to `MultiLineString` stop-to-stop segments "
             "(`geometry_source: \"stop_sequence\"`). Stops emit `Point` features.\n\n"
-            f"Edge-cached using `WORKER_FEED_CACHE_TTL_SECONDS` (`{feed_cache_ttl}`s)."
+            f"Edge-cached per route using `WORKER_FEED_CACHE_TTL_SECONDS` (`{feed_cache_ttl}`s); multi-route calls query D1 only for cache misses."
           ),
           "parameters": [
             {
               "name": "route_id",
               "in": "query",
               "required": False,
-              "description": "Optional GTFS route identifier to filter the map to one route (1 to 256 bytes after trimming).",
-              "schema": {"type": "string", "minLength": 1, "maxLength": 256},
-              "example": "KJL",
+              "description": (
+                f"Optional comma-separated GTFS route identifiers to filter the map "
+                f"(1 to {map_max_routes} unique routes, each 1 to 256 bytes after trimming). "
+                "Returns `404` only if zero requested routes have active trips on the target date."
+              ),
+              "schema": {"type": "string", "minLength": 1},
+              "example": "KJL,PYL",
             },
             {
               "name": "date",
@@ -1009,6 +1015,11 @@ def build_openapi_spec() -> dict[str, Any]:
             "kind": {"type": "string", "const": "route"},
             "route_id": {"type": "string"},
             "shape_id": {"type": "string"},
+            "trip_ids": {
+              "type": "array",
+              "items": {"type": "string"},
+              "description": "Sorted active `trip_id` values using this `(route_id, shape_id)` shape on unfiltered `/map` requests.",
+            },
             "geometry_source": {"type": "string", "const": "shape"},
             "route_short_name": {"type": ["string", "null"]},
             "route_long_name": {"type": ["string", "null"]},
@@ -1051,8 +1062,13 @@ def build_openapi_spec() -> dict[str, Any]:
             "route_id": {"type": "string"},
             "stop_id": {"type": "string"},
             "stop_name": {"type": ["string", "null"]},
-            "arrival_times": {"type": ["string", "null"], "description": "Aggregated arrival times for active trips at this stop."},
-            "departure_times": {"type": ["string", "null"], "description": "Aggregated departure times for active trips at this stop."},
+            "trip_ids": {
+              "type": "array",
+              "items": {"type": "string"},
+              "description": "Ordered GTFS trip_ids aligned with arrival_times and departure_times (present on unfiltered /map responses).",
+            },
+            "arrival_times": {"type": ["string", "null"], "description": "Aggregated arrival times ordered by trip_id and stop_sequence."},
+            "departure_times": {"type": ["string", "null"], "description": "Aggregated departure times ordered by trip_id and stop_sequence."},
           },
         },
         "ShapeRouteFeature": {

@@ -19,7 +19,7 @@ explore other GTFS data.
   `WITH ... SELECT`) query as plain text. Protected by `WORKER_ADMIN_KEY`.
 - **Departures**: `GET /<provider>/departures` estimates upcoming departures at
   a required `stop_id`; `route_id`, `direction_id`, `limit`, and `at` filters are optional.
-- **Map**: `GET /<provider>/map` returns GeoJSON for a full network or one route,
+- **Map**: `GET /<provider>/map` returns GeoJSON for a full network or one or more comma-separated routes (`route_id`),
   edge-cached for `WORKER_FEED_CACHE_TTL_SECONDS` (86400 seconds in `.env.example`).
 - **Original GTFS**: `GET https://api.data.gov.my/gtfs-static/...` downloads the
   raw upstream GTFS static ZIP archive for every active provider in `providers.toml`.

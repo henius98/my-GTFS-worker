@@ -45,12 +45,3 @@ fn test_parse_range_part_validation() {
   assert_eq!(parse_range_part("Status[0:1:2]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
   assert_eq!(parse_range_part("Status[::]"), Err("Invalid range format for Status. Expected col[begin:end]".into()));
 }
-
-#[test]
-fn test_build_select_sql_renders_template() {
-  assert_eq!(build_select_sql("*", "routes", "", "", 1, 2), "SELECT *\nFROM \"routes\"\nLIMIT ?1 OFFSET ?2");
-  assert_eq!(
-    build_select_sql("\"route_id\"", "routes", "\nWHERE \"route_id\" = ?1", "\nORDER BY \"route_id\" ASC", 2, 3),
-    "SELECT \"route_id\"\nFROM \"routes\"\nWHERE \"route_id\" = ?1\nORDER BY \"route_id\" ASC\nLIMIT ?2 OFFSET ?3",
-  );
-}

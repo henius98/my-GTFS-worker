@@ -70,6 +70,7 @@ WORKER_CORS_ALLOW_ORIGIN = "*"                    # Worker SQL max rows; this is
 WORKER_SQL_MAX_ROWS = "1000"                      # Short edge Cache-Control max-age lifetime in seconds for /status and /data (non-negative integer).
 WORKER_API_CACHE_TTL_SECONDS = "60"               # Feed-level cache lifetime in seconds for /map edge caching and /departures D1 departure_cache (positive integer).
 WORKER_FEED_CACHE_TTL_SECONDS = "86400"           # Max distance in seconds from `now` for /departures requests to populate departure_cache (0 disables writes).
+WORKER_MAP_MAX_ROUTES = "20"                      # Maximum distinct route_id values accepted in one /map request (positive integer).
 WORKER_DEPARTURE_CACHE_WINDOW_SECONDS = "300"     # Maximum and default `limit` values for /departures (1 <= default <= max).
 WORKER_DEPARTURES_MAX_LIMIT = "100"
 WORKER_DEPARTURES_DEFAULT_LIMIT = "5"             # Forward search horizon in days for /departures (positive integer).

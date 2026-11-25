@@ -120,6 +120,10 @@ pub(crate) fn feed_cache_control(env: &Env) -> Result<String> {
   Ok(format!("public, max-age={}", feed_cache_ttl_seconds(env)?))
 }
 
+pub(crate) fn map_max_routes(env: &Env) -> Result<usize> {
+  parse_required_var(env, "WORKER_MAP_MAX_ROUTES", |raw| parse_int_in_range(raw, 1, usize::MAX), "must be a positive integer")
+}
+
 #[event(fetch)]
 pub async fn fetch_route(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
   console_error_panic_hook::set_once();

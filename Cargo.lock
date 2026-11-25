@@ -930,6 +930,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "console_error_panic_hook",
+ "futures-util",
  "serde",
  "serde_json",
  "worker",

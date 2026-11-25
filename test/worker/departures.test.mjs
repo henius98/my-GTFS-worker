@@ -454,23 +454,40 @@ test("returns map GeoJSON from stop_sequence fallback and shapes", async () => {
     (feature) => feature.properties.kind === "route"
   );
   assert.equal(shapeRoute.properties.geometry_source, "shape");
+  assert.equal("trip_ids" in shapeRoute.properties, false);
   assert.deepEqual(shapeRoute.geometry.coordinates, [
     [101.6, 3.1],
     [101.7, 3.2]
   ]);
 
+  // Add a second active trip sharing SH1 on U1 to verify unfiltered /map aggregates trip_ids without duplicating geometry.
+  const { DB_RAPID_BUS_KL: busDb } = await worker.getEnv();
+  await busDb
+    .prepare(
+      "INSERT INTO trips (trip_id, route_id, service_id, shape_id, trip_headsign, direction_id) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .bind("freq-exact-2", "U1", "daily", "SH1", "Exact 2", 1)
+    .run();
+
   const shapeAllMap = await worker.fetch("/rapid-bus-kl/map");
   assert.equal(shapeAllMap.status, 200);
   const shapeAllBody = await shapeAllMap.json();
   assert.equal(shapeAllBody.type, "FeatureCollection");
-  assert.ok(
-    shapeAllBody.features.some(
-      (feature) =>
-        feature.properties.kind === "route" &&
-        feature.properties.route_id === "U1" &&
-        feature.properties.geometry_source === "shape"
-    )
+  const shapeAllRoutes = shapeAllBody.features.filter(
+    (feature) => feature.properties.kind === "route"
   );
+  assert.equal(shapeAllRoutes.length, 1);
+  assert.equal(shapeAllRoutes[0].properties.route_id, "U1");
+  assert.equal(shapeAllRoutes[0].properties.shape_id, "SH1");
+  assert.equal(shapeAllRoutes[0].properties.geometry_source, "shape");
+  assert.deepEqual(shapeAllRoutes[0].properties.trip_ids, [
+    "freq-exact",
+    "freq-exact-2"
+  ]);
+  assert.deepEqual(shapeAllRoutes[0].geometry.coordinates, [
+    [101.6, 3.1],
+    [101.7, 3.2]
+  ]);
 });
 
 test("filters map GeoJSON shapes, fallback segments, and stops by date including calendar_dates exceptions", async () => {
@@ -556,8 +573,11 @@ test("filters map GeoJSON shapes, fallback segments, and stops by date including
   assert.deepEqual(
     sunBody.features
       .filter((f) => f.properties.kind === "route")
-      .map((f) => f.properties.shape_id),
-    ["SH_SUN"]
+      .map((f) => ({
+        shape_id: f.properties.shape_id,
+        trip_ids: f.properties.trip_ids
+      })),
+    [{ shape_id: "SH_SUN", trip_ids: ["sun-trip"] }]
   );
   assert.deepEqual(
     sunBody.features
@@ -721,6 +741,290 @@ test("filters map GeoJSON shapes, fallback segments, and stops by date including
       .filter((f) => f.properties.kind === "stop")
       .map((f) => f.properties.stop_id),
     ["S", "S2"]
+  );
+});
+
+test("supports comma-separated multi-route /map queries across shapes, fallback segments, and partial matches", async () => {
+  for (const invalid of [
+    "/ktmb/map?route_id=R,",
+    "/ktmb/map?route_id=,R",
+    "/ktmb/map?route_id=R,,R2",
+    "/ktmb/map?route_id=R&route_id=R2"
+  ]) {
+    assert.equal((await worker.fetch(invalid)).status, 400, invalid);
+  }
+  assert.equal(
+    (await worker.fetch("/ktmb/map?route_id=missing1,missing2")).status,
+    404
+  );
+
+  // Stop-sequence provider (ktmb): two active routes sharing stop S2 keep separate route features and per-route stop times.
+  const { DB_KTMB: ktmb } = await worker.getEnv();
+  await ktmb.batch([
+    ktmb
+      .prepare(
+        "UPDATE stops SET stop_lat = ?, stop_lon = ? WHERE stop_id = ?"
+      )
+      .bind(3.139, 101.686, "S"),
+    ktmb
+      .prepare(
+        "INSERT INTO routes (route_id, agency_id, route_short_name, route_color) VALUES (?, ?, ?, ?)"
+      )
+      .bind("R2", "A", "KTM2", "445566"),
+    ktmb
+      .prepare(
+        "INSERT INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES (?, ?, ?, ?)"
+      )
+      .bind("S2", "Second", 3.149, 101.696),
+    ktmb
+      .prepare(
+        "INSERT INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES (?, ?, ?, ?)"
+      )
+      .bind("S3", "Third", 3.159, 101.706),
+    ktmb
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("early", "S2", 2, "08:14:00", "08:15:00"),
+    ktmb
+      .prepare(
+        "INSERT INTO trips (trip_id, route_id, service_id, direction_id) VALUES (?, ?, ?, ?)"
+      )
+      .bind("r2-trip", "R2", "daily", 0),
+    ktmb
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("r2-trip", "S2", 1, "10:00:00", "10:00:00"),
+    ktmb
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("r2-trip", "S3", 2, "10:10:00", "10:10:00")
+  ]);
+
+  const ktmbMulti = await worker.fetch("/ktmb/map?route_id=R2,R,missing,R");
+  assert.equal(ktmbMulti.status, 200);
+  const ktmbMultiBody = await ktmbMulti.json();
+  assert.deepEqual(
+    ktmbMultiBody.features
+      .filter((f) => f.properties.kind === "route")
+      .map((f) => ({
+        route_id: f.properties.route_id,
+        geometry_source: f.properties.geometry_source,
+        coordinates: f.geometry.coordinates
+      })),
+    [
+      {
+        route_id: "R",
+        geometry_source: "stop_sequence",
+        coordinates: [
+          [
+            [101.686, 3.139],
+            [101.696, 3.149]
+          ]
+        ]
+      },
+      {
+        route_id: "R2",
+        geometry_source: "stop_sequence",
+        coordinates: [
+          [
+            [101.696, 3.149],
+            [101.706, 3.159]
+          ]
+        ]
+      }
+    ]
+  );
+  assert.deepEqual(
+    ktmbMultiBody.features
+      .filter((f) => f.properties.kind === "stop")
+      .map((f) => ({
+        route_id: f.properties.route_id,
+        stop_id: f.properties.stop_id,
+        arrival_times: f.properties.arrival_times
+      })),
+    [
+      { route_id: "R", stop_id: "S", arrival_times: "08:09:00, 08:19:00" },
+      { route_id: "R", stop_id: "S2", arrival_times: "08:14:00" },
+      { route_id: "R2", stop_id: "S2", arrival_times: "10:00:00" },
+      { route_id: "R2", stop_id: "S3", arrival_times: "10:10:00" }
+    ]
+  );
+
+  // Shapes provider (rapid-bus-kl): U1 has a valid shape, U2 shares SH1, U3 has no shape (falls back to stop_sequence).
+  await seedRapidBusKl();
+  const { DB_RAPID_BUS_KL: bus } = await worker.getEnv();
+  await bus.batch([
+    bus
+      .prepare(
+        "INSERT INTO routes (route_id, agency_id, route_short_name, route_color) VALUES (?, ?, ?, ?)"
+      )
+      .bind("U2", "RKL", "U2", "223344"),
+    bus
+      .prepare(
+        "INSERT INTO routes (route_id, agency_id, route_short_name, route_color) VALUES (?, ?, ?, ?)"
+      )
+      .bind("U3", "RKL", "U3", "556677"),
+    bus
+      .prepare(
+        "INSERT INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES (?, ?, ?, ?)"
+      )
+      .bind("S3", "Third", 3.3, 101.8),
+    bus
+      .prepare(
+        "INSERT INTO trips (trip_id, route_id, service_id, shape_id, trip_headsign, direction_id) VALUES (?, ?, ?, ?, ?, ?)"
+      )
+      .bind("u2-trip", "U2", "daily", "SH1", "Shared Shape", 0),
+    bus
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("u2-trip", "S1", 1, "09:00:00", "09:00:00"),
+    bus
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("u2-trip", "S2", 2, "09:10:00", "09:10:00"),
+    bus
+      .prepare(
+        "INSERT INTO trips (trip_id, route_id, service_id, shape_id, trip_headsign, direction_id) VALUES (?, ?, ?, ?, ?, ?)"
+      )
+      .bind("u3-trip", "U3", "daily", "", "No Shape", 0),
+    bus
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("u3-trip", "S2", 1, "11:00:00", "11:00:00"),
+    bus
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("u3-trip", "S3", 2, "11:15:00", "11:15:00")
+  ]);
+
+  const busMulti = await worker.fetch("/rapid-bus-kl/map?route_id=U3,U1,U2,UNKNOWN");
+  assert.equal(busMulti.status, 200);
+  const busMultiBody = await busMulti.json();
+  assert.deepEqual(
+    busMultiBody.features
+      .filter((f) => f.properties.kind === "route")
+      .map((f) => ({
+        route_id: f.properties.route_id,
+        geometry_source: f.properties.geometry_source,
+        type: f.geometry.type
+      })),
+    [
+      { route_id: "U1", geometry_source: "shape", type: "LineString" },
+      { route_id: "U2", geometry_source: "shape", type: "LineString" },
+      { route_id: "U3", geometry_source: "stop_sequence", type: "MultiLineString" }
+    ]
+  );
+  assert.deepEqual(
+    busMultiBody.features
+      .filter((f) => f.properties.kind === "stop")
+      .map((f) => [f.properties.route_id, f.properties.stop_id]),
+    [
+      ["U1", "S1"],
+      ["U1", "S2"],
+      ["U2", "S1"],
+      ["U2", "S2"],
+      ["U3", "S2"],
+      ["U3", "S3"]
+    ]
+  );
+});
+
+test("caches /map routes individually, queries D1 only for cache misses, and enforces WORKER_MAP_MAX_ROUTES", async () => {
+  const tooManyRoutes = Array.from({ length: 21 }, (_, i) => `R${i}`).join(",");
+  const limitRes = await worker.fetch(`/ktmb/map?route_id=${tooManyRoutes}`);
+  assert.equal(limitRes.status, 400);
+  assert.deepEqual(await limitRes.json(), {
+    error: "Too many route_id values; maximum is 20"
+  });
+
+  const { DB_KTMB: ktmb } = await worker.getEnv();
+  await ktmb.batch([
+    ktmb
+      .prepare("UPDATE stops SET stop_lat = ?, stop_lon = ? WHERE stop_id = ?")
+      .bind(3.139, 101.686, "S"),
+    ktmb
+      .prepare(
+        "INSERT INTO routes (route_id, agency_id, route_short_name, route_color) VALUES (?, ?, ?, ?)"
+      )
+      .bind("R2", "A", "KTM2", "445566"),
+    ktmb
+      .prepare(
+        "INSERT INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES (?, ?, ?, ?)"
+      )
+      .bind("S2", "Second", 3.149, 101.696),
+    ktmb
+      .prepare(
+        "INSERT INTO stops (stop_id, stop_name, stop_lat, stop_lon) VALUES (?, ?, ?, ?)"
+      )
+      .bind("S3", "Third", 3.159, 101.706),
+    ktmb
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("early", "S2", 2, "08:14:00", "08:15:00"),
+    ktmb
+      .prepare(
+        "INSERT INTO trips (trip_id, route_id, service_id, direction_id) VALUES (?, ?, ?, ?)"
+      )
+      .bind("r2-trip", "R2", "daily", 0),
+    ktmb
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("r2-trip", "S2", 1, "10:00:00", "10:00:00"),
+    ktmb
+      .prepare(
+        "INSERT INTO stop_times (trip_id, stop_id, stop_sequence, arrival_time, departure_time) VALUES (?, ?, ?, ?, ?)"
+      )
+      .bind("r2-trip", "S3", 2, "10:10:00", "10:10:00")
+  ]);
+
+  // 1. Prime cache for route R via single-route request.
+  const primeR = await worker.fetch("/ktmb/map?route_id=R");
+  assert.equal(primeR.status, 200);
+  await primeR.json();
+
+  // 2. Remove R from D1; multi-route request for R,R2 must reuse cached R and query D1 only for R2.
+  await ktmb.prepare("DELETE FROM trips WHERE route_id = ?").bind("R").run();
+  const combinedRes = await worker.fetch("/ktmb/map?route_id=R,R2");
+  assert.equal(combinedRes.status, 200);
+  assert.equal(combinedRes.headers.get("Cache-Control"), "public, max-age=86400");
+  const combinedBody = await combinedRes.json();
+  assert.deepEqual(
+    combinedBody.features
+      .filter((f) => f.properties.kind === "route")
+      .map((f) => f.properties.route_id),
+    ["R", "R2"]
+  );
+  assert.deepEqual(
+    combinedBody.features
+      .filter((f) => f.properties.kind === "stop")
+      .map((f) => [f.properties.route_id, f.properties.stop_id]),
+    [
+      ["R", "S"],
+      ["R", "S2"],
+      ["R2", "S2"],
+      ["R2", "S3"]
+    ]
+  );
+
+  // 3. Remove R2 from D1 too; single-route request for R2 must hit the cache populated by the multi-route call.
+  await ktmb.prepare("DELETE FROM trips WHERE route_id = ?").bind("R2").run();
+  const cachedR2 = await worker.fetch("/ktmb/map?route_id=R2");
+  assert.equal(cachedR2.status, 200);
+  const cachedR2Body = await cachedR2.json();
+  assert.deepEqual(
+    cachedR2Body.features
+      .filter((f) => f.properties.kind === "route")
+      .map((f) => f.properties.route_id),
+    ["R2"]
   );
 });
 

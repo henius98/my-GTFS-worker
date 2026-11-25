@@ -12,7 +12,7 @@ info:
 
     **Rate limits**: Exceeding the Cloudflare D1 daily row read limit returns `429 Too Many Requests` with a JSON `ErrorResponse` body.
 servers:
-  - url: "https://my-gtfs-worker.98heniyschen.workers.dev"
+  - url: "https://my-gtfs-worker.henius98.workers.dev"
     description: Production Cloudflare Worker
   - url: "http://localhost:8787"
     description: Local Wrangler dev server
@@ -385,17 +385,16 @@ paths:
       description: |-
         Returns active routes and stops for a service date as a GeoJSON `FeatureCollection`. Providers with a `shapes` table emit `LineString` route features (`geometry_source: "shape"`); providers without shapes (or routes without shape points) fall back to `MultiLineString` stop-to-stop segments (`geometry_source: "stop_sequence"`). Stops emit `Point` features.
 
-        Edge-cached using `WORKER_FEED_CACHE_TTL_SECONDS` (`86400`s).
+        Edge-cached per route using `WORKER_FEED_CACHE_TTL_SECONDS` (`86400`s); multi-route calls query D1 only for cache misses.
       parameters:
         - name: route_id
           in: query
           required: false
-          description: "Optional GTFS route identifier to filter the map to one route (1 to 256 bytes after trimming)."
+          description: "Optional comma-separated GTFS route identifiers to filter the map (1 to 20 unique routes, each 1 to 256 bytes after trimming). Returns `404` only if zero requested routes have active trips on the target date."
           schema:
             type: string
             minLength: 1
-            maxLength: 256
-          example: KJL
+          example: "KJL,PYL"
         - name: date
           in: query
           required: false
@@ -883,6 +882,11 @@ components:
           type: string
         shape_id:
           type: string
+        trip_ids:
+          type: array
+          items:
+            type: string
+          description: "Sorted active `trip_id` values using this `(route_id, shape_id)` shape on unfiltered `/map` requests."
         geometry_source:
           type: string
           const: shape
@@ -937,12 +941,17 @@ components:
           type: string
         stop_name:
           type: [string, "null"]
+        trip_ids:
+          type: array
+          items:
+            type: string
+          description: "Ordered GTFS trip_ids aligned with arrival_times and departure_times (present on unfiltered /map responses)."
         arrival_times:
           type: [string, "null"]
-          description: Aggregated arrival times for active trips at this stop.
+          description: Aggregated arrival times ordered by trip_id and stop_sequence.
         departure_times:
           type: [string, "null"]
-          description: Aggregated departure times for active trips at this stop.
+          description: Aggregated departure times ordered by trip_id and stop_sequence.
     ShapeRouteFeature:
       type: object
       required: [type, geometry, properties]
