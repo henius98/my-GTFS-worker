@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
-use worker::{D1Database, D1Result, D1Type, Result};
+use worker::{D1Result, D1Type, Result};
 
 use super::schedule::{Calendar, Exception, ParsedService, Template};
 use super::{Parameters, Stop};
 use crate::data::schema;
+use crate::database::ProviderDb;
 
 const STOP_QUERY: &str = include_str!("sql/stop.sql");
 const QUERY: &str = include_str!("sql/query.sql");
@@ -23,7 +24,7 @@ fn decode<T: DeserializeOwned>(result: D1Result) -> Result<Vec<T>> {
   result.results::<T>()
 }
 
-pub(super) async fn load_stop_and_templates(db: &D1Database, provider: &str, params: &Parameters) -> Result<Option<(Stop, Vec<Template>)>> {
+pub(super) async fn load_stop_and_templates(db: &ProviderDb, provider: &str, params: &Parameters) -> Result<Option<(Stop, Vec<Template>)>> {
   let has = |table: &str, column: &str| schema::has_column(provider, table, column);
   let frequencies = has("frequencies", "trip_id");
   let stop_headsign = has("stop_times", "stop_headsign");
@@ -46,7 +47,7 @@ pub(super) async fn load_stop_and_templates(db: &D1Database, provider: &str, par
   let stop_stmt = db.prepare(STOP_QUERY).bind_refs(&D1Type::Text(&params.stop_id))?;
   let templates_stmt =
     db.prepare(sql).bind_refs(&[D1Type::Text(&params.stop_id), params.route_id.as_deref().map_or(D1Type::Null, D1Type::Text), params.direction_id.map_or(D1Type::Null, D1Type::Integer)])?;
-  let mut initial_results = db.batch(vec![stop_stmt, templates_stmt]).await?.into_iter();
+  let mut initial_results = db.batch(vec![("stop", stop_stmt), ("templates", templates_stmt)]).await?.into_iter();
   let stop_result = initial_results.next().ok_or_else(|| worker::Error::RustError("Missing stop result".into()))?;
   let templates_result = initial_results.next().ok_or_else(|| worker::Error::RustError("Missing templates result".into()))?;
 
@@ -61,12 +62,14 @@ pub(super) async fn load_stop_and_templates(db: &D1Database, provider: &str, par
   let service_ids = serde_json::to_string(&templates.iter().map(|template| &template.service_id).collect::<HashSet<_>>())?;
   let service_ids_arg = D1Type::Text(&service_ids);
   let (calendars_result, exceptions_result) = if has("calendar_dates", "service_id") {
-    let mut results = db.batch(vec![db.prepare(CALENDAR_QUERY).bind_refs(&service_ids_arg)?, db.prepare(CALENDAR_DATES_QUERY).bind_refs(&service_ids_arg)?]).await?.into_iter();
+    let mut results =
+      db.batch(vec![("calendar", db.prepare(CALENDAR_QUERY).bind_refs(&service_ids_arg)?), ("calendar_dates", db.prepare(CALENDAR_DATES_QUERY).bind_refs(&service_ids_arg)?)]).await?.into_iter();
     let calendars = results.next().ok_or_else(|| worker::Error::RustError("Missing calendar result".into()))?;
     let exceptions = results.next().ok_or_else(|| worker::Error::RustError("Missing calendar_dates result".into()))?;
     (calendars, Some(exceptions))
   } else {
-    let calendars = db.prepare(CALENDAR_QUERY).bind_refs(&service_ids_arg)?.all().await?;
+    let stmt = db.prepare(CALENDAR_QUERY).bind_refs(&service_ids_arg)?;
+    let calendars = db.all("calendar", &stmt).await?;
     (calendars, None)
   };
   let calendars: Vec<Calendar> = decode(calendars_result)?;

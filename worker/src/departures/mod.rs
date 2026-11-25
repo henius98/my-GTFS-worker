@@ -126,7 +126,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str) -> Resu
     Ok(params) => params,
     Err(message) => return crate::json_error(400, &message),
   };
-  let db = match database::for_provider(env, provider) {
+  let db = match database::for_provider(env, provider, "departures") {
     Ok(db) => db,
     Err(_) => return database::provider_not_found(provider),
   };
@@ -140,7 +140,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str) -> Resu
   }
 }
 
-async fn calculate(db: &worker::D1Database, provider: &str, params: Parameters, now: DateTime<Utc>, config: &DepartureConfig) -> Result<Response> {
+async fn calculate(db: &database::ProviderDb, provider: &str, params: Parameters, now: DateTime<Utc>, config: &DepartureConfig) -> Result<Response> {
   let until = params.when + Duration::days(config.search_days);
   let state = match cache::read_with_state(db, &params, now).await {
     Ok((feed_state, Some(entry))) => {

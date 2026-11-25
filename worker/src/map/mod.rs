@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use chrono::{Datelike, NaiveDate, Weekday};
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
-use worker::{Cache, Context, D1Database, D1PreparedStatement, D1Result, D1Type, Env, Method, Request, Response, Result, Url};
+use worker::{Cache, Context, D1PreparedStatement, D1Result, D1Type, Env, Method, Request, Response, Result, Url};
 
-use crate::database;
+use crate::database::{self, ProviderDb};
 
 #[derive(Deserialize)]
 struct MapRoute {
@@ -259,7 +259,7 @@ fn cache_responses(ctx: &Context, entries: Vec<(String, Response)>) {
   });
 }
 
-fn prepare_ids_query(db: &D1Database, sql: &str, ids_json: &str) -> Result<D1PreparedStatement> {
+fn prepare_ids_query(db: &ProviderDb, sql: &str, ids_json: &str) -> Result<D1PreparedStatement> {
   db.prepare(sql).bind_refs(&D1Type::Text(ids_json))
 }
 
@@ -427,11 +427,12 @@ fn merge_route_features(by_route: BTreeMap<String, Vec<serde_json::Value>>) -> V
   route_features
 }
 
-async fn query_filtered_routes(db: &D1Database, provider: &str, route_ids: &[String], active_services: &str, has_shapes: bool) -> Result<Option<MapData>> {
+async fn query_filtered_routes(db: &ProviderDb, provider: &str, route_ids: &[String], active_services: &str, has_shapes: bool) -> Result<Option<MapData>> {
   let query_sql = route_trips_sql(provider, active_services, has_shapes);
   let route_ids_json = serde_json::to_string(route_ids)?;
   // Validate the requested route_ids via primary key before scanning trips, and fetch active trip_id/shape_id once for reuse.
-  let route_result = prepare_ids_query(db, &query_sql, &route_ids_json)?.all().await?;
+  let route_stmt = prepare_ids_query(db, &query_sql, &route_ids_json)?;
+  let route_result = db.all("route_trips", &route_stmt).await?;
   if !route_result.success() {
     return Ok(None);
   }
@@ -469,11 +470,11 @@ async fn query_filtered_routes(db: &D1Database, provider: &str, route_ids: &[Str
     let shape_ids: Vec<&str> = shape_routes.keys().map(String::as_str).collect();
     let shape_ids_json = serde_json::to_string(&shape_ids)?;
     let shaped_trips_json = serde_json::to_string(&shaped_trip_pairs)?;
-    let mut statements = vec![prepare_ids_query(db, SHAPES_BY_ROUTE_SQL, &shape_ids_json)?, prepare_ids_query(db, STOPS_BY_ROUTE_SQL, &shaped_trips_json)?];
+    let mut statements = vec![("shapes_by_route", prepare_ids_query(db, SHAPES_BY_ROUTE_SQL, &shape_ids_json)?), ("stops_by_route", prepare_ids_query(db, STOPS_BY_ROUTE_SQL, &shaped_trips_json)?)];
     let has_unshaped = !fallback_trip_pairs.is_empty();
     if has_unshaped {
       let unshaped_trips_json = serde_json::to_string(&fallback_trip_pairs)?;
-      statements.push(prepare_ids_query(db, SEGMENTS_AND_STOPS_BY_ROUTE_SQL, &unshaped_trips_json)?);
+      statements.push(("segments_and_stops_by_route", prepare_ids_query(db, SEGMENTS_AND_STOPS_BY_ROUTE_SQL, &unshaped_trips_json)?));
     }
     let mut second_batch = db.batch(statements).await?.into_iter();
     let geometry_result = take_result(&mut second_batch, "geometry")?;
@@ -498,7 +499,8 @@ async fn query_filtered_routes(db: &D1Database, provider: &str, route_ids: &[Str
       trips_by_shaped_route.iter().filter(|(rid, _)| !routes_with_paths.contains(rid.as_str())).flat_map(|(rid, tids)| tids.iter().map(move |tid| (rid.as_str(), tid.as_str()))).collect();
     if !missing_shape_trip_pairs.is_empty() {
       let missing_trips_json = serde_json::to_string(&missing_shape_trip_pairs)?;
-      let fallback_result = prepare_ids_query(db, SEGMENTS_AND_STOPS_BY_ROUTE_SQL, &missing_trips_json)?.all().await?;
+      let fallback_stmt = prepare_ids_query(db, SEGMENTS_AND_STOPS_BY_ROUTE_SQL, &missing_trips_json)?;
+      let fallback_result = db.all("segments_and_stops_by_route_fallback", &fallback_stmt).await?;
       if !fallback_result.success() {
         return Ok(None);
       }
@@ -507,7 +509,8 @@ async fn query_filtered_routes(db: &D1Database, provider: &str, route_ids: &[Str
     Ok(Some(MapData { routes: route_rows, paths, segments, stops }))
   } else {
     let all_trips_json = serde_json::to_string(&fallback_trip_pairs)?;
-    let merged_result = prepare_ids_query(db, SEGMENTS_AND_STOPS_BY_ROUTE_SQL, &all_trips_json)?.all().await?;
+    let merged_stmt = prepare_ids_query(db, SEGMENTS_AND_STOPS_BY_ROUTE_SQL, &all_trips_json)?;
+    let merged_result = db.all("segments_and_stops_by_route", &merged_stmt).await?;
     if !merged_result.success() {
       return Ok(None);
     }
@@ -530,7 +533,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
   let cache_control = crate::feed_cache_control(env)?;
 
   if route_ids.len() > 1 {
-    let db = match database::for_provider(env, provider) {
+    let db = match database::for_provider(env, provider, "map") {
       Ok(db) => db,
       Err(_) => return crate::json_error(404, "Database is unavailable for this provider"),
     };
@@ -589,7 +592,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     return Ok(response);
   }
 
-  let db = match database::for_provider(env, provider) {
+  let db = match database::for_provider(env, provider, "map") {
     Ok(db) => db,
     Err(_) => return crate::json_error(404, "Database is unavailable for this provider"),
   };
@@ -609,7 +612,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     if has_shapes {
       let shape_sql = SHAPES_SQL.replace("__ACTIVE_SERVICES__", &active_services);
       let stop_sql = STOPS_SQL.replace("__ACTIVE_SERVICES__", &active_services);
-      let mut batch = db.batch(vec![db.prepare(&route_sql), db.prepare(&shape_sql), db.prepare(&stop_sql)]).await?.into_iter();
+      let mut batch = db.batch(vec![("routes", db.prepare(&route_sql)), ("shapes", db.prepare(&shape_sql)), ("stops", db.prepare(&stop_sql))]).await?.into_iter();
       let route_result = take_result(&mut batch, "routes")?;
       let geometry_result = take_result(&mut batch, "geometry")?;
       let stop_result = take_result(&mut batch, "stops")?;
@@ -619,7 +622,8 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
       let paths = collect_paths(geometry_result.results::<ShapePoint>()?)?;
       let segments = if paths.is_empty() {
         let fallback_sql = SEGMENTS_AND_STOPS_SQL.replace("__ACTIVE_SERVICES__", &active_services);
-        let fallback_result = db.prepare(&fallback_sql).all().await?;
+        let fallback_stmt = db.prepare(&fallback_sql);
+        let fallback_result = db.all("segments_and_stops_fallback", &fallback_stmt).await?;
         if !fallback_result.success() {
           return crate::json_error(503, "Map data is unavailable");
         }
@@ -630,7 +634,7 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
       MapData { routes: route_result.results::<MapRoute>()?, paths, segments, stops: stop_result.results::<StopPoint>()? }
     } else {
       let merged_sql = SEGMENTS_AND_STOPS_SQL.replace("__ACTIVE_SERVICES__", &active_services);
-      let mut batch = db.batch(vec![db.prepare(&route_sql), db.prepare(&merged_sql)]).await?.into_iter();
+      let mut batch = db.batch(vec![("routes", db.prepare(&route_sql)), ("segments_and_stops", db.prepare(&merged_sql))]).await?.into_iter();
       let route_result = take_result(&mut batch, "routes")?;
       let merged_result = take_result(&mut batch, "segments_and_stops")?;
       if !route_result.success() || !merged_result.success() {

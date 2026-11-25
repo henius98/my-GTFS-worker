@@ -33,13 +33,14 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
     return Ok(response);
   }
 
-  let d1 = match database::for_provider(env, provider) {
+  let d1 = match database::for_provider(env, provider, "status") {
     Ok(db) => db,
     Err(_) => return database::provider_not_found(provider),
   };
 
   // Fetch detailed import progress
-  let progress_results = d1.prepare(include_str!("sql/import_progress.sql")).all().await?;
+  let progress_stmt = d1.prepare(include_str!("sql/import_progress.sql"));
+  let progress_results = d1.all("import_progress", &progress_stmt).await?;
   if !progress_results.success() {
     return Err(worker::Error::RustError("Status query failed".into()));
   }

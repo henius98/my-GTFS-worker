@@ -1,9 +1,10 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use worker::{D1Database, D1Type, Result};
+use worker::{D1Type, Result};
 
 use super::schedule::Departure;
 use super::{Parameters, Stop};
+use crate::database::ProviderDb;
 
 const FEED_STATE_SQL: &str = include_str!("sql/feed_state.sql");
 
@@ -44,36 +45,38 @@ impl Entry {
   }
 }
 
-pub(super) async fn read_with_state(db: &D1Database, params: &Parameters, now: DateTime<Utc>) -> Result<(FeedState, Option<Entry>)> {
+pub(super) async fn read_with_state(db: &ProviderDb, params: &Parameters, now: DateTime<Utc>) -> Result<(FeedState, Option<Entry>)> {
   let sql = include_str!("sql/cache_read.sql").replace("__FEED_STATE__", FEED_STATE_SQL);
-  let row = db
-    .prepare(sql)
-    .bind_refs(&[D1Type::Text(&params.stop_id), D1Type::Text(params.route_id.as_deref().unwrap_or("")), D1Type::Integer(params.direction_id.unwrap_or(-1)), D1Type::Real(now.timestamp() as f64)])?
-    .first::<CacheReadRow>(None)
-    .await?
-    .ok_or_else(|| worker::Error::RustError("Import state is unavailable".into()))?;
+  let stmt = db.prepare(sql).bind_refs(&[
+    D1Type::Text(&params.stop_id),
+    D1Type::Text(params.route_id.as_deref().unwrap_or("")),
+    D1Type::Integer(params.direction_id.unwrap_or(-1)),
+    D1Type::Real(now.timestamp() as f64),
+  ])?;
+  let result = db.all("cache_read", &stmt).await?;
+  if !result.success() {
+    return Err(worker::Error::RustError("Departure cache read failed".into()));
+  }
+  let row = result.results::<CacheReadRow>()?.into_iter().next().ok_or_else(|| worker::Error::RustError("Import state is unavailable".into()))?;
   let entry = row.payload.map(|payload| serde_json::from_str(&payload)).transpose()?;
   Ok((FeedState { revision: row.revision }, entry))
 }
 
-pub(super) async fn write(db: &D1Database, params: &Parameters, state: &FeedState, now: DateTime<Utc>, ttl: Duration, entry: &Entry) -> Result<()> {
+pub(super) async fn write(db: &ProviderDb, params: &Parameters, state: &FeedState, now: DateTime<Utc>, ttl: Duration, entry: &Entry) -> Result<()> {
   // Check the import revision in the same statement as the upsert so an import
   // starting during calculation cannot publish results under an old revision.
   let sql = include_str!("sql/cache_write.sql").replace("__FEED_STATE__", FEED_STATE_SQL);
   let expires_at = now.checked_add_signed(ttl).ok_or_else(|| worker::Error::RustError("Departure cache expiry is out of range".into()))?.timestamp();
   let payload = serde_json::to_string(entry)?;
-  let result = db
-    .prepare(sql)
-    .bind_refs(&[
-      D1Type::Text(&params.stop_id),
-      D1Type::Text(params.route_id.as_deref().unwrap_or("")),
-      D1Type::Integer(params.direction_id.unwrap_or(-1)),
-      D1Type::Text(&state.revision),
-      D1Type::Real(expires_at as f64),
-      D1Type::Text(&payload),
-    ])?
-    .run()
-    .await?;
+  let stmt = db.prepare(sql).bind_refs(&[
+    D1Type::Text(&params.stop_id),
+    D1Type::Text(params.route_id.as_deref().unwrap_or("")),
+    D1Type::Integer(params.direction_id.unwrap_or(-1)),
+    D1Type::Text(&state.revision),
+    D1Type::Real(expires_at as f64),
+    D1Type::Text(&payload),
+  ])?;
+  let result = db.run("cache_write", &stmt).await?;
   if !result.success() {
     return Err(worker::Error::RustError("Departure cache write failed".into()));
   }

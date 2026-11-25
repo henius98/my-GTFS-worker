@@ -234,7 +234,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
     None => 0,
   };
 
-  let d1 = match database::for_provider(env, provider) {
+  let d1 = match database::for_provider(env, provider, "data") {
     Ok(db) => db,
     Err(_) => return database::provider_not_found(provider),
   };
@@ -359,7 +359,7 @@ pub async fn handle(req: &Request, env: &Env, url: &Url, provider: &str, table_n
   params.push(JsValue::from_f64(offset as f64));
 
   let statement = d1.prepare(&query).bind(&params)?;
-  let details = database::query_raw_results(&statement).await?;
+  let details = d1.query_raw_results(&normalized_table_name, &statement).await?;
   let response_data = Object::new();
   Reflect::set(&response_data, &JsValue::from_str("data"), &details)?;
   Reflect::set(&response_data, &JsValue::from_str("limit"), &JsValue::from_f64(limit as f64))?;

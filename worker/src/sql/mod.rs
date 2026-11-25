@@ -69,7 +69,7 @@ pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Resp
     return Response::error("Only one SELECT query without comments is allowed", 400);
   }
 
-  let d1 = match database::for_provider(env, provider) {
+  let d1 = match database::for_provider(env, provider, "sql") {
     Ok(db) => db,
     Err(_) => return database::provider_not_found(provider),
   };
@@ -77,7 +77,7 @@ pub async fn handle(req: &mut Request, env: &Env, provider: &str) -> Result<Resp
   // A subquery accepts SELECT statements (including WITH ... SELECT) but rejects writes. Cap returned rows as in /data.
   let query = build_wrapped_query(sql, super::max_rows(env)?);
   let statement = d1.prepare(query);
-  let details = match database::query_raw_results(&statement).await {
+  let details = match d1.query_raw_results("sql", &statement).await {
     Ok(details) => details,
     Err(err) if crate::is_d1_row_read_limit_error(&err) => return Err(err),
     Err(err) => return Response::error(format!("Query error: {err}"), 400),
