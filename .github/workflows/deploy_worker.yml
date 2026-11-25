@@ -1,0 +1,84 @@
+name: Deploy Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/deploy_worker.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "providers.toml"
+      - "wrangler.toml"
+      - "worker/**"
+      - "migrations/**"
+      - "scripts/build.sh"
+      - "scripts/deploy.sh"
+      - "scripts/generate-wrangler.sh"
+      - "scripts/schema_parser.rs"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NODE_OPTIONS: "--no-deprecation"
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Node Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.100.0
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust Dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Deploy Worker via scripts/deploy.sh
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          D1_MAX_DATABASES: ${{ vars.D1_MAX_DATABASES }}
+        run: |
+          export PATH="$PWD/node_modules/.bin:$PATH"
+          bash ./scripts/deploy.sh
+
+      - name: Commit Updated Provider Config
+        if: always()
+        run: |
+          if ! git diff --quiet providers.toml wrangler.toml; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add providers.toml wrangler.toml
+            git commit -m "chore: sync providers.toml and wrangler.toml from deploy"
+            git push
+          else
+            echo "No changes in providers.toml or wrangler.toml."
+          fi
