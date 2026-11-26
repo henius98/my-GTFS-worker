@@ -7,7 +7,6 @@ __ACTIVE_SERVICES__,
       stop_times.stop_id,
       stop_times.stop_sequence,
       stop_times.arrival_time,
-      stop_times.departure_time,
       LAG(stop_times.stop_id) OVER (PARTITION BY trips.trip_id ORDER BY stop_times.stop_sequence) AS prev_stop_id
     FROM trips
     JOIN active_services ON active_services.service_id = trips.service_id
@@ -28,8 +27,7 @@ __ACTIVE_SERVICES__,
       route_id,
       stop_id,
       json_group_array(trip_id ORDER BY trip_id, stop_sequence) AS trip_ids_json,
-      GROUP_CONCAT(arrival_time, ', ' ORDER BY trip_id, stop_sequence) AS arrival_times,
-      GROUP_CONCAT(departure_time, ', ' ORDER BY trip_id, stop_sequence) AS departure_times
+      GROUP_CONCAT(arrival_time, ', ' ORDER BY trip_id, stop_sequence) AS arrival_times
     FROM trip_stop_times
     GROUP BY route_id, stop_id
   )
@@ -43,8 +41,7 @@ SELECT
   to_stop.stop_lat AS to_lat,
   to_stop.stop_lon AS to_lng,
   NULL AS trip_ids_json,
-  NULL AS arrival_times,
-  NULL AS departure_times
+  NULL AS arrival_times
 FROM distinct_segments
 JOIN stops AS from_stop ON from_stop.stop_id = distinct_segments.from_stop_id
 JOIN stops AS to_stop ON to_stop.stop_id = distinct_segments.to_stop_id
@@ -59,8 +56,7 @@ SELECT
   NULL AS to_lat,
   NULL AS to_lng,
   route_stops.trip_ids_json,
-  route_stops.arrival_times,
-  route_stops.departure_times
+  route_stops.arrival_times
 FROM route_stops
 JOIN stops ON stops.stop_id = route_stops.stop_id
 ORDER BY row_kind, route_id, stop_id, lat, lng, to_lat, to_lng

@@ -45,7 +45,6 @@ struct StopPoint {
   #[serde(default)]
   trip_ids_json: Option<String>,
   arrival_times: Option<String>,
-  departure_times: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,7 +117,6 @@ enum FeatureProperties<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     trip_ids: Option<Vec<String>>,
     arrival_times: Option<String>,
-    departure_times: Option<String>,
   },
 }
 
@@ -391,7 +389,6 @@ fn build_features<'a>(routes: &'a HashMap<String, MapRoute>, paths: RoutePaths, 
           stop_name: stop.stop_name,
           trip_ids,
           arrival_times: stop.arrival_times,
-          departure_times: stop.departure_times,
         },
       });
     }

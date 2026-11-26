@@ -1054,7 +1054,6 @@ def build_openapi_spec() -> dict[str, Any]:
             "stop_id",
             "stop_name",
             "arrival_times",
-            "departure_times",
           ],
           "additionalProperties": False,
           "properties": {
@@ -1065,10 +1064,9 @@ def build_openapi_spec() -> dict[str, Any]:
             "trip_ids": {
               "type": "array",
               "items": {"type": "string"},
-              "description": "Ordered GTFS trip_ids aligned with arrival_times and departure_times (present on unfiltered /map responses).",
+              "description": "Ordered GTFS trip_ids aligned with arrival_times (present on unfiltered /map responses).",
             },
             "arrival_times": {"type": ["string", "null"], "description": "Aggregated arrival times ordered by trip_id and stop_sequence."},
-            "departure_times": {"type": ["string", "null"], "description": "Aggregated departure times ordered by trip_id and stop_sequence."},
           },
         },
         "ShapeRouteFeature": {

@@ -123,14 +123,17 @@ fn collect_paths_groups_direct_and_shared_shapes() -> std::result::Result<(), Bo
   assert!(filtered_json[0]["properties"].get("trip_ids").is_none());
 
   let stop: StopPoint = serde_json::from_str(
-    r#"{"route_id":"R1","stop_id":"S1","stop_name":"A","lat":3.1,"lng":101.6,"trip_ids_json":"[\"T1\",\"T2\"]","arrival_times":"08:00:00, 08:10:00","departure_times":"08:00:18, 08:10:18"}"#,
+    r#"{"route_id":"R1","stop_id":"S1","stop_name":"A","lat":3.1,"lng":101.6,"trip_ids_json":"[\"T1\",\"T2\"]","arrival_times":"08:00:00, 08:10:00"}"#,
   )?;
   assert_eq!(stop.route_id, "R1");
   let stop_features = serde_json::to_value(build_features(&routes, BTreeMap::new(), BTreeMap::new(), vec![stop]))?;
   assert_eq!(stop_features[0]["properties"]["trip_ids"], serde_json::json!(["T1", "T2"]));
-  let filtered_stop: StopPoint = serde_json::from_str(r#"{"route_id":"R1","stop_id":"S1","stop_name":"A","lat":3.1,"lng":101.6,"arrival_times":null,"departure_times":null}"#)?;
+  assert_eq!(stop_features[0]["properties"]["arrival_times"], "08:00:00, 08:10:00");
+  assert!(stop_features[0]["properties"].get("departure_times").is_none());
+  let filtered_stop: StopPoint = serde_json::from_str(r#"{"route_id":"R1","stop_id":"S1","stop_name":"A","lat":3.1,"lng":101.6,"arrival_times":null}"#)?;
   let filtered_stop_features = serde_json::to_value(build_features(&routes, BTreeMap::new(), BTreeMap::new(), vec![filtered_stop]))?;
   assert!(filtered_stop_features[0]["properties"].get("trip_ids").is_none());
+  assert!(filtered_stop_features[0]["properties"].get("departure_times").is_none());
   let seg: StopSegment = serde_json::from_str(r#"{"route_id":"R1","lat":3.1,"lng":101.6,"to_lat":3.2,"to_lng":101.7}"#)?;
   assert_eq!(seg.route_id, "R1");
   Ok(())
@@ -140,11 +143,11 @@ fn collect_paths_groups_direct_and_shared_shapes() -> std::result::Result<(), Bo
 fn collect_segments_and_stops_groups_multilinestring_and_splits_stops() -> std::result::Result<(), Box<dyn std::error::Error>> {
   let rows: Vec<SegmentOrStop> = serde_json::from_str(
     r#"[
-      {"row_kind":"segment","route_id":"R1","lat":3.1,"lng":101.6,"to_lat":3.2,"to_lng":101.7,"stop_id":null,"stop_name":null,"arrival_times":null,"departure_times":null},
-      {"row_kind":"segment","route_id":"R1","lat":3.2,"lng":101.7,"to_lat":3.3,"to_lng":101.8,"stop_id":null,"stop_name":null,"arrival_times":null,"departure_times":null},
-      {"row_kind":"segment","route_id":"R1","lat":99.0,"lng":101.7,"to_lat":3.3,"to_lng":101.8,"stop_id":null,"stop_name":null,"arrival_times":null,"departure_times":null},
-      {"row_kind":"segment","route_id":"R2","lat":4.0,"lng":102.0,"to_lat":4.1,"to_lng":102.1,"stop_id":null,"stop_name":null,"arrival_times":null,"departure_times":null},
-      {"row_kind":"stop","route_id":"R1","lat":3.1,"lng":101.6,"to_lat":null,"to_lng":null,"stop_id":"S1","stop_name":"First","arrival_times":"08:00:00","departure_times":"08:01:00"}
+      {"row_kind":"segment","route_id":"R1","lat":3.1,"lng":101.6,"to_lat":3.2,"to_lng":101.7,"stop_id":null,"stop_name":null,"arrival_times":null},
+      {"row_kind":"segment","route_id":"R1","lat":3.2,"lng":101.7,"to_lat":3.3,"to_lng":101.8,"stop_id":null,"stop_name":null,"arrival_times":null},
+      {"row_kind":"segment","route_id":"R1","lat":99.0,"lng":101.7,"to_lat":3.3,"to_lng":101.8,"stop_id":null,"stop_name":null,"arrival_times":null},
+      {"row_kind":"segment","route_id":"R2","lat":4.0,"lng":102.0,"to_lat":4.1,"to_lng":102.1,"stop_id":null,"stop_name":null,"arrival_times":null},
+      {"row_kind":"stop","route_id":"R1","lat":3.1,"lng":101.6,"to_lat":null,"to_lng":null,"stop_id":"S1","stop_name":"First","arrival_times":"08:00:00"}
     ]"#,
   )?;
   let (segments, stops) = collect_segments_and_stops(rows);

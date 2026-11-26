@@ -396,18 +396,18 @@ test("returns map GeoJSON from stop_sequence fallback and shapes", async () => {
     ktmbStops.map((feature) => ({
       stop_id: feature.properties.stop_id,
       arrival_times: feature.properties.arrival_times,
-      departure_times: feature.properties.departure_times
+      has_departure_times: "departure_times" in feature.properties
     })),
     [
       {
         stop_id: "S",
         arrival_times: "08:09:00, 08:19:00",
-        departure_times: "08:10:00, 08:20:00"
+        has_departure_times: false
       },
       {
         stop_id: "S2",
         arrival_times: "08:14:00",
-        departure_times: "08:15:00"
+        has_departure_times: false
       }
     ]
   );
@@ -430,18 +430,18 @@ test("returns map GeoJSON from stop_sequence fallback and shapes", async () => {
       .map((feature) => ({
         stop_id: feature.properties.stop_id,
         arrival_times: feature.properties.arrival_times,
-        departure_times: feature.properties.departure_times
+        has_departure_times: "departure_times" in feature.properties
       })),
     [
       {
         stop_id: "S",
         arrival_times: "08:09:00, 08:19:00",
-        departure_times: "08:10:00, 08:20:00"
+        has_departure_times: false
       },
       {
         stop_id: "S2",
         arrival_times: "08:14:00",
-        departure_times: "08:15:00"
+        has_departure_times: false
       }
     ]
   );

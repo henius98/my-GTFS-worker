@@ -272,15 +272,15 @@ fn ktmb_map_queries_deduplicate_and_use_primary_keys() -> CheckResult {
 
   let filtered_stops = db
     .prepare(&stops_by_route_sql)?
-    .query_map(params![route_trip_pairs_json], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?)))?
+    .query_map(params![route_trip_pairs_json], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?)))?
     .collect::<Result<Vec<_>, _>>()?;
   assert_eq!(
     filtered_stops,
     vec![
-      ("R1".into(), "S1".into(), Some("08:00:00, 09:10:00".into()), Some("08:00:00, 09:10:00".into())),
-      ("R1".into(), "S2".into(), Some("08:10:00, 09:00:00".into()), Some("08:10:00, 09:00:00".into())),
-      ("R2".into(), "S2".into(), Some("10:00:00".into()), Some("10:00:00".into())),
-      ("R2".into(), "S3".into(), Some("10:10:00".into()), Some("10:10:00".into())),
+      ("R1".into(), "S1".into(), Some("08:00:00, 09:10:00".into())),
+      ("R1".into(), "S2".into(), Some("08:10:00, 09:00:00".into())),
+      ("R2".into(), "S2".into(), Some("10:00:00".into())),
+      ("R2".into(), "S3".into(), Some("10:10:00".into())),
     ]
   );
 
@@ -304,15 +304,15 @@ fn ktmb_map_queries_deduplicate_and_use_primary_keys() -> CheckResult {
   let all_stops_sql = map_sql("stops.sql")?.replace("__ACTIVE_SERVICES__", &active_services);
   let all_stops = db
     .prepare(&all_stops_sql)?
-    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?)))?
+    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?)))?
     .collect::<Result<Vec<_>, _>>()?;
   assert_eq!(
     all_stops,
     vec![
-      ("R1".into(), "S1".into(), Some(r#"["T1","T2"]"#.into()), Some("08:00:00, 09:10:00".into()), Some("08:00:00, 09:10:00".into())),
-      ("R1".into(), "S2".into(), Some(r#"["T1","T2"]"#.into()), Some("08:10:00, 09:00:00".into()), Some("08:10:00, 09:00:00".into())),
-      ("R2".into(), "S2".into(), Some(r#"["T3"]"#.into()), Some("10:00:00".into()), Some("10:00:00".into())),
-      ("R2".into(), "S3".into(), Some(r#"["T3"]"#.into()), Some("10:10:00".into()), Some("10:10:00".into())),
+      ("R1".into(), "S1".into(), Some(r#"["T1","T2"]"#.into()), Some("08:00:00, 09:10:00".into())),
+      ("R1".into(), "S2".into(), Some(r#"["T1","T2"]"#.into()), Some("08:10:00, 09:00:00".into())),
+      ("R2".into(), "S2".into(), Some(r#"["T3"]"#.into()), Some("10:00:00".into())),
+      ("R2".into(), "S3".into(), Some(r#"["T3"]"#.into()), Some("10:10:00".into())),
     ]
   );
   Ok(())
@@ -391,19 +391,16 @@ fn map_queries_filter_by_date_with_calendar_and_calendar_dates_exceptions() -> C
   let hol_stops_sql = map_sql("stops_by_route.sql")?;
   let hol_stops = db
     .prepare(&hol_stops_sql)?
-    .query_map(params![hol_trip_pairs_json], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?)))?
+    .query_map(params![hol_trip_pairs_json], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?)))?
     .collect::<Result<Vec<_>, _>>()?;
-  assert_eq!(hol_stops, vec![("U1".into(), "S1".into(), Some("10:00:00".into()), Some("10:00:00".into())), ("U1".into(), "S4".into(), Some("10:10:00".into()), Some("10:10:00".into()))]);
+  assert_eq!(hol_stops, vec![("U1".into(), "S1".into(), Some("10:00:00".into())), ("U1".into(), "S4".into(), Some("10:10:00".into()))]);
 
   let hol_all_stops_sql = map_sql("stops.sql")?.replace("__ACTIVE_SERVICES__", &hol_cte);
   let hol_all_stops = db
     .prepare(&hol_all_stops_sql)?
-    .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?)))?
+    .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?)))?
     .collect::<Result<Vec<_>, _>>()?;
-  assert_eq!(
-    hol_all_stops,
-    vec![("S1".into(), Some(r#"["T_HOL"]"#.into()), Some("10:00:00".into()), Some("10:00:00".into())), ("S4".into(), Some(r#"["T_HOL"]"#.into()), Some("10:10:00".into()), Some("10:10:00".into()))]
-  );
+  assert_eq!(hol_all_stops, vec![("S1".into(), Some(r#"["T_HOL"]"#.into()), Some("10:00:00".into())), ("S4".into(), Some(r#"["T_HOL"]"#.into()), Some("10:10:00".into()))]);
 
   // Normal Monday (2026-09-28): WD active, HOL inactive.
   let norm_cte = exc_cte(20260928, "monday");
