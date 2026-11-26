@@ -375,7 +375,7 @@ test("returns map GeoJSON from stop_sequence fallback and shapes", async () => {
 
   const ktmbMap = await worker.fetch("/ktmb/map?route_id=R");
   assert.equal(ktmbMap.status, 200);
-  assert.equal(ktmbMap.headers.get("Cache-Control"), "public, max-age=86400");
+  assert.equal(ktmbMap.headers.get("Cache-Control"), "public, max-age=75600, immutable");
   const ktmbBody = await ktmbMap.json();
   assert.equal(ktmbBody.type, "FeatureCollection");
   const fallbackRoute = ktmbBody.features.find(
@@ -995,7 +995,7 @@ test("caches /map routes individually, queries D1 only for cache misses, and enf
   await ktmb.prepare("DELETE FROM trips WHERE route_id = ?").bind("R").run();
   const combinedRes = await worker.fetch("/ktmb/map?route_id=R,R2");
   assert.equal(combinedRes.status, 200);
-  assert.equal(combinedRes.headers.get("Cache-Control"), "public, max-age=86400");
+  assert.equal(combinedRes.headers.get("Cache-Control"), "public, max-age=75600, immutable");
   const combinedBody = await combinedRes.json();
   assert.deepEqual(
     combinedBody.features
@@ -1019,6 +1019,7 @@ test("caches /map routes individually, queries D1 only for cache misses, and enf
   await ktmb.prepare("DELETE FROM trips WHERE route_id = ?").bind("R2").run();
   const cachedR2 = await worker.fetch("/ktmb/map?route_id=R2");
   assert.equal(cachedR2.status, 200);
+  assert.equal(cachedR2.headers.get("Cache-Control"), "public, max-age=75600, immutable");
   const cachedR2Body = await cachedR2.json();
   assert.deepEqual(
     cachedR2Body.features

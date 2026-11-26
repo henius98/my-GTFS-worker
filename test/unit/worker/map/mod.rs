@@ -171,3 +171,36 @@ fn collect_segments_and_stops_groups_multilinestring_and_splits_stops() -> std::
   assert!(json["properties"].get("to_stop_id").is_none());
   Ok(())
 }
+
+#[test]
+fn seconds_until_next_expire_time_targets_upcoming_time_in_local_timezone() -> std::result::Result<(), Box<dyn std::error::Error>> {
+  let parse = |rfc3339: &str, tz: Tz| -> std::result::Result<DateTime<Tz>, chrono::ParseError> { Ok(DateTime::parse_from_rfc3339(rfc3339)?.with_timezone(&tz)) };
+  let time = |h: u32, m: u32| -> std::result::Result<NaiveTime, &'static str> { NaiveTime::from_hms_opt(h, m, 0).ok_or("invalid test time") };
+
+  let kl = chrono_tz::Asia::Kuala_Lumpur;
+  let five_am = time(5, 0)?;
+  assert_eq!(seconds_until_next_expire_time(parse("2026-09-24T00:00:00+08:00", kl)?, five_am), 5 * 3600);
+  assert_eq!(seconds_until_next_expire_time(parse("2026-09-24T04:59:59+08:00", kl)?, five_am), 1);
+  assert_eq!(seconds_until_next_expire_time(parse("2026-09-24T04:59:59.500+08:00", kl)?, five_am), 0);
+  assert_eq!(seconds_until_next_expire_time(parse("2026-09-24T05:00:00+08:00", kl)?, five_am), 24 * 3600);
+  assert_eq!(seconds_until_next_expire_time(parse("2026-09-24T00:00:00Z", kl)?, five_am), 21 * 3600);
+  assert_eq!(seconds_until_next_expire_time(parse("2026-09-24T23:59:59+08:00", kl)?, five_am), 5 * 3600 + 1);
+  assert_eq!(map_cache_control(parse("2026-09-24T00:00:00Z", kl)?, five_am), "public, max-age=75600, immutable");
+
+  let five_thirty = time(5, 30)?;
+  assert_eq!(seconds_until_next_expire_time(parse("2026-09-24T05:29:59+08:00", kl)?, five_thirty), 1);
+  assert_eq!(seconds_until_next_expire_time(parse("2026-09-24T05:30:00+08:00", kl)?, five_thirty), 24 * 3600);
+
+  let midnight = time(0, 0)?;
+  assert_eq!(seconds_until_next_expire_time(parse("2026-09-24T00:00:00+08:00", kl)?, midnight), 24 * 3600);
+  assert_eq!(seconds_until_next_expire_time(parse("2026-09-24T23:59:59+08:00", kl)?, midnight), 1);
+
+  let ny = chrono_tz::America::New_York;
+  assert_eq!(seconds_until_next_expire_time(parse("2026-03-07T08:00:00-05:00", ny)?, five_am), 20 * 3600);
+  assert_eq!(seconds_until_next_expire_time(parse("2026-10-31T08:00:00-04:00", ny)?, five_am), 22 * 3600);
+  // DST spring-forward gap across 02:30 steps forward by one hour to 03:30 EDT.
+  assert_eq!(seconds_until_next_expire_time(parse("2026-03-08T01:30:00-05:00", ny)?, time(2, 30)?), 3600);
+  // DST fall-back fold at 01:30 picks the second 01:30 EST when already past the first.
+  assert_eq!(seconds_until_next_expire_time(parse("2026-11-01T01:15:00-05:00", ny)?, time(1, 30)?), 15 * 60);
+  Ok(())
+}

@@ -1,4 +1,6 @@
-use super::{MAX_TTL_SECONDS, is_d1_row_read_limit, is_d1_row_read_limit_error, parse_int_in_range, parse_non_empty, parse_timezone};
+use chrono::NaiveTime;
+
+use super::{MAX_TTL_SECONDS, is_d1_row_read_limit, is_d1_row_read_limit_error, parse_hh_mm, parse_int_in_range, parse_non_empty, parse_timezone};
 
 #[test]
 fn detects_d1_daily_row_read_limit_errors() {
@@ -32,4 +34,11 @@ fn parses_worker_env_values_and_rejects_invalid_inputs() {
   assert_eq!(parse_timezone("UTC"), Some(chrono_tz::UTC));
   assert_eq!(parse_timezone(""), None);
   assert_eq!(parse_timezone("Invalid/Timezone"), None);
+
+  assert_eq!(parse_hh_mm(" 05:00 "), NaiveTime::from_hms_opt(5, 0, 0));
+  assert_eq!(parse_hh_mm("00:00"), NaiveTime::from_hms_opt(0, 0, 0));
+  assert_eq!(parse_hh_mm("23:59"), NaiveTime::from_hms_opt(23, 59, 0));
+  for invalid in ["", "5:00", "05:0", "24:00", "05:60", "05:00:00", "-1:00", "ab:cd"] {
+    assert_eq!(parse_hh_mm(invalid), None, "{invalid}");
+  }
 }

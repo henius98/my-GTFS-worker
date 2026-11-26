@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use chrono::{Datelike, NaiveDate, Weekday};
+use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveTime, TimeZone, Weekday};
+use chrono_tz::Tz;
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use worker::{Cache, Context, D1PreparedStatement, D1Result, D1Type, Env, Method, Request, Response, Result, Url};
@@ -510,18 +511,44 @@ async fn query_filtered_routes(db: &ProviderDb, provider: &str, route_ids: &[Str
   }
 }
 
+fn seconds_until_next_expire_time(now: DateTime<Tz>, expire_time: NaiveTime) -> i64 {
+  let tz = now.timezone();
+  let today = now.date_naive();
+  let Some(target_date) = (if now.time() < expire_time { Some(today) } else { today.succ_opt() }) else {
+    return 0;
+  };
+  let naive_target = target_date.and_time(expire_time);
+  let target = match tz.from_local_datetime(&naive_target) {
+    LocalResult::Single(dt) => dt,
+    LocalResult::Ambiguous(earliest, latest) => {
+      if earliest > now {
+        earliest
+      } else {
+        latest
+      }
+    }
+    LocalResult::None => naive_target.checked_add_signed(Duration::hours(1)).and_then(|dt| tz.from_local_datetime(&dt).earliest()).unwrap_or(now),
+  };
+  (target - now).num_seconds().max(0)
+}
+
+fn map_cache_control(now: DateTime<Tz>, expire_time: NaiveTime) -> String {
+  format!("public, max-age={}, immutable", seconds_until_next_expire_time(now, expire_time))
+}
+
 pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider: &str) -> Result<Response> {
   if req.method() != Method::Get {
     return crate::method_not_allowed("GET", true);
   }
 
-  let today = ServiceDate::from_naive_date(crate::current_time(env)?.with_timezone(&crate::default_timezone(env)?).date_naive());
+  let now = crate::current_time(env)?.with_timezone(&crate::default_timezone(env)?);
+  let today = ServiceDate::from_naive_date(now.date_naive());
   let max_routes = crate::map_max_routes(env)?;
   let MapParams { route_ids, date } = match parse_params(url, today, max_routes) {
     Ok(params) => params,
     Err((status, message)) => return crate::json_error(status, &message),
   };
-  let cache_control = crate::feed_cache_control(env)?;
+  let cache_control = map_cache_control(now, crate::map_cache_expire_time(env)?);
 
   if route_ids.len() > 1 {
     let db = match database::for_provider(env, provider, "map") {
@@ -580,7 +607,9 @@ pub async fn handle(req: &Request, env: &Env, ctx: Context, url: &Url, provider:
 
   let cache_key = route_cache_key(url, provider, route_ids.first().map(String::as_str), date);
   if let Ok(Some(response)) = Cache::default().get(&cache_key, false).await {
-    return Ok(response);
+    let headers = response.headers().clone();
+    headers.set("Cache-Control", &cache_control)?;
+    return Ok(response.with_headers(headers));
   }
 
   let db = match database::for_provider(env, provider, "map") {

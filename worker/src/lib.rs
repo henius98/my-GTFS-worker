@@ -13,7 +13,7 @@ mod status;
 use std::error::Error as StdError;
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveTime, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
 use worker::{Cache, Context, Date, Env, Method, Request, Response, Result, Url, event};
@@ -85,6 +85,16 @@ pub(crate) fn parse_timezone(value: &str) -> Option<Tz> {
   (!trimmed.is_empty()).then(|| trimmed.parse::<Tz>().ok()).flatten()
 }
 
+pub(crate) fn parse_hh_mm(value: &str) -> Option<NaiveTime> {
+  let bytes = value.trim().as_bytes();
+  if bytes.len() != 5 || bytes[2] != b':' || !bytes[..2].iter().chain(&bytes[3..5]).all(u8::is_ascii_digit) {
+    return None;
+  }
+  let hour: u32 = std::str::from_utf8(&bytes[..2]).ok()?.parse().ok()?;
+  let minute: u32 = std::str::from_utf8(&bytes[3..5]).ok()?.parse().ok()?;
+  NaiveTime::from_hms_opt(hour, minute, 0)
+}
+
 pub(crate) fn current_time(env: &Env) -> Result<DateTime<Utc>> {
   env
     .var("WORKER_TEST_NOW")
@@ -116,12 +126,12 @@ pub(crate) fn feed_cache_ttl_seconds(env: &Env) -> Result<i64> {
   parse_required_var(env, "WORKER_FEED_CACHE_TTL_SECONDS", |raw| parse_int_in_range(raw, 1, MAX_TTL_SECONDS), "must be a positive integer")
 }
 
-pub(crate) fn feed_cache_control(env: &Env) -> Result<String> {
-  Ok(format!("public, max-age={}", feed_cache_ttl_seconds(env)?))
-}
-
 pub(crate) fn map_max_routes(env: &Env) -> Result<usize> {
   parse_required_var(env, "WORKER_MAP_MAX_ROUTES", |raw| parse_int_in_range(raw, 1, usize::MAX), "must be a positive integer")
+}
+
+pub(crate) fn map_cache_expire_time(env: &Env) -> Result<NaiveTime> {
+  parse_required_var(env, "WORKER_MAP_CACHE_EXPIRE_TIME", parse_hh_mm, "must be HH:MM in 24-hour format")
 }
 
 #[event(fetch)]
