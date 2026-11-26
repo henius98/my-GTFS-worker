@@ -396,10 +396,8 @@ fn map_queries_filter_by_date_with_calendar_and_calendar_dates_exceptions() -> C
   assert_eq!(hol_stops, vec![("U1".into(), "S1".into(), Some("10:00:00".into())), ("U1".into(), "S4".into(), Some("10:10:00".into()))]);
 
   let hol_all_stops_sql = map_sql("stops.sql")?.replace("__ACTIVE_SERVICES__", &hol_cte);
-  let hol_all_stops = db
-    .prepare(&hol_all_stops_sql)?
-    .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?)))?
-    .collect::<Result<Vec<_>, _>>()?;
+  let hol_all_stops =
+    db.prepare(&hol_all_stops_sql)?.query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?)))?.collect::<Result<Vec<_>, _>>()?;
   assert_eq!(hol_all_stops, vec![("S1".into(), Some(r#"["T_HOL"]"#.into()), Some("10:00:00".into())), ("S4".into(), Some(r#"["T_HOL"]"#.into()), Some("10:10:00".into()))]);
 
   // Normal Monday (2026-09-28): WD active, HOL inactive.

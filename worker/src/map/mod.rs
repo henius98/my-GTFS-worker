@@ -383,13 +383,7 @@ fn build_features<'a>(routes: &'a HashMap<String, MapRoute>, paths: RoutePaths, 
       features.push(Feature {
         kind: "Feature",
         geometry: Geometry::Point(position),
-        properties: FeatureProperties::Stop {
-          route_id: stop.route_id,
-          stop_id: stop.stop_id,
-          stop_name: stop.stop_name,
-          trip_ids,
-          arrival_times: stop.arrival_times,
-        },
+        properties: FeatureProperties::Stop { route_id: stop.route_id, stop_id: stop.stop_id, stop_name: stop.stop_name, trip_ids, arrival_times: stop.arrival_times },
       });
     }
   }

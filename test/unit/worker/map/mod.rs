@@ -122,9 +122,7 @@ fn collect_paths_groups_direct_and_shared_shapes() -> std::result::Result<(), Bo
   let filtered_json = serde_json::to_value(build_features(&routes, filtered_paths, BTreeMap::new(), Vec::new()))?;
   assert!(filtered_json[0]["properties"].get("trip_ids").is_none());
 
-  let stop: StopPoint = serde_json::from_str(
-    r#"{"route_id":"R1","stop_id":"S1","stop_name":"A","lat":3.1,"lng":101.6,"trip_ids_json":"[\"T1\",\"T2\"]","arrival_times":"08:00:00, 08:10:00"}"#,
-  )?;
+  let stop: StopPoint = serde_json::from_str(r#"{"route_id":"R1","stop_id":"S1","stop_name":"A","lat":3.1,"lng":101.6,"trip_ids_json":"[\"T1\",\"T2\"]","arrival_times":"08:00:00, 08:10:00"}"#)?;
   assert_eq!(stop.route_id, "R1");
   let stop_features = serde_json::to_value(build_features(&routes, BTreeMap::new(), BTreeMap::new(), vec![stop]))?;
   assert_eq!(stop_features[0]["properties"]["trip_ids"], serde_json::json!(["T1", "T2"]));
