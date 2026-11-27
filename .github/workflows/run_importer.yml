@@ -2,8 +2,8 @@ name: GTFS Import Pipeline
 
 on:
   schedule:
-    # Run twice daily at 04:00 and 13:00 UTC+8; the durable UTC-day budget also covers manual runs.
-    - cron: "0 5,20 * * *"
+    # Run twice daily at 04:30 and 13:30 UTC+8; the durable UTC-day budget also covers manual runs.
+    - cron: "30 5,20 * * *"
   workflow_dispatch:
     inputs:
       max_rows:
