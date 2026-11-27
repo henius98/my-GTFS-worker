@@ -389,3 +389,10 @@ async fn run_import_splits_tight_daily_write_budget_fairly_across_multiple_provi
   assert!(insert_payloads.iter().any(|payload| payload.contains("\"R1\"") && payload.contains("\"R3\"") && !payload.contains("\"R4\"")));
   Ok(())
 }
+
+#[test]
+fn format_incomplete_providers_lists_provider_names_when_present() {
+  assert_eq!(format_incomplete_providers(&[]), "0 provider(s) remain incomplete");
+  assert_eq!(format_incomplete_providers(&["ktmb"]), "1 provider(s) remain incomplete (ktmb)");
+  assert_eq!(format_incomplete_providers(&["ktmb", "rapid-rail-kl"]), "2 provider(s) remain incomplete (ktmb, rapid-rail-kl)");
+}

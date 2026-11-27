@@ -69,6 +69,10 @@ pub struct WorkflowSummary {
   pub usage: D1Usage,
 }
 
+fn format_incomplete_providers(names: &[&str]) -> String {
+  if names.is_empty() { "0 provider(s) remain incomplete".to_owned() } else { format!("{} provider(s) remain incomplete ({})", names.len(), names.join(", ")) }
+}
+
 pub async fn run_import(
   providers: ProvidersToml,
   runtime: Arc<RuntimeConfig>,
@@ -208,11 +212,12 @@ pub async fn run_import_with_shutdown(
 
   let has_error = preparation_has_error || schedule.has_error;
   let shutdown_requested = schedule.shutdown_requested || shutdown.is_triggered();
+  let incomplete_provider_names = schedule.remaining_providers.iter().map(processor::PreparedProvider::name).collect::<Vec<_>>();
   println!(
-    "Workflow logical-row budget: processed {} of {} rows; {} provider(s) remain incomplete; write budget exhausted: {}; shutdown requested: {}",
+    "Workflow logical-row budget: processed {} of {} rows; {}; write budget exhausted: {}; shutdown requested: {}",
     schedule.total_rows_processed,
     runtime.max_rows_per_workflow,
-    schedule.remaining_providers.len(),
+    format_incomplete_providers(&incomplete_provider_names),
     schedule.write_budget_exhausted,
     shutdown_requested,
   );

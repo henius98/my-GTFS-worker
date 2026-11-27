@@ -221,7 +221,7 @@ test("importer advances contiguous checkpoints under tight write budget, resumes
   // depending on how many of the 7 small-file rows run first) without swapping live tables.
   const run1 = await runImporter({ D1_DAILY_WRITE_LIMIT: "2090" });
   assert.equal(run1.code, 0, `Run 1 failed:\n${run1.stdout}\n${run1.stderr}`);
-  assert.match(run1.stdout, /write budget exhausted: true/);
+  assert.match(run1.stdout, /1 provider\(s\) remain incomplete \(ktmb\); write budget exhausted: true/);
 
   const liveStopsAfterRun1 = await db.prepare("SELECT stop_id FROM stops ORDER BY stop_id").all();
   assert.deepEqual(
