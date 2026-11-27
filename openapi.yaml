@@ -25,8 +25,6 @@ tags:
     description: "Paginated, filterable GTFS table queries."
   - name: SQL
     description: Admin-protected read-only SQL queries.
-  - name: Departures
-    description: Estimated upcoming stop departures from static schedules and frequencies.
   - name: Map
     description: GeoJSON transit network routes and stops.
 paths:
@@ -271,110 +269,6 @@ paths:
           "$ref": "#/components/responses/RateLimitExceeded"
         "500":
           "$ref": "#/components/responses/InternalServerError"
-  "/{provider}/departures":
-    parameters:
-      - "$ref": "#/components/parameters/Provider"
-    get:
-      tags: [Departures]
-      operationId: getDepartures
-      summary: Estimate upcoming departures at a stop
-      description: |-
-        Estimates upcoming departures from static GTFS schedules and frequencies over `WORKER_DEPARTURES_SEARCH_DAYS` (7 days). Respects `calendar`, `calendar_dates` overrides, agency timezones, post-midnight service times, and excludes `pickup_type = 1` stop times. Unknown or duplicate query parameters return `400`.
-
-        Responses always set `Cache-Control: no-store` and `X-Departure-Cache: HIT | MISS | BYPASS` (backed by per-provider `departure_cache` with TTL `WORKER_FEED_CACHE_TTL_SECONDS` = 86400s).
-      parameters:
-        - name: stop_id
-          in: query
-          required: true
-          description: "GTFS stop identifier (1 to 256 bytes after trimming)."
-          schema:
-            type: string
-            minLength: 1
-            maxLength: 256
-          example: KJ10
-        - name: route_id
-          in: query
-          required: false
-          description: "Optional GTFS route identifier filter (1 to 256 bytes after trimming)."
-          schema:
-            type: string
-            minLength: 1
-            maxLength: 256
-          example: KJL
-        - name: direction_id
-          in: query
-          required: false
-          description: "Optional GTFS travel direction filter (`0` or `1`)."
-          schema:
-            type: integer
-            enum: [0, 1]
-          example: 0
-        - name: limit
-          in: query
-          required: false
-          description: "Maximum departures to return (`1..=100`, default `5`)."
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 100
-            default: 5
-          example: 5
-        - name: at
-          in: query
-          required: false
-          description: "RFC3339 timestamp with timezone offset (defaults to current UTC time)."
-          schema:
-            type: string
-            format: date-time
-          example: "2026-09-23T08:00:00+08:00"
-      responses:
-        "200":
-          description: Estimated upcoming departures.
-          headers:
-            Access-Control-Allow-Origin:
-              "$ref": "#/components/headers/CorsAllowOrigin"
-            Cache-Control:
-              "$ref": "#/components/headers/CacheControl"
-            X-Departure-Cache:
-              "$ref": "#/components/headers/DepartureCacheStatus"
-          content:
-            "application/json":
-              schema:
-                "$ref": "#/components/schemas/DeparturesResponse"
-        "400":
-          "$ref": "#/components/responses/BadRequestJson"
-        "404":
-          description: "Unknown `stop_id` (JSON) or unbound provider (plain text)."
-          headers:
-            Access-Control-Allow-Origin:
-              "$ref": "#/components/headers/CorsAllowOrigin"
-          content:
-            "application/json":
-              schema:
-                "$ref": "#/components/schemas/ErrorResponse"
-              example:
-                error: Unknown stop_id
-            "text/plain":
-              schema:
-                type: string
-              example: "Provider 'unknown' not found or DB not bound"
-        "405":
-          "$ref": "#/components/responses/MethodNotAllowedJson"
-        "429":
-          "$ref": "#/components/responses/RateLimitExceeded"
-        "500":
-          "$ref": "#/components/responses/InternalServerError"
-        "503":
-          description: Departure lookup failed against D1 or schedule data is invalid.
-          headers:
-            Access-Control-Allow-Origin:
-              "$ref": "#/components/headers/CorsAllowOrigin"
-          content:
-            "application/json":
-              schema:
-                "$ref": "#/components/schemas/ErrorResponse"
-              example:
-                error: Departure data is unavailable
   "/{provider}/map":
     parameters:
       - "$ref": "#/components/parameters/Provider"
@@ -385,7 +279,7 @@ paths:
       description: |-
         Returns active routes and stops for a service date as a GeoJSON `FeatureCollection`. Providers with a `shapes` table emit `LineString` route features (`geometry_source: "shape"`); providers without shapes (or routes without shape points) fall back to `MultiLineString` stop-to-stop segments (`geometry_source: "stop_sequence"`). Stops emit `Point` features.
 
-        Edge-cached per route using `WORKER_FEED_CACHE_TTL_SECONDS` (`86400`s); multi-route calls query D1 only for cache misses.
+        Edge-cached per route until the next daily `WORKER_MAP_CACHE_EXPIRE_TIME` (`05:00` in `Asia/Kuala_Lumpur`); multi-route calls query D1 only for cache misses.
       parameters:
         - name: route_id
           in: query
@@ -479,12 +373,12 @@ components:
       description: |-
         Table compiled into the provider's D1 schema (matched case-insensitively).
         Available tables per provider:
-        - `mybas-johor`: `0_dataset_versions`, `0_import_progress`, `agency`, `areas`, `calendar`, `departure_cache`, `fare_leg_rules`, `fare_media`, `fare_products`, `rider_categories`, `routes`, `shapes`, `stop_areas`, `stop_times`, `stops`, `trips`
-        - `ktmb`: `0_daily_import_budget`, `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `calendar_dates`, `departure_cache`, `routes`, `stop_times`, `stops`, `trips`
-        - `rapid-bus-mrtfeeder`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `calendar_dates`, `departure_cache`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
-        - `rapid-rail-kl`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `departure_cache`, `frequencies`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
-        - `rapid-bus-kl`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `departure_cache`, `frequencies`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
-        - `rapid-bus-penang`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `departure_cache`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
+        - `mybas-johor`: `0_dataset_versions`, `0_import_progress`, `agency`, `areas`, `calendar`, `fare_leg_rules`, `fare_media`, `fare_products`, `rider_categories`, `routes`, `shapes`, `stop_areas`, `stop_times`, `stops`, `trips`
+        - `ktmb`: `0_daily_import_budget`, `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `calendar_dates`, `routes`, `stop_times`, `stops`, `trips`
+        - `rapid-bus-mrtfeeder`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `calendar_dates`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
+        - `rapid-rail-kl`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `frequencies`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
+        - `rapid-bus-kl`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `frequencies`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
+        - `rapid-bus-penang`: `0_dataset_versions`, `0_import_progress`, `agency`, `calendar`, `routes`, `shapes`, `stop_times`, `stops`, `trips`
       schema:
         type: string
         enum:
@@ -495,7 +389,6 @@ components:
           - areas
           - calendar
           - calendar_dates
-          - departure_cache
           - fare_leg_rules
           - fare_media
           - fare_products
@@ -521,11 +414,6 @@ components:
       description: HTTP caching directive for the response.
       schema:
         type: string
-    DepartureCacheStatus:
-      description: "Status of the per-provider D1 `departure_cache` lookup."
-      schema:
-        type: string
-        enum: [HIT, MISS, BYPASS]
   responses:
     BadRequestText:
       description: "Invalid query parameter, column, or SQL statement."
@@ -672,145 +560,6 @@ components:
           type: array
           items:
             "$ref": "#/components/schemas/DataRow"
-    DepartureStop:
-      type: object
-      required: [stop_id, stop_name]
-      additionalProperties: false
-      properties:
-        stop_id:
-          type: string
-        stop_name:
-          type: [string, "null"]
-    Departure:
-      type: object
-      required:
-        - trip_id
-        - route_id
-        - route_short_name
-        - route_long_name
-        - route_color
-        - route_text_color
-        - service_id
-        - trip_headsign
-        - direction_id
-        - stop_sequence
-        - service_date
-        - agency_timezone
-        - headway_secs
-        - trip_start_secs
-        - estimate_method
-        - departure_secs
-        - service_departure_time
-        - estimated_arrival_at
-        - estimated_departure_at
-        - wait_seconds
-      additionalProperties: false
-      properties:
-        trip_id:
-          type: string
-        route_id:
-          type: string
-        route_short_name:
-          type: [string, "null"]
-        route_long_name:
-          type: [string, "null"]
-        route_color:
-          type: [string, "null"]
-        route_text_color:
-          type: [string, "null"]
-        service_id:
-          type: string
-        trip_headsign:
-          type: [string, "null"]
-        direction_id:
-          type: [integer, "null"]
-          enum: [0, 1, null]
-        stop_sequence:
-          type: integer
-          minimum: 0
-        service_date:
-          type: string
-          format: date
-          description: "GTFS service date (may precede the local calendar date after midnight)."
-        agency_timezone:
-          type: string
-          description: IANA timezone name used to resolve the service day.
-        headway_secs:
-          type: [integer, "null"]
-          minimum: 1
-          description: "Headway in seconds for frequency-based trips; `null` for scheduled trips."
-        trip_start_secs:
-          type: [integer, "null"]
-          minimum: 0
-          description: Trip start offset in seconds since service-day origin for frequency-based trips.
-        estimate_method:
-          type: string
-          enum: [gtfs_schedule, frequency_start_plus_headway]
-        departure_secs:
-          type: integer
-          minimum: 0
-          description: "Seconds since service-day origin; may exceed 86400 for post-midnight service."
-        service_departure_time:
-          type: string
-          pattern: "^\\d{2,}:\\d{2}:\\d{2}$"
-          description: "GTFS service-day time string (`HH:MM:SS`, hours may exceed 23)."
-        estimated_arrival_at:
-          type: string
-          format: date-time
-          description: RFC3339 estimated arrival timestamp in agency timezone offset.
-        estimated_departure_at:
-          type: string
-          format: date-time
-          description: RFC3339 estimated departure timestamp in agency timezone offset.
-        wait_seconds:
-          type: integer
-          minimum: 0
-          description: "Seconds from `requested_at` until `estimated_departure_at` (rounded up)."
-    DeparturesResponse:
-      type: object
-      required:
-        - stop
-        - route_id
-        - direction_id
-        - requested_at
-        - search_until
-        - limit
-        - is_estimate
-        - estimate_method
-        - realtime
-        - departures
-      additionalProperties: false
-      properties:
-        stop:
-          "$ref": "#/components/schemas/DepartureStop"
-        route_id:
-          type: [string, "null"]
-        direction_id:
-          type: [integer, "null"]
-          enum: [0, 1, null]
-        requested_at:
-          type: string
-          format: date-time
-        search_until:
-          type: string
-          format: date-time
-        limit:
-          type: integer
-          minimum: 1
-        is_estimate:
-          type: boolean
-          const: true
-        estimate_method:
-          type: [string, "null"]
-          enum: [gtfs_schedule, frequency_start_plus_headway, mixed, null]
-          description: "`null` when `departures` is empty; `mixed` when results combine scheduled and headway estimates."
-        realtime:
-          type: boolean
-          const: false
-        departures:
-          type: array
-          items:
-            "$ref": "#/components/schemas/Departure"
     GeoJsonPosition:
       type: array
       description: "GeoJSON `[longitude, latitude]` coordinate pair."

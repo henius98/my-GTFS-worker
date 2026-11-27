@@ -13,7 +13,7 @@ fn formats_provider_d1_binding_name() {
 fn formats_d1_query_log_with_quota_metadata() {
   let meta = D1ResultMeta { changed_db: Some(true), changes: Some(1), duration: Some(4.25), last_row_id: Some(9), rows_read: Some(42), rows_written: Some(3), size_after: Some(16_384) };
 
-  let line = format_d1_query_log("ktmb", "DB_KTMB", "departures", "cache_write", true, Some(&meta), None);
+  let line = format_d1_query_log("ktmb", "DB_KTMB", "map", "route_trips", true, Some(&meta), None);
   let Some(line) = line else {
     panic!("expected serialized log line");
   };
@@ -25,8 +25,8 @@ fn formats_d1_query_log_with_quota_metadata() {
   assert_eq!(parsed["event"], "d1_query");
   assert_eq!(parsed["provider"], "ktmb");
   assert_eq!(parsed["database"], "DB_KTMB");
-  assert_eq!(parsed["route"], "departures");
-  assert_eq!(parsed["query"], "cache_write");
+  assert_eq!(parsed["route"], "map");
+  assert_eq!(parsed["query"], "route_trips");
   assert_eq!(parsed["success"], true);
   assert_eq!(parsed["rows_read"], 42);
   assert_eq!(parsed["rows_written"], 3);

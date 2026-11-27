@@ -5,7 +5,6 @@
 
 mod data;
 mod database;
-mod departures;
 mod map;
 mod sql;
 mod status;
@@ -122,10 +121,6 @@ pub(crate) fn api_cache_control(env: &Env) -> Result<String> {
   Ok(format!("public, max-age={seconds}"))
 }
 
-pub(crate) fn feed_cache_ttl_seconds(env: &Env) -> Result<i64> {
-  parse_required_var(env, "WORKER_FEED_CACHE_TTL_SECONDS", |raw| parse_int_in_range(raw, 1, MAX_TTL_SECONDS), "must be a positive integer")
-}
-
 pub(crate) fn map_max_routes(env: &Env) -> Result<usize> {
   parse_required_var(env, "WORKER_MAP_MAX_ROUTES", |raw| parse_int_in_range(raw, 1, usize::MAX), "must be a positive integer")
 }
@@ -151,7 +146,6 @@ pub async fn fetch_route(mut req: Request, env: Env, ctx: Context) -> Result<Res
   } else {
     let result = match (segments.next(), segments.next(), segments.next(), segments.next()) {
       (Some(provider), Some("status"), None, None) => status::handle(&req, &env, ctx, &url, provider).await,
-      (Some(provider), Some("departures"), None, None) => departures::handle(&req, &env, &url, provider).await,
       (Some(provider), Some("map"), None, None) => map::handle(&req, &env, ctx, &url, provider).await,
       (Some(provider), Some("sql"), None, None) => sql::handle(&mut req, &env, provider).await,
       (Some(provider), Some("data"), Some(table_name), None) => data::handle(&req, &env, &url, provider, table_name).await,

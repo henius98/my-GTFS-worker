@@ -101,12 +101,8 @@ def load_worker_vars() -> dict[str, str]:
   defaults = {
     "WORKER_SQL_MAX_ROWS": "1000",
     "WORKER_API_CACHE_TTL_SECONDS": "60",
-    "WORKER_FEED_CACHE_TTL_SECONDS": "86400",
     "WORKER_MAP_MAX_ROUTES": "20",
-    "WORKER_DEPARTURE_CACHE_WINDOW_SECONDS": "300",
-    "WORKER_DEPARTURES_MAX_LIMIT": "100",
-    "WORKER_DEPARTURES_DEFAULT_LIMIT": "5",
-    "WORKER_DEPARTURES_SEARCH_DAYS": "7",
+    "WORKER_MAP_CACHE_EXPIRE_TIME": "05:00",
     "WORKER_DEFAULT_TIMEZONE": "Asia/Kuala_Lumpur",
   }
   wrangler_path = ROOT / "wrangler.toml"
@@ -143,11 +139,8 @@ def build_openapi_spec() -> dict[str, Any]:
 
   sql_max_rows = int(worker_vars["WORKER_SQL_MAX_ROWS"])
   api_cache_ttl = int(worker_vars["WORKER_API_CACHE_TTL_SECONDS"])
-  feed_cache_ttl = int(worker_vars["WORKER_FEED_CACHE_TTL_SECONDS"])
   map_max_routes = int(worker_vars["WORKER_MAP_MAX_ROUTES"])
-  departures_max_limit = int(worker_vars["WORKER_DEPARTURES_MAX_LIMIT"])
-  departures_default_limit = int(worker_vars["WORKER_DEPARTURES_DEFAULT_LIMIT"])
-  departures_search_days = int(worker_vars["WORKER_DEPARTURES_SEARCH_DAYS"])
+  map_cache_expire_time = worker_vars["WORKER_MAP_CACHE_EXPIRE_TIME"]
   default_timezone = worker_vars["WORKER_DEFAULT_TIMEZONE"]
 
   prod_url = load_bruno_base_url(
@@ -197,7 +190,6 @@ def build_openapi_spec() -> dict[str, Any]:
       {"name": "Status", "description": "GTFS import progress per provider."},
       {"name": "Data", "description": "Paginated, filterable GTFS table queries."},
       {"name": "SQL", "description": "Admin-protected read-only SQL queries."},
-      {"name": "Departures", "description": "Estimated upcoming stop departures from static schedules and frequencies."},
       {"name": "Map", "description": "GeoJSON transit network routes and stops."},
     ],
     "paths": {
@@ -469,111 +461,6 @@ def build_openapi_spec() -> dict[str, Any]:
           },
         },
       },
-      "/{provider}/departures": {
-        "parameters": [{"$ref": "#/components/parameters/Provider"}],
-        "get": {
-          "tags": ["Departures"],
-          "operationId": "getDepartures",
-          "summary": "Estimate upcoming departures at a stop",
-          "description": (
-            f"Estimates upcoming departures from static GTFS schedules and frequencies over `WORKER_DEPARTURES_SEARCH_DAYS` "
-            f"({departures_search_days} days). Respects `calendar`, `calendar_dates` overrides, agency timezones, post-midnight service times, "
-            "and excludes `pickup_type = 1` stop times. Unknown or duplicate query parameters return `400`.\n\n"
-            f"Responses always set `Cache-Control: no-store` and `X-Departure-Cache: HIT | MISS | BYPASS` "
-            f"(backed by per-provider `departure_cache` with TTL `WORKER_FEED_CACHE_TTL_SECONDS` = {feed_cache_ttl}s)."
-          ),
-          "parameters": [
-            {
-              "name": "stop_id",
-              "in": "query",
-              "required": True,
-              "description": "GTFS stop identifier (1 to 256 bytes after trimming).",
-              "schema": {"type": "string", "minLength": 1, "maxLength": 256},
-              "example": "KJ10",
-            },
-            {
-              "name": "route_id",
-              "in": "query",
-              "required": False,
-              "description": "Optional GTFS route identifier filter (1 to 256 bytes after trimming).",
-              "schema": {"type": "string", "minLength": 1, "maxLength": 256},
-              "example": "KJL",
-            },
-            {
-              "name": "direction_id",
-              "in": "query",
-              "required": False,
-              "description": "Optional GTFS travel direction filter (`0` or `1`).",
-              "schema": {"type": "integer", "enum": [0, 1]},
-              "example": 0,
-            },
-            {
-              "name": "limit",
-              "in": "query",
-              "required": False,
-              "description": f"Maximum departures to return (`1..={departures_max_limit}`, default `{departures_default_limit}`).",
-              "schema": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": departures_max_limit,
-                "default": departures_default_limit,
-              },
-              "example": departures_default_limit,
-            },
-            {
-              "name": "at",
-              "in": "query",
-              "required": False,
-              "description": "RFC3339 timestamp with timezone offset (defaults to current UTC time).",
-              "schema": {"type": "string", "format": "date-time"},
-              "example": "2026-09-23T08:00:00+08:00",
-            },
-          ],
-          "responses": {
-            "200": {
-              "description": "Estimated upcoming departures.",
-              "headers": {
-                "Access-Control-Allow-Origin": cors_header_ref,
-                "Cache-Control": cache_control_ref,
-                "X-Departure-Cache": {"$ref": "#/components/headers/DepartureCacheStatus"},
-              },
-              "content": {
-                "application/json": {
-                  "schema": {"$ref": "#/components/schemas/DeparturesResponse"}
-                }
-              },
-            },
-            "400": {"$ref": "#/components/responses/BadRequestJson"},
-            "404": {
-              "description": "Unknown `stop_id` (JSON) or unbound provider (plain text).",
-              "headers": {"Access-Control-Allow-Origin": cors_header_ref},
-              "content": {
-                "application/json": {
-                  "schema": {"$ref": "#/components/schemas/ErrorResponse"},
-                  "example": {"error": "Unknown stop_id"},
-                },
-                "text/plain": {
-                  "schema": {"type": "string"},
-                  "example": "Provider 'unknown' not found or DB not bound",
-                },
-              },
-            },
-            "405": {"$ref": "#/components/responses/MethodNotAllowedJson"},
-            "429": {"$ref": "#/components/responses/RateLimitExceeded"},
-            "500": {"$ref": "#/components/responses/InternalServerError"},
-            "503": {
-              "description": "Departure lookup failed against D1 or schedule data is invalid.",
-              "headers": {"Access-Control-Allow-Origin": cors_header_ref},
-              "content": {
-                "application/json": {
-                  "schema": {"$ref": "#/components/schemas/ErrorResponse"},
-                  "example": {"error": "Departure data is unavailable"},
-                }
-              },
-            },
-          },
-        },
-      },
       "/{provider}/map": {
         "parameters": [{"$ref": "#/components/parameters/Provider"}],
         "get": {
@@ -585,7 +472,7 @@ def build_openapi_spec() -> dict[str, Any]:
             "Providers with a `shapes` table emit `LineString` route features (`geometry_source: \"shape\"`); "
             "providers without shapes (or routes without shape points) fall back to `MultiLineString` stop-to-stop segments "
             "(`geometry_source: \"stop_sequence\"`). Stops emit `Point` features.\n\n"
-            f"Edge-cached per route using `WORKER_FEED_CACHE_TTL_SECONDS` (`{feed_cache_ttl}`s); multi-route calls query D1 only for cache misses."
+            f"Edge-cached per route until the next daily `WORKER_MAP_CACHE_EXPIRE_TIME` (`{map_cache_expire_time}` in `{default_timezone}`); multi-route calls query D1 only for cache misses."
           ),
           "parameters": [
             {
@@ -703,13 +590,6 @@ def build_openapi_spec() -> dict[str, Any]:
         "CacheControl": {
           "description": "HTTP caching directive for the response.",
           "schema": {"type": "string"},
-        },
-        "DepartureCacheStatus": {
-          "description": "Status of the per-provider D1 `departure_cache` lookup.",
-          "schema": {
-            "type": "string",
-            "enum": ["HIT", "MISS", "BYPASS"],
-          },
         },
       },
       "responses": {
@@ -848,105 +728,6 @@ def build_openapi_spec() -> dict[str, Any]:
               "type": "array",
               "items": {"$ref": "#/components/schemas/DataRow"},
             }
-          },
-        },
-        "DepartureStop": {
-          "type": "object",
-          "required": ["stop_id", "stop_name"],
-          "additionalProperties": False,
-          "properties": {
-            "stop_id": {"type": "string"},
-            "stop_name": {"type": ["string", "null"]},
-          },
-        },
-        "Departure": {
-          "type": "object",
-          "required": [
-            "trip_id",
-            "route_id",
-            "route_short_name",
-            "route_long_name",
-            "route_color",
-            "route_text_color",
-            "service_id",
-            "trip_headsign",
-            "direction_id",
-            "stop_sequence",
-            "service_date",
-            "agency_timezone",
-            "headway_secs",
-            "trip_start_secs",
-            "estimate_method",
-            "departure_secs",
-            "service_departure_time",
-            "estimated_arrival_at",
-            "estimated_departure_at",
-            "wait_seconds",
-          ],
-          "additionalProperties": False,
-          "properties": {
-            "trip_id": {"type": "string"},
-            "route_id": {"type": "string"},
-            "route_short_name": {"type": ["string", "null"]},
-            "route_long_name": {"type": ["string", "null"]},
-            "route_color": {"type": ["string", "null"]},
-            "route_text_color": {"type": ["string", "null"]},
-            "service_id": {"type": "string"},
-            "trip_headsign": {"type": ["string", "null"]},
-            "direction_id": {"type": ["integer", "null"], "enum": [0, 1, None]},
-            "stop_sequence": {"type": "integer", "minimum": 0},
-            "service_date": {"type": "string", "format": "date", "description": "GTFS service date (may precede the local calendar date after midnight)."},
-            "agency_timezone": {"type": "string", "description": "IANA timezone name used to resolve the service day."},
-            "headway_secs": {"type": ["integer", "null"], "minimum": 1, "description": "Headway in seconds for frequency-based trips; `null` for scheduled trips."},
-            "trip_start_secs": {"type": ["integer", "null"], "minimum": 0, "description": "Trip start offset in seconds since service-day origin for frequency-based trips."},
-            "estimate_method": {
-              "type": "string",
-              "enum": ["gtfs_schedule", "frequency_start_plus_headway"],
-            },
-            "departure_secs": {"type": "integer", "minimum": 0, "description": "Seconds since service-day origin; may exceed 86400 for post-midnight service."},
-            "service_departure_time": {
-              "type": "string",
-              "pattern": r"^\d{2,}:\d{2}:\d{2}$",
-              "description": "GTFS service-day time string (`HH:MM:SS`, hours may exceed 23).",
-            },
-            "estimated_arrival_at": {"type": "string", "format": "date-time", "description": "RFC3339 estimated arrival timestamp in agency timezone offset."},
-            "estimated_departure_at": {"type": "string", "format": "date-time", "description": "RFC3339 estimated departure timestamp in agency timezone offset."},
-            "wait_seconds": {"type": "integer", "minimum": 0, "description": "Seconds from `requested_at` until `estimated_departure_at` (rounded up)."},
-          },
-        },
-        "DeparturesResponse": {
-          "type": "object",
-          "required": [
-            "stop",
-            "route_id",
-            "direction_id",
-            "requested_at",
-            "search_until",
-            "limit",
-            "is_estimate",
-            "estimate_method",
-            "realtime",
-            "departures",
-          ],
-          "additionalProperties": False,
-          "properties": {
-            "stop": {"$ref": "#/components/schemas/DepartureStop"},
-            "route_id": {"type": ["string", "null"]},
-            "direction_id": {"type": ["integer", "null"], "enum": [0, 1, None]},
-            "requested_at": {"type": "string", "format": "date-time"},
-            "search_until": {"type": "string", "format": "date-time"},
-            "limit": {"type": "integer", "minimum": 1},
-            "is_estimate": {"type": "boolean", "const": True},
-            "estimate_method": {
-              "type": ["string", "null"],
-              "enum": ["gtfs_schedule", "frequency_start_plus_headway", "mixed", None],
-              "description": "`null` when `departures` is empty; `mixed` when results combine scheduled and headway estimates.",
-            },
-            "realtime": {"type": "boolean", "const": False},
-            "departures": {
-              "type": "array",
-              "items": {"$ref": "#/components/schemas/Departure"},
-            },
           },
         },
         "GeoJsonPosition": {

@@ -6,11 +6,6 @@ const server = createTestHarness({
   workers: [{ configPath: "./test/worker/wrangler.jsonc" }]
 });
 const worker = server.getWorker("my-gtfs-worker-test");
-const at = "2026-09-24T00:00:00Z";
-
-async function request(query, options) {
-  return worker.fetch(`/ktmb/departures${query}`, options);
-}
 
 before(async () => {
   await server.listen();
@@ -63,112 +58,6 @@ afterEach(async () => {
 
 after(async () => {
   await server.close();
-});
-
-test("validates departure requests through HTTP", async () => {
-  for (const query of [
-    "",
-    "?stop_id=",
-    "?stop_id=S&limit=0",
-    "?stop_id=S&limit=-1",
-    "?stop_id=S&limit=101",
-    "?stop_id=S&limit=1.5",
-    "?stop_id=S&limit=",
-    "?stop_id=S&direction_id=2",
-    "?stop_id=S&at=2026-09-24T08:00:00",
-    "?stop_id=S&stop_id=T",
-    "?stop_id=S&api_key=secret",
-    "?stop_id=S&route_id="
-  ]) {
-    const response = await request(query);
-    assert.equal(response.status, 400, query);
-    assert.equal(typeof (await response.json()).error, "string", query);
-  }
-  const method = await request("?stop_id=S", { method: "POST" });
-  assert.equal(method.status, 405);
-  assert.equal(method.headers.get("Allow"), "GET");
-  assert.deepEqual(await method.json(), { error: "Method not allowed" });
-
-  const valid = await request(
-    "?stop_id=S&route_id=R&direction_id=1&limit=100&at=2026-09-24T08:00:00%2B08:00"
-  );
-  assert.equal(valid.status, 200);
-  const body = await valid.json();
-  assert.equal(body.route_id, "R");
-  assert.equal(body.direction_id, 1);
-  assert.equal(body.limit, 100);
-  assert.equal(body.requested_at, at);
-});
-
-test("returns scheduled departures with route and direction filters", async () => {
-  const response = await request(
-    `?stop_id=S&route_id=R&direction_id=1&limit=1&at=${at}`
-  );
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get("X-Departure-Cache"), "MISS");
-  const body = await response.json();
-  assert.equal(body.stop.stop_name, "Test stop");
-  assert.equal(body.route_id, "R");
-  assert.equal(body.direction_id, 1);
-  assert.equal(body.limit, 1);
-  assert.equal(body.search_until, "2026-10-01T00:00:00Z");
-  assert.equal(body.is_estimate, true);
-  assert.equal(body.realtime, false);
-  assert.equal(body.departures.length, 1);
-  assert.equal(body.departures[0].trip_id, "late");
-  assert.equal(body.departures[0].estimate_method, "gtfs_schedule");
-  assert.equal(body.departures[0].wait_seconds, 20 * 60);
-  assert.equal(
-    body.departures[0].estimated_departure_at,
-    "2026-09-24T08:20:00+08:00"
-  );
-});
-
-test("reuses cached departures and recalculates waits", async () => {
-  const first = await request(`?stop_id=S&limit=2&at=${at}`);
-  assert.equal(first.status, 200);
-  assert.equal(first.headers.get("X-Departure-Cache"), "MISS");
-  assert.deepEqual(
-    (await first.json()).departures.map((row) => row.trip_id),
-    ["early", "late"]
-  );
-
-  const second = await request("?stop_id=S&limit=1&at=2026-09-24T00:10:01Z");
-  assert.equal(second.status, 200);
-  assert.equal(second.headers.get("X-Departure-Cache"), "HIT");
-  const body = await second.json();
-  assert.equal(body.departures[0].trip_id, "late");
-  assert.equal(body.departures[0].wait_seconds, 9 * 60 + 59);
-});
-
-test("invalidates and recaches departures when feed progress changes", async () => {
-  const first = await request(`?stop_id=S&at=${at}`);
-  assert.equal(first.headers.get("X-Departure-Cache"), "MISS");
-  const { DB_KTMB: db } = await worker.getEnv();
-  await db
-    .prepare(
-      "INSERT INTO \"0_import_progress\" (FileName, CRC, LastProcessedLine, Status) VALUES (?, ?, ?, ?)"
-    )
-    .bind("trips.txt", "changed", 1, 1)
-    .run();
-
-  const second = await request(`?stop_id=S&at=${at}`);
-  assert.equal(second.status, 200);
-  assert.equal(second.headers.get("X-Departure-Cache"), "MISS");
-  assert.equal((await second.json()).departures[0].trip_id, "early");
-
-  const secondCached = await request(`?stop_id=S&at=${at}`);
-  assert.equal(secondCached.status, 200);
-  assert.equal(secondCached.headers.get("X-Departure-Cache"), "HIT");
-});
-
-test("reports unknown stops and unbound providers", async () => {
-  const stop = await request(`?stop_id=unknown&at=${at}`);
-  assert.equal(stop.status, 404);
-  assert.deepEqual(await stop.json(), { error: "Unknown stop_id" });
-
-  const provider = await worker.fetch(`/unknown/departures?stop_id=S&at=${at}`);
-  assert.equal(provider.status, 404);
 });
 
 async function seedRapidBusKl() {
@@ -1027,33 +916,6 @@ test("caches /map routes individually, queries D1 only for cache misses, and enf
       .map((f) => f.properties.route_id),
     ["R2"]
   );
-});
-
-test("computes frequency departures with exact_times 0 and 1", async () => {
-  await seedRapidBusKl();
-  const response = await worker.fetch(
-    `/rapid-bus-kl/departures?stop_id=S2&limit=4&at=${at}`
-  );
-  assert.equal(response.status, 200);
-  const body = await response.json();
-  assert.ok(body.departures.length >= 2);
-  assert.equal(body.departures[0].trip_id, "freq-exact");
-  assert.equal(body.departures[0].estimate_method, "gtfs_schedule");
-  assert.equal(
-    body.departures[0].estimated_departure_at,
-    "2026-09-24T08:03:00+08:00"
-  );
-  assert.equal(body.departures[0].headway_secs, 600);
-  assert.equal(body.departures[1].trip_id, "freq-headway");
-  assert.equal(
-    body.departures[1].estimate_method,
-    "frequency_start_plus_headway"
-  );
-  assert.equal(
-    body.departures[1].estimated_departure_at,
-    "2026-09-24T08:05:00+08:00"
-  );
-  assert.equal(body.departures[1].headway_secs, 600);
 });
 
 test("serves /sql read-only queries and enforces method", async () => {

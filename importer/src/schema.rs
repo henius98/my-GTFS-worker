@@ -51,7 +51,7 @@ impl SchemaCatalog {
   }
 
   pub fn is_infrastructure_table(table_name: &str) -> bool {
-    matches!(table_name, "departure_cache" | "0_daily_import_budget" | "0_import_progress" | "0_dataset_versions")
+    matches!(table_name, "0_daily_import_budget" | "0_import_progress" | "0_dataset_versions")
   }
 
   pub fn quote_identifier(identifier: &str) -> String {

@@ -5,7 +5,7 @@ Open this directory as a collection in Bruno. Select `Local` for
 endpoints require no authentication; `POST /<provider>/sql` requires
 `WORKER_ADMIN_KEY` via `Authorization: Bearer <key>` or `X-Admin-Key: <key>`
 (unless `WORKER_ALLOW_ANONYMOUS_SQL=true` is set locally). Edit the example
-`provider`, `table`, `stopId`, and `routeId` values in `collection.bru` to
+`provider`, `table`, and `routeId` values in `collection.bru` to
 explore other GTFS data.
 
 - **Worker health**: `GET /`, returning a plain-text liveness message.
@@ -17,10 +17,8 @@ explore other GTFS data.
   request includes optional examples for column selection, filters, range bounds, and sort.
 - **SQL**: `POST /<provider>/sql` accepts a single read-only `SELECT` (or
   `WITH ... SELECT`) query as plain text. Protected by `WORKER_ADMIN_KEY`.
-- **Departures**: `GET /<provider>/departures` estimates upcoming departures at
-  a required `stop_id`; `route_id`, `direction_id`, `limit`, and `at` filters are optional.
 - **Map**: `GET /<provider>/map` returns GeoJSON for a full network or one or more comma-separated routes (`route_id`),
-  edge-cached for `WORKER_FEED_CACHE_TTL_SECONDS` (86400 seconds in `.env.example`).
+  edge-cached per route until the next daily `WORKER_MAP_CACHE_EXPIRE_TIME` in `WORKER_DEFAULT_TIMEZONE`.
 - **Original GTFS**: `GET https://api.data.gov.my/gtfs-static/...` downloads the
   raw upstream GTFS static ZIP archive for every active provider in `providers.toml`.
   In Bruno **Developer Mode** (shield icon at top-right), the post-response script

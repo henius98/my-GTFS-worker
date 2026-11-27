@@ -96,19 +96,6 @@ impl ProviderDb {
     }
   }
 
-  pub async fn run(&self, query: &str, statement: &D1PreparedStatement) -> Result<D1Result> {
-    match statement.run().await {
-      Ok(result) => {
-        self.log_result(query, &result);
-        Ok(result)
-      }
-      Err(err) => {
-        self.log_error(query, &err);
-        Err(err)
-      }
-    }
-  }
-
   pub async fn batch(&self, statements: Vec<(&str, D1PreparedStatement)>) -> Result<Vec<D1Result>> {
     let (labels, stmts): (Vec<&str>, Vec<D1PreparedStatement>) = statements.into_iter().unzip();
     match self.db.batch(stmts).await {

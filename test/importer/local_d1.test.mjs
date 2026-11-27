@@ -313,12 +313,6 @@ test("importer advances contiguous checkpoints under tight write budget, resumes
       ["S1", "S2"],
     );
 
-    const depRes = await worker.fetch("http://local/ktmb/departures?stop_id=S1&limit=3&at=2026-09-24T00:00:00Z");
-    assert.equal(depRes.status, 200);
-    const depBody = await depRes.json();
-    assert.equal(depBody.departures.length, 3);
-    assert.equal(depBody.departures[0].trip_id, "T1");
-
     const mapRes = await worker.fetch("http://local/ktmb/map?route_id=R1");
     assert.equal(mapRes.status, 200);
     const mapBody = await mapRes.json();

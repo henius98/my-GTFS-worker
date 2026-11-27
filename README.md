@@ -8,7 +8,7 @@ It handles multiple Malaysian public transport operator datasets dynamically usi
 
 **Single codebase, multiple isolated databases.** The Cargo workspace contains three crates:
 
-1. **`worker`** (`my-gtfs-worker`): A Cloudflare Worker compiled to WebAssembly (`wasm32-unknown-unknown`) that dynamically routes requests to per-provider D1 bindings (`DB_<PROVIDER>`), exposing `/`, `/<provider>/status`, `/<provider>/data/<table>`, `/<provider>/sql`, `/<provider>/departures`, and `/<provider>/map`.
+1. **`worker`** (`my-gtfs-worker`): A Cloudflare Worker compiled to WebAssembly (`wasm32-unknown-unknown`) that dynamically routes requests to per-provider D1 bindings (`DB_<PROVIDER>`), exposing `/`, `/<provider>/status`, `/<provider>/data/<table>`, `/<provider>/sql`, and `/<provider>/map`.
 2. **`importer`**: A standalone CLI executed by GitHub Actions (or locally against Wrangler D1). It downloads GTFS ZIP feeds, parses CSVs in bounded blocking tasks, stages rows into `<table_name>__staging` tables via the D1 REST API, and atomically swaps live tables once every file finishes staging.
 3. **`test`** (`gtfs-checks`): Houses all unit tests (`test/unit/{importer,worker,scripts}/`), integration tests, migration/schema validators, and benchmarks.
 
@@ -36,7 +36,7 @@ scripts/deploy.sh                ← Provisions D1 DB + applies migrations + dep
 - 🧠 **Compile-Time Schema Discovery** — Both `importer/build.rs` and `worker/build.rs` share `scripts/schema_parser.rs` to parse per-provider `migrations/<provider>/0_gtfs_schema.sql` at build time—generating column maps, primary keys, staging DDL, per-row write bounds, base schema SQL, and ordered migrations with no runtime `PRAGMA` queries.
 - 🛡️ **Schema-Aware File Selection & CI Verification** — Rejects unsupported ZIP entries before CSV parsing or task spawning. CI validates live upstream feed headers against compiled schemas, local migration chains, staging swaps, and payload/replay benchmarks.
 - 📊 **D1 Usage Telemetry** — Aggregates Cloudflare's per-query `rows_read` and `rows_written` metadata and logs actual usage at the end of each workflow.
-- 🌐 **Edge-Cached Public API & D1 Departure Cache** — Serves edge-cached `/status` and `/map` responses, paginated `/data/<table>` queries, static-feed `/departures` estimates backed by per-provider `departure_cache` tables (auto-invalidated on `0_import_progress` changes), and admin-protected read-only `/sql` queries.
+- 🌐 **Edge-Cached Public API** — Serves edge-cached `/status` and `/map` responses, paginated `/data/<table>` queries, and admin-protected read-only `/sql` queries.
 - ⏱️ **Twice-Daily Feed Checks** — GitHub Actions cron (`0 4,13 * * *`, `timezone: "Asia/Singapore"`) checks feeds at 04:00 and 13:00 UTC+8; a durable UTC-day write ledger (`0_daily_import_budget`) also covers manual runs.
 - 🧾 **Auditable Rotation History** — Automatic database rotation creates a fresh D1 database, applies `0_gtfs_schema.sql`, updates `providers.toml`, records the retired database under `[[retired_databases]]`, and triggers automatic `wrangler.toml` regeneration and worker redeploy in CI.
 - 🗄️ **Full Provider Isolation** — Each provider gets its own D1 database with bare GTFS table names and `0_`-prefixed infrastructure tables.
@@ -91,7 +91,6 @@ my-GTFS-worker/
 │       ├── status/              # GET /<provider>/status (edge-cached import progress)
 │       ├── data/                # GET /<provider>/data/<table> (paginated filter/sort API)
 │       ├── sql/                 # POST /<provider>/sql (admin-protected read-only SQL)
-│       ├── departures/          # GET /<provider>/departures (schedule/headway estimator + D1 cache)
 │       └── map/                 # GET /<provider>/map (edge-cached GeoJSON network/route map)
 ├── migrations/                  # Per-provider D1 SQL migrations & reference schema.sql
 │   ├── <provider>/              # 0_gtfs_schema.sql + incremental migrations per provider
@@ -100,7 +99,7 @@ my-GTFS-worker/
 │   ├── Cargo.toml
 │   ├── unit/                    # Out-of-line unit tests for importer, worker & scripts
 │   ├── importer/                # Budget/checkpoint tests, local D1 e2e, validator & benchmarks
-│   ├── worker/                  # Departure SQL tests, Wrangler HTTP/D1 e2e & data API check
+│   ├── worker/                  # Map SQL tests, Wrangler HTTP/D1 e2e & data API check
 │   └── shared/                  # Shared test utilities
 └── .github/workflows/           # CI build/test/release (build_importer.yml) & cron (run_importer.yml)
 ```
@@ -109,7 +108,7 @@ my-GTFS-worker/
 
 | Crate                  | Purpose                                                                                                                                                                                                              |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `worker`               | Deploys to Cloudflare Workers. Serves `/`, `/<provider>/status`, `/<provider>/data/<table>`, `/<provider>/sql`, `/<provider>/departures`, and `/<provider>/map` against per-provider D1 databases.                   |
+| `worker`               | Deploys to Cloudflare Workers. Serves `/`, `/<provider>/status`, `/<provider>/data/<table>`, `/<provider>/sql`, and `/<provider>/map` against per-provider D1 databases.                                            |
 | `importer`             | Runs via GitHub Actions or `pnpm import:local`. Downloads GTFS ZIPs, stages CSVs concurrently into `<table_name>__staging` tables within daily write/memory limits, tracks byte checkpoints, and atomically swaps tables. |
 | `test` (`gtfs-checks`) | Hosts all unit tests, integration tests, local Wrangler e2e suites, live-feed schema/migration validation (`verify_migrations`), and JSON/UPSERT benchmarks.                                                          |
 
@@ -325,19 +324,8 @@ curl -X POST http://localhost:8787/ktmb/sql \
   --data-binary 'SELECT * FROM stops LIMIT 10'
 ```
 
-#### `GET /<provider>/departures`
-Estimates upcoming departures at a stop over the configured search horizon (`WORKER_DEPARTURES_SEARCH_DAYS`, example `7`) using each provider's GTFS schema: frequency trips expand their headways, scheduled trips use `stop_times`, `calendar_dates` additions/cancellations override weekly `calendar` entries, agency timezones and post-midnight service times are respected, and `pickup_type = 1` stop times are excluded.
-
-```bash
-curl --get 'http://localhost:8787/rapid-rail-kl/departures' --data-urlencode 'stop_id=KJ10' --data-urlencode 'limit=5'
-```
-
-Query parameters: `stop_id` (required), optional `route_id`, `direction_id` (`0` or `1`), `limit` (`1..=WORKER_DEPARTURES_MAX_LIMIT`, default `WORKER_DEPARTURES_DEFAULT_LIMIT`), and `at` (RFC3339 instant with timezone, default now). Returns `stop`, `route_id`, `direction_id`, `requested_at`, `search_until`, `limit`, `is_estimate: true`, `estimate_method`, `realtime: false`, and `departures` (each tagged `gtfs_schedule` or `frequency_start_plus_headway`).
-
-Responses set `Cache-Control: no-store` and `X-Departure-Cache: HIT | MISS | BYPASS`. Results within `WORKER_DEPARTURE_CACHE_WINDOW_SECONDS` of `now` are cached in each provider's `departure_cache` table for `WORKER_FEED_CACHE_TTL_SECONDS` (up to `WORKER_DEPARTURES_MAX_LIMIT` departures per `(stop_id, route_id, direction_id)` key) and automatically invalidated whenever `0_import_progress` changes. Cache writes consume D1 write allowance outside the importer's daily ledger; cache hits do not write, and cache errors fall back cleanly to live calculation.
-
 #### `GET /<provider>/map`
-Returns a provider's network as a GeoJSON `FeatureCollection`. Both query parameters are optional: omit `route_id` to return all active routes (add `?route_id=KJL` or comma-separated `?route_id=KJL,PYL` up to `WORKER_MAP_MAX_ROUTES` unique routes; returns `404` only if no requested routes have active trips on the target date), and omit `date` to default to today in `WORKER_DEFAULT_TIMEZONE` (or pass `?date=YYYY-MM-DD` / `?date=YYYYMMDD`; invalid values return `400`). The Worker calculates the weekday for the target date and restricts shapes, stop-sequence segments, and stops to services active in `calendar` (within `[start_date, end_date]`) with `calendar_dates` add/remove overrides (`exception_type` `1`/`2`) when the provider schema includes `calendar_dates`. Route shapes emit `LineString` features (`geometry_source: "shape"`); providers without a `shapes` table (such as KTMB) emit one `MultiLineString` feature per route connecting consecutive stops (`geometry_source: "stop_sequence"`). Stops emit `Point` features with aggregated `arrival_times` strings. Edge-cached per route using `WORKER_FEED_CACHE_TTL_SECONDS`; multi-route requests reuse cached routes and query D1 only for cache misses.
+Returns a provider's network as a GeoJSON `FeatureCollection`. Both query parameters are optional: omit `route_id` to return all active routes (add `?route_id=KJL` or comma-separated `?route_id=KJL,PYL` up to `WORKER_MAP_MAX_ROUTES` unique routes; returns `404` only if no requested routes have active trips on the target date), and omit `date` to default to today in `WORKER_DEFAULT_TIMEZONE` (or pass `?date=YYYY-MM-DD` / `?date=YYYYMMDD`; invalid values return `400`). The Worker calculates the weekday for the target date and restricts shapes, stop-sequence segments, and stops to services active in `calendar` (within `[start_date, end_date]`) with `calendar_dates` add/remove overrides (`exception_type` `1`/`2`) when the provider schema includes `calendar_dates`. Route shapes emit `LineString` features (`geometry_source: "shape"`); providers without a `shapes` table (such as KTMB) emit one `MultiLineString` feature per route connecting consecutive stops (`geometry_source: "stop_sequence"`). Stops emit `Point` features with aggregated `arrival_times` strings. Edge-cached per route until the next daily `WORKER_MAP_CACHE_EXPIRE_TIME` in `WORKER_DEFAULT_TIMEZONE`; multi-route requests reuse cached routes and query D1 only for cache misses.
 
 ```js
 const response = await fetch(
@@ -363,13 +351,9 @@ Set these required Cloudflare Worker variables (missing or invalid values fail f
 | `WORKER_CORS_ALLOW_ORIGIN`              |                 `*` | Value for the `Access-Control-Allow-Origin` response header                                         |
 | `WORKER_SQL_MAX_ROWS`                   |              `1000` | Maximum row cap for both `/data` and `/sql`                                                         |
 | `WORKER_API_CACHE_TTL_SECONDS`          |                `60` | `Cache-Control: public, max-age=<n>` lifetime in seconds for `/status` and `/data`                  |
-| `WORKER_FEED_CACHE_TTL_SECONDS`         |             `86400` | Cache lifetime in seconds for `/map` edge caching and `/departures` D1 `departure_cache`            |
 | `WORKER_MAP_MAX_ROUTES`                 |                `20` | Maximum distinct `route_id` values accepted in one `/map` request                                   |
-| `WORKER_DEPARTURE_CACHE_WINDOW_SECONDS` |               `300` | Max distance in seconds from `now` for `/departures` requests to populate `departure_cache` (`0` disables writes) |
-| `WORKER_DEPARTURES_MAX_LIMIT`           |               `100` | Maximum `limit` parameter and cached departure count for `/departures`                              |
-| `WORKER_DEPARTURES_DEFAULT_LIMIT`       |                 `5` | Default `limit` when `/departures` omits `limit` (must be `<= WORKER_DEPARTURES_MAX_LIMIT`)         |
-| `WORKER_DEPARTURES_SEARCH_DAYS`         |                 `7` | Forward search horizon in days for `/departures` (`1..=3650`)                                       |
-| `WORKER_DEFAULT_TIMEZONE`               | `Asia/Kuala_Lumpur` | Fallback IANA timezone when a GTFS feed omits `agency_timezone`                                     |
+| `WORKER_MAP_CACHE_EXPIRE_TIME`          |             `05:00` | Daily local time (`HH:MM` in `WORKER_DEFAULT_TIMEZONE`) when `/map` edge cache expires              |
+| `WORKER_DEFAULT_TIMEZONE`               | `Asia/Kuala_Lumpur` | Default IANA timezone for Worker date and cache-expiry calculations                                 |
 
 Additional Worker variables:
 - `WORKER_ADMIN_KEY`: Required secret/var to enable `POST /<provider>/sql` (`Authorization: Bearer <key>` or `X-Admin-Key: <key>`).
@@ -418,7 +402,7 @@ cargo run -p gtfs-checks --bin benchmark_upsert_replay
 pnpm test:importer:local
 
 # Individual worker checks
-cargo test -p gtfs-checks --test departure_sql
+cargo test -p gtfs-checks --test map_sql
 pnpm test:worker
 ```
 

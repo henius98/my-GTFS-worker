@@ -110,6 +110,6 @@ fn max_writes_per_staging_row_uses_1_for_without_rowid_tables_and_2_as_fallback(
       }
     }
   }
-  assert_eq!(SchemaCatalog::max_writes_per_staging_row("ktmb", "departure_cache"), 2);
+  assert_eq!(SchemaCatalog::max_writes_per_staging_row("ktmb", "0_dataset_versions"), 2);
   assert_eq!(SchemaCatalog::max_writes_per_staging_row("unknown-provider", "stops"), 2);
 }

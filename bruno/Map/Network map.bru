@@ -22,5 +22,5 @@ docs {
   Returns the provider network as a GeoJSON FeatureCollection.
   Enable route_id to fetch one or more comma-separated routes (e.g. KC05_KB18,KA15_KD19, up to WORKER_MAP_MAX_ROUTES) and their stops; returns 404 if no requested route has active trips.
   LineString features represent route shapes or straight stop-to-stop segments;
-  Point features represent stops. Successful responses are edge-cached per route for WORKER_FEED_CACHE_TTL_SECONDS.
+  Point features represent stops. Successful responses are edge-cached per route until the next daily WORKER_MAP_CACHE_EXPIRE_TIME in WORKER_DEFAULT_TIMEZONE.
 }

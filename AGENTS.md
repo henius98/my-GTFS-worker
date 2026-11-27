@@ -6,7 +6,7 @@ This document serves as the single source of truth for architectural patterns an
 
 The application is a Cargo Workspace containing three crates:
 
-- **`worker/`**: Cloudflare Worker (Wasm). A unified worker that dynamically routes requests to per-provider D1 databases (`DB_<PROVIDER>`) across `/`, `/<provider>/status`, `/<provider>/data/<table>`, `/<provider>/sql`, `/<provider>/departures`, and `/<provider>/map`.
+- **`worker/`**: Cloudflare Worker (Wasm). A unified worker that dynamically routes requests to per-provider D1 databases (`DB_<PROVIDER>`) across `/`, `/<provider>/status`, `/<provider>/data/<table>`, `/<provider>/sql`, and `/<provider>/map`.
 - **`importer/`**: GitHub Actions standalone CLI. Connects directly to Cloudflare D1 via HTTP APIs to ingest ZIP/CSV GTFS files concurrently into `<table_name>__staging` tables under a shared daily write ledger (`0_daily_import_budget`), then commits atomic table swaps once all provider files finish staging.
 - **`test/`** (`gtfs-checks`): Single crate housing all integration tests, migration/live-feed validators, and benchmarks, alongside out-of-line unit tests under `test/unit/`.
 

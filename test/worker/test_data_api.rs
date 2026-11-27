@@ -1,4 +1,4 @@
-//! HTTP integration checks for a seeded Worker running at localhost:8787 (see `test/worker/departures.test.mjs` for deterministic local fixtures).
+//! HTTP integration checks for a seeded Worker running at localhost:8787 (see `test/worker/worker.test.mjs` for deterministic local fixtures).
 
 use gtfs_checks::CheckResult;
 use reqwest::{
